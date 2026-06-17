@@ -3,7 +3,22 @@
 A 64-bit operating system written from scratch in C and x86-64 assembly — no
 GRUB, no Multiboot, no external libraries. Custom MBR boot chain, own kernel.
 
-> Status: **active development.** Custom boot chain (stage1 → stage2 → long mode) into a 64-bit C kernel. Features include a framebuffer console, physical memory management, RAM filesystem, hardware interrupts, keyboard and mouse drivers, an interactive shell, a graphical user interface (GUI), and windowed apps (taskmgr, terminal).
+> Status: **active development.** Custom boot chain (stage1 → stage2 → long mode) into a 64-bit C kernel. Features include a framebuffer console, physical memory management, RAM filesystem, hardware interrupts, keyboard and mouse drivers, an interactive shell, a graphical user interface (GUI), an IPv4/TCP/UDP network stack with an e1000 NIC driver, and windowed apps (terminal, browser, taskmgr, settings).
+
+## Web browser
+
+A small windowed **Browser** app renders basic HTML — headings, paragraphs,
+lists, links, bold and preformatted text. It loads:
+
+- **`http://` pages** over the kernel's own TCP/IP stack (DNS → TCP → HTTP/1.0).
+  There is no TLS yet, so `https://` is unsupported.
+- **local HTML files** from the ramfs (e.g. the bundled `/web/index.html`).
+
+Click links to navigate, type a URL in the address bar, `<` goes back, and the
+scrollbar / Space / `b` / `j` / `k` scroll. The data path rides the e1000 NIC
+(the link QEMU/VirtualBox NAT exposes); Wi-Fi association is scaffolded in the
+kernel but still needs a radio driver — see the `wifi` command. The shell also
+has `browse URL` (render a page as text) and `download URL` (save to the ramfs).
 
 ## Boot flow (from scratch)
 
@@ -75,7 +90,7 @@ The interactive OS shell supports a wide range of commands:
 - **File Inspection:** `cat`, `head`, `tail`, `hex`, `meta`, `diff`, `grep`, `checksum`, `preview`, `count`
 - **System Information:** `sysinfo`, `cpuinfo`, `meminfo`, `diskinfo`, `uptime`, `battery`, `sensors`, `devices`, `version`, `health`
 - **Process Management:** `ps`, `kill`, `top`, `freeze`, `resume`, `services`, `service`, `jobs`, `priority`, `monitor`
-- **Networking:** `netinfo`, `ping`, `trace`, `ports`, `download`, `upload`, `wifi`, `firewall`, `share`, `scan`
+- **Networking:** `netinfo`, `ping`, `trace`, `ports`, `download`, `browse`, `upload`, `wifi`, `firewall`, `share`, `scan`
 - **Bonus / Unique:** `focus`, `snapshot`, `timeline`, `vault`, `doctor`, `assistant`, `sandbox`, `workspace`, `panic`, `story`
 - **Core:** `help`, `echo`, `clear`, `mem`
 

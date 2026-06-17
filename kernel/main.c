@@ -25,6 +25,7 @@
 #include "sched.h"
 #include "shell.h"
 #include "gui.h"
+#include "netif.h"
 
 /* Demo kernel threads: prove preemptive switching by heart-beating to serial
  * (the GUI owns the framebuffer console, so threads stay off it). hlt parks the
@@ -88,6 +89,7 @@ void kmain(struct bootinfo *bi) {
 
     fs_init();       kprintf("[ok] ramfs mounted (/)\n");
     sysreg_init();   kprintf("[ok] service + task registry\n");
+    net_init();      /* netif core + NIC driver probe (e1000 under QEMU) */
 
     sched_init();                         /* adopt current context as thread 0 */
     sched_add(demo_thread_a, "demoA");

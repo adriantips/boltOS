@@ -31,12 +31,16 @@ echo "[3/6] kernel C sources"
 SRCS=(
     kernel/main.c kernel/serial.c kernel/console.c kernel/shell.c kernel/kprintf.c kernel/font8x8.c
     kernel/gdt.c kernel/idt.c kernel/interrupts.c kernel/pic.c kernel/pit.c
-    kernel/hw.c kernel/sysreg.c kernel/sched.c
+    kernel/hw.c kernel/pci.c kernel/sysreg.c kernel/sched.c
+    net/netif.c net/driver.c net/eth.c net/arp.c net/ip.c net/icmp.c net/udp.c
+    net/tcp.c net/dns.c net/http.c
+    net/wifi.c net/firmware.c drivers/e1000.c
     kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c
-    kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c
+    kernel/html.c
+    kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c
     kernel/settings.c
     fs/ramfs.c
-    drivers/keyboard.c drivers/framebuffer.c drivers/mouse.c mm/pmm.c mm/vmm.c mm/kheap.c libc/string.c
+    drivers/keyboard.c drivers/framebuffer.c drivers/mouse.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
 )
 KOBJS=(build/kboot.o build/isr.o)
 for c in "${SRCS[@]}"; do

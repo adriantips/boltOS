@@ -11,6 +11,8 @@ if errorlevel 1 (
     echo   "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" storagectl BoltOS --name IDE --add ide --controller PIIX4 --bootable on
     echo   "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" storageattach BoltOS --storagectl IDE --port 0 --device 0 --type hdd --medium "%~dp0iso\boltos.vdi"
     echo   "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" storageattach BoltOS --storagectl IDE --port 1 --device 0 --type dvddrive --medium "%~dp0iso\boltos.iso"
+    echo   REM NAT NIC the e1000 driver binds ^(8086:100E^) -- gives the browser internet:
+    echo   "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" modifyvm BoltOS --nic1 nat --nictype1 82540EM
     echo   "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" modifyvm BoltOS --uart1 0x3F8 4 --uartmode1 server \\.\pipe\boltos
     pause
 )

@@ -16,6 +16,16 @@ SECTIONS
     }
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) { *(.rodata .rodata.*) }
+
+    /* Link-time driver table (P4): DRIVER_REGISTER drops a driver* here; the
+     * bounds let driver_probe_all() walk it. KEEP so GC never drops entries. */
+    . = ALIGN(8);
+    .drivers : AT(ADDR(.drivers) - KERNEL_VBASE) {
+        __drivers_start = .;
+        KEEP(*(.drivers))
+        __drivers_end = .;
+    }
+
     .data   : AT(ADDR(.data)   - KERNEL_VBASE) { *(.data .data.*) }
 
     . = ALIGN(16);

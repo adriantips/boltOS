@@ -92,3 +92,24 @@ void pmm_free_frame(uint64_t addr) {
     uint64_t f = addr / FRAME;
     if (f < nframes && is_used(f)) { set_free(f); used_frames--; }
 }
+
+uint64_t pmm_alloc_contig(uint64_t n) {
+    if (n == 0) return 0;
+    /* linear scan for a run of n free frames; bounded by nframes (small n) */
+    uint64_t run = 0, start = 0;
+    for (uint64_t f = 0; f < nframes; f++) {
+        if (is_used(f)) { run = 0; continue; }
+        if (run == 0) start = f;
+        if (++run == n) {
+            for (uint64_t g = start; g < start + n; g++) { set_used(g); used_frames++; }
+            return start * FRAME;
+        }
+    }
+    return 0;
+}
+
+void pmm_free_contig(uint64_t base, uint64_t n) {
+    uint64_t s = base / FRAME;
+    for (uint64_t f = s; f < s + n && f < nframes; f++)
+        if (is_used(f)) { set_free(f); used_frames--; }
+}

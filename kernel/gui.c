@@ -271,6 +271,16 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         g_round(cxx - 2 * s, cyy - 2 * s, 4 * s, 4 * s, 2 * s, hub, 255); /* hub */
         break;
     }
+    case ICON_BROWSER: {                        /* globe */
+        int cxx = x + 8 * s, cyy = y + 7 * s, r = 6 * s;
+        g_round(cxx - r, cyy - r, 2 * r, 2 * r, r, c, 255);     /* disc          */
+        uint32_t in = (c >> 1) & 0x7F7F7F;
+        g_vline(cxx, cyy - r, 2 * r, in);                       /* meridian      */
+        g_hline(cxx - r, cyy, 2 * r, in);                       /* equator       */
+        g_hline(cxx - r + s, cyy - 3 * s, 2 * (r - s), in);     /* latitude lines*/
+        g_hline(cxx - r + s, cyy + 3 * s, 2 * (r - s), in);
+        break;
+    }
     default:
         g_round(x, y, 14 * s, 12 * s, 2 * s, c, 255);
         break;
@@ -611,6 +621,7 @@ void gui_run(void) {
     console_detach();                                /* GUI owns the framebuffer now */
 
     terminal_app_init();
+    browser_app_init();
     taskmgr_app_init();
     settings_app_init();
     for (int i = 0; i < nwin; i++) gui_open(&wins[i]);   /* show the apps */
