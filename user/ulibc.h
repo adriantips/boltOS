@@ -1,0 +1,46 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+/* mmap prot bits (match include/syscall.h) */
+#define PROT_READ   1
+#define PROT_WRITE  2
+#define PROT_EXEC   4
+
+/* open flags (match include/vfs.h) */
+#define O_RDONLY 0x000
+#define O_WRONLY 0x001
+#define O_RDWR   0x002
+#define O_CREAT  0x040
+#define O_TRUNC  0x200
+#define O_APPEND 0x400
+
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+typedef struct { uint64_t size; uint64_t is_dir; } stat_t;   /* matches SYS_FSTAT */
+
+/* thin syscall wrappers */
+long  sys_read (int fd, void *buf, unsigned long len);
+long  sys_write(int fd, const void *buf, unsigned long len);
+int   open (const char *path, int flags);
+int   close(int fd);
+long  read (int fd, void *buf, unsigned long len);
+long  write(int fd, const void *buf, unsigned long len);
+long  lseek(int fd, long off, int whence);
+int   fstat(int fd, stat_t *st);
+void *mmap (void *addr, unsigned long len, int prot, int flags, int fd);
+void *sbrk_brk(void *addr);          /* raw SYS_BRK */
+int   getpid(void);
+void  yield(void);
+void  exit(int code) __attribute__((noreturn));
+
+/* heap */
+void *malloc(unsigned long n);
+void  free(void *p);
+
+/* tiny stdio */
+int   putchar(int c);
+int   puts(const char *s);
+int   printf(const char *fmt, ...);

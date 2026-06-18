@@ -12,6 +12,9 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "kheap.h"
+#include "pmm.h"
+#include "mm.h"
+#include "pcspk.h"
 #include "pit.h"
 #include "hw.h"
 #include "shell.h"
@@ -23,9 +26,13 @@ extern const unsigned char font8x8_basic[128][8];
 #define TITLE_H    32
 #define TASKBAR_H  48
 #define RADIUS     9
-#define MAX_WIN    8
+#define MAX_WIN    24
 #define DI_W       80              /* desktop icon cell width  */
 #define DI_H       86              /* desktop icon cell height */
+#define MAX_PW     3840            /* largest panel we allocate backbuffers for */
+#define MAX_PH     2160            /* (4K) -- res changes reuse these buffers   */
+
+static int hires_ok;               /* big backbuffers allocated -> res switch allowed */
 
 static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
@@ -242,10 +249,17 @@ static int      nwin;
 static int      ztop;
 static int      focus_id = -1;
 static int      drag_id  = -1, drag_dx, drag_dy;
+static int      client_drag_id = -1;            /* window receiving held-button drag */
 static uint8_t  prev_btns;
 static int      menu_open;
 static int      cpu_load;
 static int      dirty = 1;
+
+/* right-click taskbar context menu: targets one window */
+static int      ctx_open, ctx_win, ctx_x, ctx_y;
+#define CTX_W   168
+#define CTX_ITEM 30
+#define CTX_N    2
 
 int  gui_screen_w(void) { return W; }
 int  gui_screen_h(void) { return H; }
@@ -378,6 +392,135 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         (void)c;
         break;
     }
+    case ICON_CALC: {                           /* pocket calculator */
+        g_round(x, y, 16 * s, 14 * s, 2 * s, c, 255);                 /* body      */
+        g_round(x + 2 * s, y + 2 * s, 12 * s, 3 * s, s, 0x0E0E16, 255); /* screen  */
+        uint32_t key = (c >> 1) & 0x7F7F7F;
+        for (int ky = 0; ky < 3; ky++)                               /* keypad    */
+            for (int kx = 0; kx < 3; kx++)
+                g_fill(x + (3 + kx * 4) * s, y + (7 + ky * 2) * s, 2 * s, s, key);
+        break;
+    }
+    case ICON_MATRIX: {                          /* matrix rain: dotted columns */
+        for (int cc = 0; cc < 4; cc++) {
+            int gx = x + cc * 4 * s;
+            for (int k = 0; k < 3; k++)
+                g_fill(gx, y + ((cc + k) % 4) * 4 * s, 2 * s, 2 * s, c);
+        }
+        break;
+    }
+    case ICON_MEMORY: {                          /* memory: two cards */
+        g_round(x,        y + 2 * s, 7 * s, 11 * s, 2 * s, c, 255);
+        g_round(x + 9 * s, y,        7 * s, 11 * s, 2 * s, (c >> 1) & 0x7F7F7F, 255);
+        break;
+    }
+    case ICON_COLOR: {                           /* color picker: swatches */
+        g_round(x,        y,        7 * s, 7 * s, 2 * s, 0xE0556B, 255);
+        g_round(x + 9 * s, y,        7 * s, 7 * s, 2 * s, 0x34C759, 255);
+        g_round(x,        y + 9 * s, 7 * s, 7 * s, 2 * s, 0x4F8DF7, 255);
+        g_round(x + 9 * s, y + 9 * s, 7 * s, 7 * s, 2 * s, 0xF6D32D, 255);
+        (void)c;
+        break;
+    }
+    case ICON_TTT: {                             /* tic-tac-toe: grid + X O */
+        for (int i = 1; i < 3; i++) { g_fill(x + i * 5 * s, y, s, 15 * s, c); g_fill(x, y + i * 5 * s, 15 * s, s, c); }
+        g_fill(x + s, y + s, 3 * s, s, c); g_fill(x + s, y + 3 * s, 3 * s, s, c); /* X-ish */
+        g_round(x + 11 * s, y + 11 * s, 3 * s, 3 * s, s, c, 255);                  /* O-ish */
+        break;
+    }
+    case ICON_LIFE: {                            /* life: glider */
+        g_round(x + 5 * s, y + 1 * s, 3 * s, 3 * s, s, c, 255);
+        g_round(x + 9 * s, y + 5 * s, 3 * s, 3 * s, s, c, 255);
+        g_round(x + 1 * s, y + 9 * s, 3 * s, 3 * s, s, c, 255);
+        g_round(x + 5 * s, y + 9 * s, 3 * s, 3 * s, s, c, 255);
+        g_round(x + 9 * s, y + 9 * s, 3 * s, 3 * s, s, c, 255);
+        break;
+    }
+    case ICON_SYSINFO: {                         /* info "i" in a disc */
+        int cxx = x + 8 * s, cyy = y + 7 * s, rr = 7 * s;
+        g_round(cxx - rr, cyy - rr, 2 * rr, 2 * rr, rr, c, 255);
+        uint32_t in = 0x0E0E16;
+        g_fill(cxx - s, cyy - 4 * s, 2 * s, 2 * s, in);          /* dot  */
+        g_fill(cxx - s, cyy - s, 2 * s, 5 * s, in);             /* stem */
+        break;
+    }
+    case ICON_STOPWATCH: {                       /* stopwatch */
+        int cxx = x + 8 * s, cyy = y + 9 * s, rr = 6 * s;
+        g_fill(cxx - 2 * s, y, 4 * s, 2 * s, c);                 /* top button */
+        g_round(cxx - rr, cyy - rr, 2 * rr, 2 * rr, rr, c, 255); /* case       */
+        uint32_t in = 0x0E0E16;
+        g_round(cxx - rr + s, cyy - rr + s, 2 * (rr - s), 2 * (rr - s), rr - s, in, 255);
+        g_fill(cxx - s / 2, cyy - 4 * s, s, 4 * s, c);           /* hand        */
+        break;
+    }
+    case ICON_2048: {                           /* 2048: four tiles */
+        uint32_t a = 0x4F8DF7, b = 0xF6D32D;
+        g_round(x,        y,        7 * s, 7 * s, 2 * s, a, 255);
+        g_round(x + 9 * s, y,        7 * s, 7 * s, 2 * s, b, 255);
+        g_round(x,        y + 9 * s, 7 * s, 7 * s, 2 * s, b, 255);
+        g_round(x + 9 * s, y + 9 * s, 7 * s, 7 * s, 2 * s, a, 255);
+        (void)c;
+        break;
+    }
+    case ICON_SNAKE: {                          /* snake: body segments + food */
+        g_round(x + 1 * s, y + 9 * s, 4 * s, 4 * s, s, COL_GOOD, 255);
+        g_round(x + 4 * s, y + 6 * s, 4 * s, 4 * s, s, COL_GOOD, 255);
+        g_round(x + 7 * s, y + 6 * s, 4 * s, 4 * s, s, 0x6FE38A, 255);   /* head */
+        g_round(x + 12 * s, y + 2 * s, 3 * s, 3 * s, s, COL_BAD, 255);   /* food */
+        (void)c;
+        break;
+    }
+    case ICON_MINES: {                          /* minesweeper: grid + a mine */
+        g_round(x, y, 16 * s, 14 * s, 2 * s, COL_PANEL_3, 255);
+        for (int i = 1; i < 4; i++) { g_vline(x + i * 4 * s, y, 14 * s, 0x12121A); g_hline(x, y + i * 4 * s - s, 16 * s, 0x12121A); }
+        g_round(x + 9 * s, y + 8 * s, 5 * s, 5 * s, 2 * s, c, 255);  /* a mine */
+        break;
+    }
+    case ICON_PAINT: {                          /* paint: palette + brush */
+        g_round(x, y, 13 * s, 13 * s, 5 * s, 0xF2F2F5, 255);     /* palette disc */
+        g_round(x + 2 * s, y + 2 * s, 2 * s, 2 * s, s, 0xE0556B, 255);
+        g_round(x + 7 * s, y + 2 * s, 2 * s, 2 * s, s, 0x4FC3F7, 255);
+        g_round(x + 2 * s, y + 7 * s, 2 * s, 2 * s, s, 0xF6D32D, 255);
+        g_round(x + 7 * s, y + 7 * s, 2 * s, 2 * s, s, 0x34C759, 255);
+        g_fill(x + 11 * s, y + 11 * s, 5 * s, 2 * s, c);         /* brush handle */
+        break;
+    }
+    case ICON_PIANO: {                          /* piano keys */
+        g_round(x, y + 2 * s, 16 * s, 11 * s, 2 * s, 0xF2F2F5, 255);   /* white keys */
+        for (int i = 1; i < 5; i++) g_vline(x + i * 3 * s, y + 2 * s, 11 * s, 0x9AA7C2);
+        for (int i = 0; i < 4; i++) g_fill(x + (2 + i * 3) * s, y + 2 * s, 2 * s, 7 * s, 0x101018); /* black */
+        (void)c;
+        break;
+    }
+    case ICON_CALENDAR: {                       /* calendar: page with header band */
+        uint32_t pg = 0xF5F7FC, grid = 0x9AA7C2;
+        g_round(x, y + s, 16 * s, 13 * s, 2 * s, pg, 255);
+        g_round(x, y + s, 16 * s, 4 * s, 2 * s, c, 255);      /* red header  */
+        g_fill(x + 3 * s, y, s, 3 * s, c);                    /* rings       */
+        g_fill(x + 12 * s, y, s, 3 * s, c);
+        for (int gy = 0; gy < 3; gy++)
+            for (int gx = 0; gx < 4; gx++)
+                g_fill(x + (2 + gx * 4) * s, y + (7 + gy * 2) * s, 2 * s, s, grid);
+        break;
+    }
+    case ICON_NOTES: {                          /* notepad: page with a pencil */
+        uint32_t pg = 0xF5F7FC, ln = 0x9AA7C2;
+        g_round(x + s, y, 12 * s, 15 * s, 2 * s, pg, 255);
+        for (int i = 0; i < 4; i++)
+            g_fill(x + 3 * s, y + 3 * s + i * 3 * s, 8 * s, s, ln);
+        g_fill(x + 10 * s, y + 9 * s, 5 * s, 2 * s, c);       /* pencil body */
+        g_fill(x + 14 * s, y + 8 * s, 2 * s, 2 * s, 0xF3C766); /* pencil tip  */
+        break;
+    }
+    case ICON_CLOCK: {                          /* analog clock */
+        int cxx = x + 8 * s, cyy = y + 7 * s, rr = 6 * s;
+        g_round(cxx - rr, cyy - rr, 2 * rr, 2 * rr, rr, c, 255);
+        uint32_t in = 0x0E0E16;
+        g_round(cxx - rr + s, cyy - rr + s, 2 * (rr - s), 2 * (rr - s), rr - s, in, 255);
+        g_fill(cxx - s / 2, cyy - 4 * s, s, 4 * s, c);          /* hour hand  */
+        g_fill(cxx, cyy - s / 2, 4 * s, s, c);                  /* minute hand*/
+        break;
+    }
     default:
         g_round(x, y, 14 * s, 12 * s, 2 * s, c, 255);
         break;
@@ -440,13 +583,22 @@ static void draw_window(window_t *w) {
  *  Taskbar + start menu
  * ===========================================================================*/
 #define TB_BTN 44
+/* The taskbar only carries apps that are open OR pinned -- launchers live on
+ * the desktop now. Build that ordered list (window indices) each frame. */
+static int taskbar_list(int *out) {
+    int n = 0;
+    for (int i = 0; i < nwin; i++)
+        if (wins[i].open || wins[i].pinned) out[n++] = i;
+    return n;
+}
 static void taskbar_layout(int *startx, int *y) {
-    int count = 1 + nwin;                       /* start button + one per window */
+    int idx[MAX_WIN]; int vis = taskbar_list(idx);
+    int count = 1 + vis;                        /* start button + visible apps */
     int total = count * TB_BTN + (count - 1) * 8;
     *startx = (W - total) / 2;
     *y = H - TASKBAR_H + (TASKBAR_H - TB_BTN) / 2;
 }
-/* slot -1 = start button; 0..nwin-1 = windows */
+/* slot -1 = start button; 0..vis-1 = visible-list position */
 static void taskbar_btn_rect(int slot, int *bx, int *by) {
     int sx, y; taskbar_layout(&sx, &y);
     *bx = sx + (slot + 1) * (TB_BTN + 8);
@@ -477,9 +629,11 @@ static void draw_taskbar(void) {
     if (menu_open || hot) g_round(bx, by, TB_BTN, TB_BTN, 8, 0x2A2A38, 255);
     draw_icon(ICON_START, bx + 8, by + 8, 1, COL_ACCENT);
 
-    /* one button per window */
-    for (int i = 0; i < nwin; i++) {
-        taskbar_btn_rect(i, &bx, &by);
+    /* one button per open-or-pinned window */
+    int idx[MAX_WIN]; int vis = taskbar_list(idx);
+    for (int s = 0; s < vis; s++) {
+        int i = idx[s];
+        taskbar_btn_rect(s, &bx, &by);
         window_t *w = &wins[i];
         int active = (i == top) && w->open && !w->minimized;
         int h2 = mxp >= bx && mxp < bx + TB_BTN && myp >= by && myp < by + TB_BTN;
@@ -489,27 +643,92 @@ static void draw_taskbar(void) {
         if (w->open) {   /* running indicator underline */
             int iw = active ? 18 : 8;
             g_round(bx + TB_BTN / 2 - iw / 2, by + TB_BTN - 3, iw, 3, 1, active ? w->accent : COL_TEXT_DIM, 255);
+        } else if (w->pinned) {   /* pinned-but-closed: small dot */
+            g_round(bx + TB_BTN / 2 - 1, by + TB_BTN - 3, 3, 3, 1, COL_TEXT_DIM, 200);
         }
     }
     draw_clock();
 }
 
+/* ---- taskbar right-click context menu ----------------------------------- */
+static const char *ctx_label(int item) {
+    if (item == 0) return "Close window";
+    return (ctx_win >= 0 && wins[ctx_win].pinned) ? "Unpin from taskbar"
+                                                   : "Pin to taskbar";
+}
+static void ctx_menu_rect(int *x, int *y, int *w, int *h) {
+    *w = CTX_W; *h = CTX_ITEM * CTX_N + 8;
+    int mx = ctx_x, my = ctx_y - *h;            /* pop upward from the taskbar */
+    if (mx + *w > W - 6) mx = W - 6 - *w;
+    if (mx < 6) mx = 6;
+    if (my < 6) my = 6;
+    *x = mx; *y = my;
+}
+static void draw_context_menu(void) {
+    if (!ctx_open) return;
+    int x, y, w, h; ctx_menu_rect(&x, &y, &w, &h);
+    g_round(x - 2, y - 2, w + 4, h + 4, 12, 0x000000, 70);
+    g_round(x, y, w, h, 10, 0x16161E, 250);
+    int mxp = mlx(), myp = mly();
+    for (int it = 0; it < CTX_N; it++) {
+        int iy = y + 4 + it * CTX_ITEM;
+        int hot = mxp >= x && mxp < x + w && myp >= iy && myp < iy + CTX_ITEM;
+        if (hot) g_round(x + 4, iy, w - 8, CTX_ITEM, 7, 0x2A2A3A, 255);
+        uint32_t col = (it == 0) ? COL_BAD : COL_TEXT;
+        g_text(x + 14, iy + 9, ctx_label(it), hot ? 0xFFFFFF : col, 1);
+    }
+}
+/* returns clicked item (0/1) or -1 */
+static int ctx_menu_hit(int x, int y) {
+    int mx, my, w, h; ctx_menu_rect(&mx, &my, &w, &h);
+    if (x < mx || x >= mx + w || y < my || y >= my + h) return -2;   /* outside */
+    for (int it = 0; it < CTX_N; it++) {
+        int iy = my + 4 + it * CTX_ITEM;
+        if (y >= iy && y < iy + CTX_ITEM) return it;
+    }
+    return -1;
+}
+
+/* ---- start menu: a modern icon grid (scales as apps are added) ---------- */
+#define SM_COLS 4
+#define SM_TW   86
+#define SM_TH   80
+#define SM_PAD  16
+#define SM_HEAD 56
+
+static void start_menu_rect(int *ox, int *oy, int *mw, int *mh) {
+    int rows = (nwin + SM_COLS - 1) / SM_COLS; if (rows < 1) rows = 1;
+    *mw = SM_PAD * 2 + SM_COLS * SM_TW;
+    *mh = SM_HEAD + rows * SM_TH + SM_PAD - 8;
+    int sx, sy; taskbar_layout(&sx, &sy);
+    int x = sx; if (x + *mw > W - 8) x = W - 8 - *mw; if (x < 8) x = 8;
+    int y = H - TASKBAR_H - *mh - 10; if (y < 8) y = 8;
+    *ox = x; *oy = y;
+}
+static void start_menu_tile(int idx, int ox, int oy, int *tx, int *ty) {
+    *tx = ox + SM_PAD + (idx % SM_COLS) * SM_TW;
+    *ty = oy + SM_HEAD + (idx / SM_COLS) * SM_TH;
+}
+
 static void draw_start_menu(void) {
     if (!menu_open) return;
-    int mw = 300, mh = 84 + nwin * 44;
-    int sx, sy; taskbar_layout(&sx, &sy);
-    int x = sx, y = H - TASKBAR_H - mh - 10;
-    if (x + mw > W - 8) x = W - 8 - mw;
-    g_round(x, y, mw, mh, 12, 0x16161E, 245);
+    int x, y, mw, mh; start_menu_rect(&x, &y, &mw, &mh);
+    g_round(x, y, mw, mh, 14, 0x16161E, 248);
+    g_fill(x, y, mw, 3, COL_ACCENT);
     g_text(x + 18, y + 16, "BoltOS", COL_TEXT, 2);
-    g_text(x + 18, y + 40, "Pinned apps", COL_TEXT_DIM, 1);
+    g_text(x + 18, y + 38, "All apps", COL_TEXT_DIM, 1);
+
     int mxp = mlx(), myp = mly();
     for (int i = 0; i < nwin; i++) {
-        int iy = y + 64 + i * 44;
-        int hot = mxp >= x + 8 && mxp < x + mw - 8 && myp >= iy && myp < iy + 40;
-        if (hot) g_round(x + 8, iy, mw - 16, 40, 8, 0x2A2A3A, 255);
-        draw_icon(wins[i].icon, x + 18, iy + 12, 1, wins[i].accent);
-        g_text(x + 44, iy + 14, wins[i].title, COL_TEXT, 1);
+        int tx, ty; start_menu_tile(i, x, y, &tx, &ty);
+        int hot = mxp >= tx && mxp < tx + SM_TW && myp >= ty && myp < ty + SM_TH;
+        if (hot) g_round(tx + 3, ty + 2, SM_TW - 6, SM_TH - 6, 10, 0x2A2A3A, 255);
+        draw_icon(wins[i].icon, tx + SM_TW / 2 - 16, ty + 12, 2, wins[i].accent);
+        /* centred label, truncated to the tile width */
+        char lbl[24]; strncpy(lbl, wins[i].title, sizeof(lbl));
+        while (strlen(lbl) > 1 && g_text_width(lbl, 1) > SM_TW - 12) lbl[strlen(lbl) - 1] = 0;
+        int lw = g_text_width(lbl, 1);
+        g_text(tx + (SM_TW - lw) / 2, ty + 52, lbl, hot ? COL_TEXT : COL_TEXT_DIM, 1);
     }
 }
 
@@ -534,8 +753,10 @@ static void draw_cursor(void) {
 /* ===========================================================================
  *  Desktop icons + drag-and-drop
  * ===========================================================================*/
-#define MAX_DESKICON 16
-typedef struct { int used, x, y, icon; char label[40]; fs_node *node; } deskicon_t;
+#define MAX_DESKICON 48
+/* A desktop shortcut is either an app launcher (win != 0, double-click opens the
+ * window) or a file/folder shortcut (node != 0, opened via the explorer). */
+typedef struct { int used, x, y, icon; char label[40]; fs_node *node; window_t *win; } deskicon_t;
 static deskicon_t dicons[MAX_DESKICON];
 static int      desk_sel = -1;
 static int      desk_drag = -1, desk_dx, desk_dy;
@@ -569,6 +790,19 @@ void gui_desktop_add(fs_node *node, const char *label, int icon) {
         if (dicons[i].used) continue;
         dicons[i].used = 1; dicons[i].node = node; dicons[i].icon = icon;
         strncpy(dicons[i].label, label ? label : "item", sizeof(dicons[i].label));
+        deskicon_autopos(&dicons[i].x, &dicons[i].y);
+        dirty = 1;
+        return;
+    }
+}
+
+/* Seed an app launcher onto the desktop (double-click opens the window). */
+void gui_desktop_add_app(window_t *win, const char *label, int icon) {
+    if (!win) return;
+    for (int i = 0; i < MAX_DESKICON; i++) {
+        if (dicons[i].used) continue;
+        dicons[i].used = 1; dicons[i].win = win; dicons[i].icon = icon;
+        strncpy(dicons[i].label, label ? label : "app", sizeof(dicons[i].label));
         deskicon_autopos(&dicons[i].x, &dicons[i].y);
         dirty = 1;
         return;
@@ -613,7 +847,8 @@ static void draw_desktop_icons(void) {
         if (i == desk_sel) g_round(d->x, d->y, DI_W, DI_H, 8, COL_ACCENT, 70);
         else if (hot)      g_round(d->x, d->y, DI_W, DI_H, 8, 0xFFFFFF, 26);
         int s = 3, iw = 16 * s;
-        draw_icon(d->icon, d->x + (DI_W - iw) / 2, d->y + 8, s, COL_TEXT);
+        uint32_t ic = d->win ? d->win->accent : COL_TEXT;
+        draw_icon(d->icon, d->x + (DI_W - iw) / 2, d->y + 8, s, ic);
         char lb[18]; deskicon_label(d->label, lb, sizeof(lb));
         int tw = g_text_width(lb, 1), tx = d->x + (DI_W - tw) / 2, ty = d->y + 8 + iw + 6;
         g_text(tx + 1, ty + 1, lb, 0x000000, 1);        /* drop shadow for legibility */
@@ -639,8 +874,9 @@ static int deskicon_hit(int x, int y) {
 }
 
 static void deskicon_open(int i) {
-    if (i < 0 || i >= MAX_DESKICON || !dicons[i].used || !dicons[i].node) return;
-    files_open_node(dicons[i].node);
+    if (i < 0 || i >= MAX_DESKICON || !dicons[i].used) return;
+    if (dicons[i].win)       gui_open(dicons[i].win);
+    else if (dicons[i].node) files_open_node(dicons[i].node);
 }
 
 /* drop point over the wallpaper (not a window, taskbar or menu) -> make shortcut */
@@ -672,6 +908,7 @@ static void composite(void) {
 
     draw_start_menu();
     draw_taskbar();
+    draw_context_menu();
     if (dnd_active) draw_drag_ghost();
     draw_cursor();
 }
@@ -706,29 +943,37 @@ static void do_maximize(window_t *w) {
 }
 
 static void on_left_down(int x, int y) {
+    /* an open context menu eats the next click */
+    if (ctx_open) {
+        int it = ctx_menu_hit(x, y);
+        if (it == 0)      { if (ctx_win >= 0) wins[ctx_win].open = 0; }      /* close   */
+        else if (it == 1) { if (ctx_win >= 0) wins[ctx_win].pinned = !wins[ctx_win].pinned; }
+        ctx_open = 0; dirty = 1;
+        if (it >= 0) return;                  /* clicked an item -> done       */
+        /* it == -2 (outside) falls through so the click also lands normally   */
+    }
+
     /* start button */
     int bx, by; taskbar_btn_rect(-1, &bx, &by);
     if (x >= bx && x < bx + TB_BTN && y >= by && y < by + TB_BTN) { menu_open = !menu_open; dirty = 1; return; }
 
-    /* taskbar app buttons */
+    /* taskbar app buttons (open-or-pinned list) */
     if (y >= H - TASKBAR_H) {
-        for (int i = 0; i < nwin; i++) {
-            taskbar_btn_rect(i, &bx, &by);
-            if (x >= bx && x < bx + TB_BTN && y >= by && y < by + TB_BTN) { toggle_window_from_taskbar(i); menu_open = 0; return; }
+        int idx[MAX_WIN]; int vis = taskbar_list(idx);
+        for (int s = 0; s < vis; s++) {
+            taskbar_btn_rect(s, &bx, &by);
+            if (x >= bx && x < bx + TB_BTN && y >= by && y < by + TB_BTN) { toggle_window_from_taskbar(idx[s]); menu_open = 0; return; }
         }
         return;
     }
 
-    /* start menu interaction */
+    /* start menu interaction (icon grid) */
     if (menu_open) {
-        int mw = 300, mh = 84 + nwin * 44;
-        int sx, sy; taskbar_layout(&sx, &sy);
-        int mxx = sx; if (mxx + mw > W - 8) mxx = W - 8 - mw;
-        int myy = H - TASKBAR_H - mh - 10;
+        int mxx, myy, mw, mh; start_menu_rect(&mxx, &myy, &mw, &mh);
         if (x >= mxx && x < mxx + mw && y >= myy && y < myy + mh) {
             for (int i = 0; i < nwin; i++) {
-                int iy = myy + 64 + i * 44;
-                if (x >= mxx + 8 && x < mxx + mw - 8 && y >= iy && y < iy + 40) { gui_open(&wins[i]); menu_open = 0; return; }
+                int tx, ty; start_menu_tile(i, mxx, myy, &tx, &ty);
+                if (x >= tx && x < tx + SM_TW && y >= ty && y < ty + SM_TH) { gui_open(&wins[i]); menu_open = 0; return; }
             }
             return;
         }
@@ -753,8 +998,12 @@ static void on_left_down(int x, int y) {
                     }
                 }
                 if (!w->maximized) { drag_id = i; drag_dx = x - w->x; drag_dy = y - w->y; }
-            } else if (w->click) {                  /* client area */
-                w->click(w, x - w->x, y - (w->y + TITLE_H));
+            } else {                                /* client area */
+                if (w->click) w->click(w, x - w->x, y - (w->y + TITLE_H));
+                if (w->drag) {                       /* begin a held-button drag stream */
+                    client_drag_id = i;
+                    w->drag(w, x - w->x, y - (w->y + TITLE_H));
+                }
             }
             return;
         }
@@ -775,6 +1024,34 @@ static void on_left_down(int x, int y) {
     desk_sel = -1;                                   /* click on empty wallpaper */
 }
 
+/* right-press over a window's client area -> its rclick handler */
+static void on_right_down(int x, int y) {
+    /* right-click a taskbar app button -> close/pin context menu */
+    if (y >= H - TASKBAR_H) {
+        int idx[MAX_WIN]; int vis = taskbar_list(idx);
+        for (int s = 0; s < vis; s++) {
+            int bx, by; taskbar_btn_rect(s, &bx, &by);
+            if (x >= bx && x < bx + TB_BTN && y >= by && y < by + TB_BTN) {
+                ctx_open = 1; ctx_win = idx[s];
+                ctx_x = bx; ctx_y = by; dirty = 1;
+                return;
+            }
+        }
+        ctx_open = 0; dirty = 1;
+        return;
+    }
+    ctx_open = 0;                              /* any other right-click closes it */
+
+    for (int z = ztop; z >= 0; z--)
+        for (int i = 0; i < nwin; i++) {
+            window_t *w = &wins[i];
+            if (!w->open || w->minimized || w->z != z) continue;
+            if (x < w->x || x >= w->x + w->w || y < w->y || y >= w->y + w->h) continue;
+            if (y >= w->y + TITLE_H && w->rclick) { gui_focus(w); w->rclick(w, x - w->x, y - (w->y + TITLE_H)); }
+            return;
+        }
+}
+
 static void handle_mouse(void) {
     int x = mlx(), y = mly();
     uint8_t b = mouse_buttons();
@@ -784,6 +1061,10 @@ static void handle_mouse(void) {
     if (drag_id >= 0) {                              /* dragging a window */
         if (b & MOUSE_LEFT) { wins[drag_id].x = x - drag_dx; wins[drag_id].y = y - drag_dy; clamp_window(&wins[drag_id]); }
         if (up & MOUSE_LEFT)  drag_id = -1;
+    } else if (client_drag_id >= 0) {                /* held-button drag inside an app's client area */
+        window_t *w = &wins[client_drag_id];
+        if ((b & MOUSE_LEFT) && w->drag) w->drag(w, x - w->x, y - (w->y + TITLE_H));
+        if (up & MOUSE_LEFT) client_drag_id = -1;
     } else if (desk_drag >= 0) {                     /* repositioning a desktop icon */
         if (b & MOUSE_LEFT) { dicons[desk_drag].x = x - desk_dx; dicons[desk_drag].y = y - desk_dy; deskicon_clamp(&dicons[desk_drag]); }
         if (up & MOUSE_LEFT)  desk_drag = -1;
@@ -797,12 +1078,13 @@ static void handle_mouse(void) {
         on_left_down(x, y);
     }
     if ((up & MOUSE_LEFT) && !dnd_active) { dnd_armed = 0; dnd_node = 0; }  /* armed click ended w/o a drag */
+    if (down & MOUSE_RIGHT) on_right_down(x, y);
     prev_btns = b;
     dirty = 1;                                      /* cursor moved -> repaint */
 }
 
 static void handle_key(char c) {
-    if (c == 27) { menu_open = 0; dirty = 1; return; }   /* Esc closes start menu */
+    if (c == 27) { menu_open = 0; ctx_open = 0; dirty = 1; return; }   /* Esc closes menus */
     int f = topmost();
     if (f >= 0 && wins[f].key) wins[f].key(&wins[f], c);
     dirty = 1;
@@ -814,21 +1096,22 @@ static void handle_key(char c) {
  *  letterboxed output rectangle on the physical panel, and the wallpaper.
  * ===========================================================================*/
 void gui_apply_display(void) {
-    /* logical desktop size from the resolution setting (clamped to the panel) */
+    /* Real native resolution: reprogram the GPU to the picked mode so the panel
+     * itself becomes that size. Logical desktop == physical panel, output fills
+     * it edge to edge -- no upscaling, no letterbox bars, always crisp. */
     int lw, lh; settings_res_dims(g_settings.res_index, &lw, &lh);
-    if (lw > PW) lw = PW; if (lw < 320) lw = 320;
-    if (lh > PH) lh = PH; if (lh < 240) lh = 240;
-    W = lw; H = lh;
+    if (lw > MAX_PW) lw = MAX_PW;
+    if (lh > MAX_PH) lh = MAX_PH;
 
-    /* output-rectangle shape from the aspect setting (Auto = logical aspect),
-     * maximised inside the physical panel and centred (letterbox bars around). */
-    int an, ad; settings_aspect_ratio(g_settings.aspect_index, &an, &ad);
-    if (an <= 0 || ad <= 0) { an = W; ad = H; }
-    int ow = PW, oh = PW * ad / an;
-    if (oh > PH) { oh = PH; ow = PH * an / ad; }
-    if (ow > PW) ow = PW;
-    out_w = ow; out_h = oh;
-    out_x = (PW - ow) / 2; out_y = (PH - oh) / 2;
+    if (hires_ok && (lw != PW || lh != PH)) {
+        if (fb_set_mode((uint32_t)lw, (uint32_t)lh) == 0) {
+            PW = lw; PH = lh;
+            mouse_set_bounds(PW, PH);
+        }
+        /* on failure the old mode stands; fall through with current PW,PH */
+    }
+    W = PW; H = PH;
+    out_x = 0; out_y = 0; out_w = PW; out_h = PH;
 
     g_clear_clip();                          /* clip now spans the new W,H */
 
@@ -873,9 +1156,26 @@ void gui_run(void) {
     out_x = out_y = 0; out_w = PW; out_h = PH;
     g_clear_clip();
 
-    BB = (uint32_t *)kmalloc((uint64_t)PW * PH * 4);
-    if (!BB) { console_detach(); shell_run(); return; }   /* no memory -> shell */
-    BG = (uint32_t *)kmalloc((uint64_t)PW * PH * 4);
+    /* Allocate the compositor backbuffers at the largest panel we support (4K)
+     * so a later resolution change just reuses them -- no realloc, no contig
+     * fragmentation mid-session. From the PMM (direct-mapped), since the 16 MiB
+     * kheap can't hold a 33 MiB buffer. Fall back to a boot-sized kheap buffer
+     * if that much contiguous RAM isn't available (hi-res then disabled). */
+    uint64_t maxpx    = (uint64_t)MAX_PW * MAX_PH;
+    uint64_t maxframes = (maxpx * 4 + 4095) / 4096;
+    uint64_t bbp = pmm_alloc_contig(maxframes);
+    uint64_t bgp = bbp ? pmm_alloc_contig(maxframes) : 0;
+    if (bbp && bgp) {
+        BB = (uint32_t *)P2V(bbp);
+        BG = (uint32_t *)P2V(bgp);
+        hires_ok = 1;
+    } else {
+        if (bbp) pmm_free_contig(bbp, maxframes);
+        BB = (uint32_t *)kmalloc((uint64_t)PW * PH * 4);
+        if (!BB) { console_detach(); shell_run(); return; }   /* no memory -> shell */
+        BG = (uint32_t *)kmalloc((uint64_t)PW * PH * 4);
+        hires_ok = 0;
+    }
 
     settings_init();           /* theme + logical size + letterbox + wallpaper */
 
@@ -886,9 +1186,28 @@ void gui_run(void) {
     browser_app_init();
     python_app_init();
     taskmgr_app_init();
+    calc_app_init();
+    clock_app_init();
+    notes_app_init();
+    calendar_app_init();
+    piano_app_init();
+    paint_app_init();
+    mines_app_init();
+    snake_app_init();
+    g2048_app_init();
+    stopwatch_app_init();
+    sysinfo_app_init();
+    life_app_init();
+    ttt_app_init();
+    colorpick_app_init();
+    memory_app_init();
+    matrix_app_init();
     settings_app_init();
-    for (int i = 0; i < nwin; i++) gui_open(&wins[i]);   /* show the apps */
-    if (nwin > 0) gui_focus(&wins[0]);                   /* terminal gets focus */
+    /* Every app gets a launcher icon on the desktop; double-click opens it. The
+     * taskbar starts empty and only fills with apps as they are opened (or that
+     * the user pins via the taskbar right-click menu). */
+    for (int i = 0; i < nwin; i++)
+        gui_desktop_add_app(&wins[i], wins[i].title, wins[i].icon);
 
     uint64_t tick_pit = pit_ticks();
     uint64_t sec_pit  = pit_ticks();
@@ -902,7 +1221,8 @@ void gui_run(void) {
         int ci; while ((ci = kbd_trygetc()) >= 0) handle_key((char)ci);
 
         uint64_t now = pit_ticks();
-        if (now - tick_pit >= 500) {                 /* ~2 Hz: clock, blink, sampling */
+        if (now - tick_pit >= 150) {                 /* ~6.6 Hz: app ticks, animation, sampling
+                                                      * (apps self-throttle slower work internally) */
             tick_pit = now;
             for (int i = 0; i < nwin; i++) if (wins[i].open && wins[i].tick) wins[i].tick(&wins[i]);
             dirty = 1;

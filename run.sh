@@ -22,7 +22,11 @@ exec "$QEMU" \
     -drive id=ssd,file="$ROOT/iso/disk-ssd.img",format=raw,if=none \
     -device ide-hd,drive=ssd,bus=ide.1,unit=1,rotation_rate=1 \
     -boot order=c \
-    -m 512M \
+    -m 2G \
+    -rtc base=utc \
+    -vga std -global VGA.vgamem_mb=64 \
+    -audiodev dsound,id=snd0 \
+    -machine pcspk-audiodev=snd0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
     -serial stdio \

@@ -63,3 +63,5 @@ void gdt_init(void) {
 
     __asm__ volatile("ltr %%ax" :: "a"((uint16_t)0x28));
 }
+
+void tss_set_rsp0(uint64_t top) { tss.rsp0 = top; }

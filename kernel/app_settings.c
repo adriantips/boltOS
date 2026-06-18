@@ -10,9 +10,13 @@
 #include "settings.h"
 #include "commands.h"     /* sh_utoa */
 #include "string.h"
+#include "pcspk.h"
+#include "pit.h"
 
 /* control kinds */
-enum { K_THEME = 1, K_ACCENT, K_WALLSTYLE, K_WALLCOLOR, K_RES, K_ASPECT };
+enum { K_THEME = 1, K_ACCENT, K_WALLSTYLE, K_WALLCOLOR, K_RES, K_AUDIO, K_AUDIOTEST };
+
+static uint64_t beep_off_at;      /* pit tick to silence the test tone, 0 = idle */
 
 typedef struct { int x, y, w, h; uint8_t kind, val; } hot_t;
 
@@ -115,9 +119,15 @@ static void settings_draw(window_t *w, int cx, int cy, int cw, int ch) {
     y = chip_row(x0, right, y, K_RES, settings_res_count(),
                  settings_res_name, g_settings.res_index);
 
-    y = section(x0, y, "Aspect ratio");
-    y = chip_row(x0, right, y, K_ASPECT, settings_aspect_count(),
-                 settings_aspect_name, g_settings.aspect_index);
+    y = section(x0, y, "Audio device");
+    y = chip_row(x0, right, y, K_AUDIO, settings_audio_count(),
+                 settings_audio_name, g_settings.audio_device);
+    {   /* test-tone button */
+        int tw = g_text_width("Test", 1) + 24;
+        chip(x0, y, "Test", 0);
+        hot_add(x0, y, tw, 30, K_AUDIOTEST, 0);
+        y += 30 + 16;
+    }
 
     /* info footer */
     int fy = cy + ch - 36;
@@ -126,10 +136,8 @@ static void settings_draw(window_t *w, int cx, int cy, int cw, int ch) {
     fmt_dims(d, sizeof(d), gui_panel_w(), gui_panel_h());
     line[0] = 0; kstrlcat(line, "Panel    ", sizeof(line)); kstrlcat(line, d, sizeof(line));
     g_text(x0, fy, line, COL_TEXT_DIM, 1);
-    fmt_dims(d, sizeof(d), gui_screen_w(), gui_screen_h());
-    line[0] = 0; kstrlcat(line, "Desktop  ", sizeof(line)); kstrlcat(line, d, sizeof(line));
-    kstrlcat(line, "  ", sizeof(line));
-    kstrlcat(line, settings_aspect_name(g_settings.aspect_index), sizeof(line));
+    line[0] = 0; kstrlcat(line, "Audio    ", sizeof(line));
+    kstrlcat(line, settings_audio_name(g_settings.audio_device), sizeof(line));
     g_text(x0 + 210, fy, line, COL_TEXT_DIM, 1);
 }
 
@@ -142,10 +150,21 @@ static void apply_hot(int kind, int val) {
     case K_WALLSTYLE: g_settings.wall_style = val; break;
     case K_WALLCOLOR: g_settings.wall_color = settings_wallcolor(val); break;
     case K_RES:       g_settings.res_index = val; break;
-    case K_ASPECT:    g_settings.aspect_index = val; break;
+    case K_AUDIO:     g_settings.audio_device = val; break;
+    case K_AUDIOTEST:
+        /* play 880 Hz for ~200 ms; the window tick silences it. Honours mute
+         * (pcspk_tone is a no-op when the device is set to Muted). */
+        pcspk_tone(880);
+        beep_off_at = pit_ticks() + 200;
+        return;                          /* no settings_apply needed */
     default: return;
     }
     settings_apply();
+}
+
+static void settings_tick(window_t *w) {
+    (void)w;
+    if (beep_off_at && pit_ticks() >= beep_off_at) { pcspk_off(); beep_off_at = 0; }
 }
 
 static void settings_click(window_t *w, int lx, int ly) {
@@ -163,6 +182,7 @@ void settings_app_init(void) {
     if (!win) return;
     win->draw  = settings_draw;
     win->click = settings_click;
+    win->tick  = settings_tick;
     win->min_w = 440; win->min_h = 340;
     win->x = 150; win->y = 80;
 }

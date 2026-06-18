@@ -12,6 +12,8 @@ static fs_node *cwd_;
 
 /* persistence state (see bottom of file) */
 static ata_dev *g_disk;        /* backing disk, or 0 for RAM-only */
+static uint64_t g_base;        /* first LBA of the BoltFS partition (0 = whole disk) */
+static uint64_t g_cap;         /* usable sectors from g_base (partition length) */
 static int      g_autosave;    /* flush on every mutation once mounted */
 static void     fs_autosave(void);
 
@@ -331,9 +333,9 @@ int fs_sync(void) {
     measure(root_, &cnt, &blob);
 
     uint64_t sectors = 1 + (blob + ATA_SECTOR - 1) / ATA_SECTOR;
-    if (sectors > g_disk->sectors) {
-        kprintf("fs_sync: image (%lu sectors) exceeds disk (%lu)\n",
-                (unsigned long)sectors, (unsigned long)g_disk->sectors);
+    if (sectors > g_cap) {
+        kprintf("fs_sync: image (%lu sectors) exceeds partition (%lu)\n",
+                (unsigned long)sectors, (unsigned long)g_cap);
         return -1;
     }
 
@@ -358,7 +360,7 @@ int fs_sync(void) {
     sb.checksum   = sum;
     memcpy(buf, &sb, sizeof sb);
 
-    int rc = ata_write(g_disk, 0, (uint32_t)sectors, buf);
+    int rc = ata_write(g_disk, g_base, (uint32_t)sectors, buf);
     kfree(buf);
     return rc;
 }
@@ -377,7 +379,7 @@ static int fs_load_image(void) {
     if (!g_disk) return -1;
 
     uint8_t sec0[ATA_SECTOR];
-    if (ata_read(g_disk, 0, 1, sec0) != 0) return -1;
+    if (ata_read(g_disk, g_base, 1, sec0) != 0) return -1;
     struct bfs_super *sb = (struct bfs_super *)sec0;
     if (memcmp(sb->magic, BFS_MAGIC, 8) != 0) return -1;
     if (sb->version != 1 || sb->node_count == 0) return -1;
@@ -385,11 +387,11 @@ static int fs_load_image(void) {
     uint64_t blob = sb->blob_bytes;
     uint32_t cnt  = sb->node_count;
     uint64_t sectors = (blob + ATA_SECTOR - 1) / ATA_SECTOR;
-    if (1 + sectors > g_disk->sectors || blob == 0) return -1;
+    if (1 + sectors > g_cap || blob == 0) return -1;
 
     uint8_t *buf = (uint8_t *)kmalloc(sectors * ATA_SECTOR);
     if (!buf) return -1;
-    if (ata_read(g_disk, 1, (uint32_t)sectors, buf) != 0) { kfree(buf); return -1; }
+    if (ata_read(g_disk, g_base + 1, (uint32_t)sectors, buf) != 0) { kfree(buf); return -1; }
 
     uint32_t sum = 0;
     for (uint64_t i = 0; i < blob; i++) sum += buf[i];
@@ -439,6 +441,43 @@ static int fs_load_image(void) {
     return 0;
 }
 
+/* Pick (or create) the partition BoltFS lives in. Prefers an existing BoltFS
+ * partition, else the first present partition; if the disk has no valid MBR it
+ * writes one with a single BoltFS partition aligned at 1 MiB. Sets g_base/g_cap. */
+static void fs_attach_partition(void) {
+    ata_part parts[4];
+    int n = ata_read_mbr(g_disk, parts);
+    int idx = -1;
+
+    if (n > 0) {
+        for (int i = 0; i < 4; i++)                  /* prefer a BoltFS partition */
+            if (parts[i].present && parts[i].type == ATA_PART_BOLTFS) { idx = i; break; }
+        if (idx < 0)
+            for (int i = 0; i < 4; i++)              /* else first present one    */
+                if (parts[i].present) { idx = i; break; }
+    }
+
+    if (idx < 0) {                                   /* no usable table -> create */
+        uint64_t start = 2048;                       /* 1 MiB alignment           */
+        if (start >= g_disk->sectors) start = 1;     /* tiny disk fallback        */
+        if (ata_write_mbr_single(g_disk, ATA_PART_BOLTFS, start) == 0 &&
+            ata_read_mbr(g_disk, parts) > 0) {
+            idx = 0;
+            kprintf("[ok] fs: wrote MBR, BoltFS partition @ LBA %lu\n",
+                    (unsigned long)start);
+        }
+    }
+
+    if (idx >= 0) {
+        g_base = parts[idx].lba_start;
+        g_cap  = parts[idx].sectors;
+    } else {                                         /* MBR unavailable -> raw disk */
+        g_base = 0;
+        g_cap  = g_disk->sectors;
+        kprintf("[--] fs: no partition table; using raw disk\n");
+    }
+}
+
 void fs_persist_init(void) {
     g_disk = ata_fs_disk();
     if (!g_disk) {
@@ -446,13 +485,16 @@ void fs_persist_init(void) {
         return;
     }
 
+    fs_attach_partition();
+
     if (fs_load_image() == 0) {
-        kprintf("[ok] fs: loaded image from %s '%s' (%d nodes)\n",
+        kprintf("[ok] fs: loaded image from %s '%s' part@LBA%lu (%d nodes)\n",
                 ata_media(g_disk), g_disk->model[0] ? g_disk->model : "disk",
-                fs_count_nodes());
+                (unsigned long)g_base, fs_count_nodes());
     } else {
-        kprintf("[ok] fs: formatting %s '%s' with seed tree\n",
-                ata_media(g_disk), g_disk->model[0] ? g_disk->model : "disk");
+        kprintf("[ok] fs: formatting %s '%s' part@LBA%lu with seed tree\n",
+                ata_media(g_disk), g_disk->model[0] ? g_disk->model : "disk",
+                (unsigned long)g_base);
     }
 
     g_autosave = 1;

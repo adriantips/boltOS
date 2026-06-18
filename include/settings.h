@@ -17,8 +17,9 @@ typedef struct {
     uint32_t accent;        /* accent colour override                   */
     int      wall_style;    /* WALL_*                                   */
     uint32_t wall_color;    /* wallpaper base colour                    */
-    int      res_index;     /* resolution table index (0 = native)      */
-    int      aspect_index;  /* aspect table index    (0 = auto)         */
+    int      res_index;     /* resolution table index (real DISPI mode)  */
+    int      aspect_index;  /* unused, kept for ABI                      */
+    int      audio_device;  /* 0 = PC Speaker, 1 = Muted                 */
 } settings_t;
 
 extern settings_t g_settings;
@@ -47,3 +48,6 @@ void        settings_res_dims(int i, int *w, int *h);   /* native/oversize -> pa
 int         settings_aspect_count(void);
 const char *settings_aspect_name(int i);
 void        settings_aspect_ratio(int i, int *num, int *den);  /* auto -> 0,0 */
+
+int         settings_audio_count(void);
+const char *settings_audio_name(int i);

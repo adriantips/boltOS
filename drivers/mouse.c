@@ -67,6 +67,14 @@ static void on_irq(struct registers *r) {
     }
 }
 
+/* Re-clamp the cursor to a new panel size after a resolution change. Keeps the
+ * pointer on screen instead of stranded off the new bottom-right edge. */
+void mouse_set_bounds(int screen_w, int screen_h) {
+    sw = screen_w; sh = screen_h;
+    if (mx > sw - 1) mx = sw - 1;
+    if (my > sh - 1) my = sh - 1;
+}
+
 void mouse_init(int screen_w, int screen_h) {
     sw = screen_w; sh = screen_h;
     mx = screen_w / 2; my = screen_h / 2;

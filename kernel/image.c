@@ -5,6 +5,7 @@
  *      - JPEG  (baseline sequential, Huffman, 4:4:4 / 4:2:2 / 4:2:0)
  *      - GIF   (87a/89a, first frame, LZW, transparency)
  *      - BMP   (24/32-bit uncompressed)
+ *      - TGA   (truecolor 24/32 + grayscale 8, uncompressed or RLE)
  *  Output is a 0xAARRGGBB buffer. Large images are box-downscaled on the way
  *  out so the resident cost stays small on the 16 MiB kernel heap.
  * ===========================================================================*/
@@ -355,6 +356,68 @@ static image_t *decode_bmp(const uint8_t *d, uint32_t len) {
             uint8_t al = bytespp == 4 ? s[3] : 255;
             px[y*w+x] = argb(al, s[2], s[1], s[0]);
         }
+    }
+    return finalize(px, w, h);
+}
+
+/* ===========================================================================
+ *  TGA / Targa (uncompressed + RLE; truecolor 24/32 and grayscale 8)
+ *  No magic number: only reached as the dispatch fallback, and every header
+ *  field is range-checked so a non-TGA blob fails cleanly to NULL.
+ * ===========================================================================*/
+static image_t *decode_tga(const uint8_t *d, uint32_t len) {
+    if (len < 18) return 0;
+    uint8_t idlen   = d[0];
+    uint8_t cmaptyp = d[1];
+    uint8_t imgtyp  = d[2];
+    int w   = (int)rd_le16(d + 12);
+    int h   = (int)rd_le16(d + 14);
+    int bpp = d[16];
+    uint8_t desc = d[17];
+
+    /* only non-colormapped truecolor/grayscale, raw (2/3) or RLE (10/11) */
+    if (cmaptyp != 0) return 0;
+    if (imgtyp != 2 && imgtyp != 3 && imgtyp != 10 && imgtyp != 11) return 0;
+    int rle = (imgtyp == 10 || imgtyp == 11);
+    if (bpp != 8 && bpp != 24 && bpp != 32) return 0;
+    if (w <= 0 || h <= 0 || (uint64_t)w*h > IMG_MAX_PIXELS) return 0;
+
+    int bytespp = bpp / 8;
+    uint32_t pos = 18u + idlen;          /* skip image-ID (no color map here) */
+    if (pos >= len) return 0;
+    int top = (desc & 0x20) != 0;        /* descriptor bit5: top-left origin  */
+
+    uint32_t *px = (uint32_t *)kmalloc((uint32_t)w * h * 4);
+    if (!px) return 0;
+
+    uint64_t total = (uint64_t)w * h, done = 0;
+    uint8_t pixbuf[4];
+    while (done < total) {
+        int count, raw;
+        if (rle) {
+            if (pos >= len) { kfree(px); return 0; }
+            uint8_t pkt = d[pos++];
+            count = (pkt & 0x7F) + 1;
+            raw   = !(pkt & 0x80);       /* high bit set => run packet */
+        } else { count = (int)(total - done); raw = 1; }
+        if ((uint64_t)count > total - done) count = (int)(total - done);
+
+        for (int i = 0; i < count; i++) {
+            if (raw || i == 0) {         /* run packet: read one pixel, repeat */
+                if (pos + (uint32_t)bytespp > len) { kfree(px); return 0; }
+                for (int b = 0; b < bytespp; b++) pixbuf[b] = d[pos++];
+            }
+            uint32_t argbpx;
+            if (bytespp == 1) argbpx = argb(255, pixbuf[0], pixbuf[0], pixbuf[0]);
+            else argbpx = argb(bytespp == 4 ? pixbuf[3] : 255,
+                               pixbuf[2], pixbuf[1], pixbuf[0]);
+            uint64_t idx = done + i;
+            int x = (int)(idx % (uint64_t)w);
+            int y = (int)(idx / (uint64_t)w);
+            int ry = top ? y : (h - 1 - y);
+            px[ry*w + x] = argbpx;
+        }
+        done += count;
     }
     return finalize(px, w, h);
 }
@@ -769,7 +832,7 @@ image_t *image_decode(const uint8_t *buf, uint32_t len) {
     if (buf[0]==0xFF && buf[1]==0xD8)                                return decode_jpeg(buf, len);
     if (buf[0]=='G' && buf[1]=='I' && buf[2]=='F')                  return decode_gif(buf, len);
     if (buf[0]=='B' && buf[1]=='M')                                  return decode_bmp(buf, len);
-    return 0;
+    return decode_tga(buf, len);   /* no magic: validated fallback */
 }
 
 void image_free(image_t *im) {

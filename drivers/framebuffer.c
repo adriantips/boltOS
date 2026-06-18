@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "framebuffer.h"
+#include "io.h"
 #include "mm.h"
 
 /* The VESA linear framebuffer the bootloader selected. It lives below 4 GiB
@@ -13,6 +14,47 @@ void fb_init(struct bootinfo *bi) {
     fw       = bi->fb_width;
     fh       = bi->fb_height;
     pitch_px = bi->fb_pitch ? bi->fb_pitch / 4 : bi->fb_width;
+}
+
+/* ---- Bochs/QEMU DISPI runtime mode switch ------------------------------- *
+ * QEMU's default "std" (Bochs) VGA exposes the DISPI register interface on I/O
+ * ports 0x01CE (index) / 0x01CF (data). Writing XRES/YRES/BPP and re-enabling
+ * with the LFB bit gives a real native-resolution linear framebuffer at the
+ * same BAR (so the base pointer never moves). No BIOS, no real-mode trip, no
+ * upscaling and no letterbox bars -- the panel itself becomes the new size. */
+#define DISPI_INDEX   0x01CE
+#define DISPI_DATA    0x01CF
+#define DI_XRES       1
+#define DI_YRES       2
+#define DI_BPP        3
+#define DI_ENABLE     4
+#define DI_VIRT_W     6
+#define DI_BANK       5
+#define DI_X_OFF      8
+#define DI_Y_OFF      9
+#define DI_EN_ENABLED 0x01
+#define DI_EN_LFB     0x40
+
+static void dispi_w(uint16_t idx, uint16_t val) { outw(DISPI_INDEX, idx); outw(DISPI_DATA, val); }
+static uint16_t dispi_r(uint16_t idx) { outw(DISPI_INDEX, idx); return inw(DISPI_DATA); }
+
+/* Reprogram the panel to w*h, 32bpp, linear. Returns 0 on success. The LFB BAR
+ * is unchanged so `fb` stays valid; we only update the cached geometry. */
+int fb_set_mode(uint32_t w, uint32_t h) {
+    if (!fb || !w || !h) return -1;
+    dispi_w(DI_ENABLE, 0);                 /* disable while reprogramming      */
+    dispi_w(DI_XRES,   (uint16_t)w);
+    dispi_w(DI_YRES,   (uint16_t)h);
+    dispi_w(DI_BPP,    32);
+    dispi_w(DI_VIRT_W, (uint16_t)w);       /* pitch = width (no padding)       */
+    dispi_w(DI_BANK,   0);
+    dispi_w(DI_X_OFF,  0);
+    dispi_w(DI_Y_OFF,  0);
+    dispi_w(DI_ENABLE, DI_EN_ENABLED | DI_EN_LFB);
+    /* verify the card accepted it; on a non-DISPI adapter the readback differs */
+    if (dispi_r(DI_XRES) != (uint16_t)w || dispi_r(DI_YRES) != (uint16_t)h) return -1;
+    fw = w; fh = h; pitch_px = w;
+    return 0;
 }
 
 int      fb_present(void) { return fb != 0; }

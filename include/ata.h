@@ -42,3 +42,29 @@ int       ata_read (ata_dev *d, uint64_t lba, uint32_t count, void *buf);
 int       ata_write(ata_dev *d, uint64_t lba, uint32_t count, const void *buf);
 
 const char *ata_media(const ata_dev *d);   /* "SSD" / "HDD" */
+
+/* ===========================================================================
+ *  MBR partition table (LBA 0).  The classic DOS/MBR layout: 446 bytes of boot
+ *  code, four 16-byte primary partition entries at offset 446, then the 0x55AA
+ *  signature. BoltFS lives inside a dedicated partition so its data is kept
+ *  apart from the raw boot image / sector 0.
+ * ===========================================================================*/
+#define MBR_SIG_OFF    510         /* offset of the 0x55 0xAA boot signature   */
+#define MBR_PART_OFF   446         /* offset of the first partition entry      */
+#define ATA_PART_BOLTFS 0xBF       /* private partition type byte for BoltFS   */
+
+typedef struct ata_part {
+    int      present;      /* 1 = non-empty entry (type != 0, length != 0)     */
+    uint8_t  boot;         /* 0x80 = active/bootable                           */
+    uint8_t  type;         /* partition type byte                              */
+    uint64_t lba_start;    /* first LBA of the partition                       */
+    uint64_t sectors;      /* partition length in 512-byte sectors            */
+} ata_part;
+
+/* Parse d's MBR into out[4]. Returns the count of non-empty primary partitions
+ * (0..4), or -1 on a read error or a missing 0x55AA signature. */
+int ata_read_mbr(ata_dev *d, ata_part out[4]);
+
+/* Write a fresh MBR holding a single partition of `type` spanning the disk from
+ * LBA `start` to the end (other three entries cleared). Returns 0 on success. */
+int ata_write_mbr_single(ata_dev *d, uint8_t type, uint64_t start);

@@ -227,3 +227,61 @@ int ata_read (ata_dev *d, uint64_t lba, uint32_t count, void *buf) {
 int ata_write(ata_dev *d, uint64_t lba, uint32_t count, const void *buf) {
     return rw(d, lba, count, (uint8_t *)(uintptr_t)buf, 1);
 }
+
+/* ---------------------------------------------------------------------------
+ *  MBR partition table.  Entries are little-endian; lba_start/sectors are the
+ *  32-bit LBA fields at offsets 8 and 12 of each 16-byte entry.
+ * ---------------------------------------------------------------------------*/
+static uint32_t rd_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+int ata_read_mbr(ata_dev *d, ata_part out[4]) {
+    if (!d || !d->present || !out) return -1;
+
+    uint8_t sec[ATA_SECTOR];
+    if (ata_read(d, 0, 1, sec) != 0) return -1;
+    if (sec[MBR_SIG_OFF] != 0x55 || sec[MBR_SIG_OFF + 1] != 0xAA) return -1;
+
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = sec + MBR_PART_OFF + i * 16;
+        ata_part *p = &out[i];
+        memset(p, 0, sizeof *p);
+        p->boot      = e[0];
+        p->type      = e[4];
+        p->lba_start = rd_le32(e + 8);
+        p->sectors   = rd_le32(e + 12);
+        if (p->type != 0 && p->sectors != 0) { p->present = 1; n++; }
+    }
+    return n;
+}
+
+static void wr_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+int ata_write_mbr_single(ata_dev *d, uint8_t type, uint64_t start) {
+    if (!d || !d->present || start == 0 || start >= d->sectors) return -1;
+
+    uint8_t sec[ATA_SECTOR];
+    memset(sec, 0, sizeof sec);
+
+    uint64_t count = d->sectors - start;
+    if (count > 0xFFFFFFFFull) count = 0xFFFFFFFFull;   /* 32-bit LBA field cap */
+
+    uint8_t *e = sec + MBR_PART_OFF;        /* first partition entry */
+    e[0] = 0x00;                            /* not bootable          */
+    e[1] = 0xFE; e[2] = 0xFF; e[3] = 0xFF;  /* CHS start: unused/max */
+    e[4] = type;
+    e[5] = 0xFE; e[6] = 0xFF; e[7] = 0xFF;  /* CHS end:   unused/max */
+    wr_le32(e + 8,  (uint32_t)start);
+    wr_le32(e + 12, (uint32_t)count);
+
+    sec[MBR_SIG_OFF]     = 0x55;
+    sec[MBR_SIG_OFF + 1] = 0xAA;
+
+    return ata_write(d, 0, 1, sec);
+}

@@ -64,6 +64,7 @@ struct window {
     int      x, y, w, h;            /* outer rectangle (includes title bar)   */
     int      min_w, min_h;
     int      open;                  /* registered + visible                   */
+    int      pinned;                /* kept on the taskbar even when closed   */
     int      minimized, maximized;
     int      rx, ry, rw, rh;        /* saved rect for un-maximise             */
     int      z;                     /* stacking order (higher = nearer front) */
@@ -72,13 +73,15 @@ struct window {
     /* client area is (x, y+TITLE_H, w, h-TITLE_H); callbacks get it as cx..ch */
     void (*draw) (window_t *, int cx, int cy, int cw, int ch);
     void (*key)  (window_t *, char c);
-    void (*click)(window_t *, int lx, int ly);   /* client-local mouse click  */
+    void (*click) (window_t *, int lx, int ly);  /* client-local left click   */
+    void (*rclick)(window_t *, int lx, int ly);  /* client-local right click  */
+    void (*drag) (window_t *, int lx, int ly);   /* held-button motion over client (client-local) */
     void (*tick) (window_t *);                    /* periodic update (~2 Hz)   */
     void  *st;                       /* app private state                      */
 };
 
 enum { ICON_NONE = 0, ICON_TERMINAL, ICON_TASKMGR, ICON_START, ICON_FILES, ICON_SETTINGS,
-       ICON_BROWSER, ICON_FOLDER, ICON_FILE, ICON_TRASH };
+       ICON_BROWSER, ICON_FOLDER, ICON_FILE, ICON_TRASH, ICON_CALC, ICON_CLOCK, ICON_NOTES, ICON_CALENDAR, ICON_PIANO, ICON_PAINT, ICON_MINES, ICON_SNAKE, ICON_2048, ICON_STOPWATCH, ICON_SYSINFO, ICON_LIFE, ICON_TTT, ICON_COLOR, ICON_MEMORY, ICON_MATRIX };
 
 window_t *gui_add_window(const char *title, int w, int h, uint32_t accent, int icon);
 void      gui_open(window_t *win);          /* show + focus + raise           */
@@ -104,6 +107,7 @@ void      gui_apply_display(void);
  *  shortcut. Double-clicking a desktop icon opens it via files_open_node().    */
 struct fs_node;
 void gui_desktop_add(struct fs_node *node, const char *label, int icon); /* seed a shortcut */
+void gui_desktop_add_app(window_t *win, const char *label, int icon);    /* seed an app launcher */
 void gui_begin_item_drag(struct fs_node *node, const char *label, int icon); /* arm a drag */
 
 /* ---- apps -------------------------------------------------------------- */
@@ -113,4 +117,20 @@ void settings_app_init(void);
 void browser_app_init(void);
 void files_app_init(void);
 void python_app_init(void);
+void calc_app_init(void);
+void clock_app_init(void);
+void notes_app_init(void);
+void calendar_app_init(void);
+void piano_app_init(void);
+void paint_app_init(void);
+void mines_app_init(void);
+void snake_app_init(void);
+void g2048_app_init(void);
+void stopwatch_app_init(void);
+void sysinfo_app_init(void);
+void life_app_init(void);
+void ttt_app_init(void);
+void colorpick_app_init(void);
+void memory_app_init(void);
+void matrix_app_init(void);
 void files_open_node(struct fs_node *n);   /* open a folder in the explorer / a file in its viewer */

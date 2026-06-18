@@ -17,6 +17,8 @@
 #include "pit.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "mm.h"
+#include "syscall.h"
 #include "kheap.h"
 #include "keyboard.h"
 #include "mouse.h"
@@ -27,6 +29,8 @@
 #include "shell.h"
 #include "gui.h"
 #include "netif.h"
+#include "vfs.h"
+#include "proc.h"
 
 /* Demo kernel threads: prove preemptive switching by heart-beating to serial
  * (the GUI owns the framebuffer console, so threads stay off it). hlt parks the
@@ -44,6 +48,30 @@ static void demo_thread_b(void) {
         if (pit_ticks() - last >= 1000) { last = pit_ticks(); serial_putc('B'); }
         __asm__ volatile("hlt");
     }
+}
+
+/* Ring-3 user program. The build cross-compiles user/hello.c into a static
+ * ET_EXEC ELF and embeds the raw bytes here. We seed it into the filesystem at
+ * /bin/hello, then exec it through the ELF64 loader: a fresh address space is
+ * built, the PT_LOAD segments are mapped, a SysV entry stack is laid out, and
+ * the program is scheduled as a ring-3 thread with its own fd table + heap. */
+extern const uint8_t _binary_hello_elf_start[];
+extern const uint8_t _binary_hello_elf_end[];
+
+static void launch_user_demo(void) {
+    syscall_init();   kprintf("[ok] SYSCALL/SYSRET armed (LSTAR + EFER.SCE)\n");
+
+    uint64_t len = (uint64_t)(_binary_hello_elf_end - _binary_hello_elf_start);
+    fs_node *n = fs_lookup("/bin/hello");
+    if (!n) { fs_create("/bin", 1); n = fs_create("/bin/hello", 0); }
+    if (!n || fs_write(n, _binary_hello_elf_start, (uint32_t)len) != 0) {
+        kprintf("[--] could not seed /bin/hello\n");
+        return;
+    }
+    kprintf("[ok] seeded /bin/hello (%lu bytes)\n", len);
+
+    if (proc_exec("/bin/hello") < 0)
+        kprintf("[--] proc_exec(/bin/hello) failed\n");
 }
 
 void kmain(struct bootinfo *bi) {
@@ -91,12 +119,15 @@ void kmain(struct bootinfo *bi) {
     ata_init();      /* probe ATA disks (HDD/SSD) before the FS attaches */
     fs_init();       kprintf("[ok] ramfs mounted (/)\n");
     fs_persist_init();/* back the tree with a real disk + load saved image */
+    vfs_init();      kprintf("[ok] VFS (ramfs + /dev + /proc)\n");
+    proc_init();
     sysreg_init();   kprintf("[ok] service + task registry\n");
     net_init();      /* netif core + NIC driver probe (e1000 under QEMU) */
 
     sched_init();                         /* adopt current context as thread 0 */
     sched_add(demo_thread_a, "demoA");
     sched_add(demo_thread_b, "demoB");
+    launch_user_demo();                   /* ring-3 user thread + syscalls */
     kprintf("[ok] preemptive scheduler (%d threads)\n", sched_count());
 
     evlog("framebuffer console came up");

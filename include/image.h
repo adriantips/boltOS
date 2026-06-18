@@ -3,7 +3,7 @@
 
 /* ===========================================================================
  *  BoltOS image decoder. Turns an in-memory PNG / JPEG (baseline) / GIF / BMP
- *  byte stream into a 32-bit ARGB pixel buffer. Everything is integer-only (the
+ *  / TGA byte stream into a 32-bit ARGB pixel buffer. Everything is integer-only (the
  *  kernel is built with no FPU), and decoded images are box-downscaled so a
  *  single image never pins more than a few hundred KiB of the 16 MiB heap.
  * ===========================================================================*/

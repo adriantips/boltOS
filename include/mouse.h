@@ -10,6 +10,7 @@
 #define MOUSE_MIDDLE 0x04
 
 void    mouse_init(int screen_w, int screen_h);
+void    mouse_set_bounds(int screen_w, int screen_h);   /* re-clamp after a res change */
 int     mouse_x(void);
 int     mouse_y(void);
 uint8_t mouse_buttons(void);

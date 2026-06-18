@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include "settings.h"
 #include "gui.h"
+#include "pcspk.h"
 
 /* Live palette. Starts as the Midnight preset so any early COL_* read (before
  * settings_init) still produces a sane dark desktop. */
@@ -56,15 +57,22 @@ static const uint32_t wallcolors[] = {
 
 static const char *wallstyle_names[] = { "Gradient", "Solid", "Glow", "Grid" };
 
-/* ---- resolution table (logical desktop size) ---------------------------- */
+/* ---- resolution table (REAL physical panel size via DISPI) -------------- *
+ * These reprogram the GPU to a true native mode -- the framebuffer becomes the
+ * picked size with no upscaling and no letterbox bars, so the picture stays
+ * crisp at every step. 1024x768 is the boot default. */
 static const struct { const char *name; int w, h; } res_tab[] = {
-    { "Native", 0, 0 },        /* 0,0 -> physical panel size */
-    { "960x720", 960, 720 },
-    { "800x600", 800, 600 },
-    { "640x480", 640, 480 },
-    { "512x384", 512, 384 },
+    { "1024x768", 1024, 768 },
+    { "720p",     1280, 720  },
+    { "1080p",    1920, 1080 },
+    { "1440p",    2560, 1440 },
+    { "4K",       3840, 2160 },
 };
 #define NRES ((int)(sizeof(res_tab) / sizeof(res_tab[0])))
+
+/* ---- audio output device ------------------------------------------------ */
+static const char *audio_names[] = { "PC Speaker", "Muted" };
+#define NAUDIO ((int)(sizeof(audio_names) / sizeof(audio_names[0])))
 
 /* ---- aspect table (output rectangle shape) ------------------------------ */
 static const struct { const char *name; int num, den; } asp_tab[] = {
@@ -94,17 +102,14 @@ const char *settings_wallstyle_name(int i)   { return (i >= 0 && i < WALL_COUNT)
 int         settings_res_count(void)         { return NRES; }
 const char *settings_res_name(int i)         { return (i >= 0 && i < NRES) ? res_tab[i].name : ""; }
 void settings_res_dims(int i, int *w, int *h) {
-    int pw = gui_panel_w(), ph = gui_panel_h();
-    int rw = (i >= 0 && i < NRES) ? res_tab[i].w : 0;
-    int rh = (i >= 0 && i < NRES) ? res_tab[i].h : 0;
-    if (rw <= 0 || rh <= 0) { rw = pw; rh = ph; }   /* native */
-    if (rw > pw) rw = pw;                            /* never exceed the panel */
-    if (rh > ph) rh = ph;
-    if (rw < 320) rw = 320;
-    if (rh < 240) rh = 240;
+    int rw = (i >= 0 && i < NRES) ? res_tab[i].w : 1024;
+    int rh = (i >= 0 && i < NRES) ? res_tab[i].h : 768;
     if (w) *w = rw;
     if (h) *h = rh;
 }
+
+int         settings_audio_count(void)       { return NAUDIO; }
+const char *settings_audio_name(int i)       { return (i >= 0 && i < NAUDIO) ? audio_names[i] : ""; }
 
 int         settings_aspect_count(void)      { return NASP; }
 const char *settings_aspect_name(int i)      { return (i >= 0 && i < NASP) ? asp_tab[i].name : ""; }
@@ -127,8 +132,9 @@ void settings_init(void) {
     g_settings.accent       = settings_theme_accent(0);
     g_settings.wall_style   = WALL_GRADIENT;
     g_settings.wall_color   = 0x0A1733;
-    g_settings.res_index    = 0;     /* native */
-    g_settings.aspect_index = 0;     /* auto   */
+    g_settings.res_index    = 0;     /* 1024x768 boot default */
+    g_settings.aspect_index = 0;     /* unused (kept for ABI) */
+    g_settings.audio_device = 0;     /* PC Speaker */
     settings_apply();
 }
 
@@ -139,5 +145,6 @@ void settings_apply(void) {
     /* user accent overrides the preset's; derive a dim variant for it */
     g_theme.accent     = g_settings.accent;
     g_theme.accent_dim = shade(g_settings.accent, 158);
-    gui_apply_display();             /* relayout + re-render wallpaper + repaint */
+    pcspk_set_enabled(g_settings.audio_device == 0);   /* PC Speaker vs Muted */
+    gui_apply_display();             /* re-mode the panel + repaint if changed */
 }
