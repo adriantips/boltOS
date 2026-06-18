@@ -20,6 +20,7 @@ typedef struct {
     int      res_index;     /* resolution table index (real DISPI mode)  */
     int      aspect_index;  /* unused, kept for ABI                      */
     int      audio_device;  /* 0 = PC Speaker, 1 = Muted                 */
+    int      font;          /* 0 = Retro 8x8, 1 = Arial 8x16 (default)   */
 } settings_t;
 
 extern settings_t g_settings;
@@ -51,3 +52,6 @@ void        settings_aspect_ratio(int i, int *num, int *den);  /* auto -> 0,0 */
 
 int         settings_audio_count(void);
 const char *settings_audio_name(int i);
+
+int         settings_font_count(void);
+const char *settings_font_name(int i);

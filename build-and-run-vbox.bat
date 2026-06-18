@@ -51,7 +51,7 @@ if errorlevel 1 (
 )
 
 echo [*] Configuring %VMNAME%...
-%VBOX% modifyvm %VMNAME% --memory 512 --cpus 1 --pae off --longmode on --ioapic off --chipset piix3 --firmware bios --hwvirtex off --nestedpaging off
+%VBOX% modifyvm %VMNAME% --memory 512 --cpus 4 --pae on --longmode on --ioapic on --chipset piix3 --firmware bios --hwvirtex on --nestedpaging on --vram 128 --graphicscontroller vboxvga --boot1 disk --boot2 dvd
 if errorlevel 1 (
     echo ERROR: Failed to configure VM
     exit /b 1
@@ -64,8 +64,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo [*] Converting to VDI...
+set VDI=%ROOT%iso\boltos.vdi
+if exist "%VDI%" del "%VDI%"
+set PADDED=%ROOT%iso\os_padded.img
+copy "%ROOT%iso\os.img" "%PADDED%" >nul
+powershell -Command "$f=[System.IO.File]::Open('%PADDED%', [System.IO.FileMode]::Open); $f.SetLength(1048576); $f.Close()" >nul
+%VBOX% convertfromraw "%PADDED%" "%VDI%" --format VDI >nul 2>&1
+del "%PADDED%" 2>nul
+if not exist "%VDI%" (
+    echo ERROR: Failed to create VDI
+    exit /b 1
+)
 echo [*] Attaching HDD...
-%VBOX% storageattach %VMNAME% --storagectl IDE --port 0 --device 0 --type hdd --medium "%ROOT%iso\os.img" --mtype writethrough
+%VBOX% storageattach %VMNAME% --storagectl IDE --port 0 --device 0 --type hdd --medium "%VDI%"
 if errorlevel 1 (
     echo ERROR: Failed to attach HDD
     exit /b 1
@@ -77,6 +89,9 @@ if errorlevel 1 (
     echo ERROR: Failed to attach ISO
     exit /b 1
 )
+
+echo [*] Configuring serial...
+%VBOX% modifyvm %VMNAME% --uart1 0x3F8 4 --uartmode1 server \\.\pipe\boltos
 
 echo [*] Configuring NIC...
 %VBOX% modifyvm %VMNAME% --nic1 nat --nictype1 82540EM

@@ -21,7 +21,13 @@
 #include "string.h"
 #include "fs.h"
 
-extern const unsigned char font8x8_basic[128][8];
+extern const unsigned char font8x8_basic[128][8];   /* 8x8 retro face   */
+extern const unsigned char font_8x16[95][16];        /* 8x16 Arial face  */
+
+/* Active GUI font face (FONT_RETRO / FONT_ARIAL). Arial is the default; the
+ * Settings app flips this via g_set_font. Both faces are 8px wide so every
+ * x-advance and width calc is identical -- only the glyph height differs. */
+static int g_font = FONT_ARIAL;
 
 #define TITLE_H    32
 #define TASKBAR_H  48
@@ -116,14 +122,35 @@ static void g_round_top(int x, int y, int w, int h, int r, uint32_t c) {
 }
 
 /* ---- text --------------------------------------------------------------- */
+/* Fetch the bitmap rows + row count of one glyph in the active face. Returns
+ * NULL for a blank/uncovered glyph (nothing to draw). Both faces are 8px wide.
+ * The 8x8 retro face packs bit 0 = leftmost pixel; the 8x16 Arial face packs
+ * bit 7 = leftmost. glyph_bit() hides that so the draw loops stay uniform. */
+static const unsigned char *glyph_rows(unsigned char u, int *rows) {
+    if (g_font == FONT_ARIAL) {
+        *rows = 16;
+        if (u >= 32 && u <= 126) return font_8x16[u - 32];
+        return 0;                                  /* outside Arial range -> blank */
+    }
+    *rows = 8;
+    if (u < 128) return font8x8_basic[u];
+    return 0;
+}
+/* is column rx (0 = leftmost) lit in this glyph row? */
+static inline int glyph_bit(unsigned char bits, int rx) {
+    return (g_font == FONT_ARIAL) ? (bits & (0x80u >> rx)) : (bits & (1u << rx));
+}
+
+int g_font_height(int scale) { return (g_font == FONT_ARIAL ? 16 : 8) * scale; }
+
 void g_char(int x, int y, char ch, uint32_t color, int s) {
-    unsigned char u = (unsigned char)ch;
-    if (u >= 128) return;
-    const unsigned char *g = font8x8_basic[u];
-    for (int ry = 0; ry < 8; ry++) {
+    int rows;
+    const unsigned char *g = glyph_rows((unsigned char)ch, &rows);
+    if (!g) return;
+    for (int ry = 0; ry < rows; ry++) {
         unsigned char bits = g[ry];
         for (int rx = 0; rx < 8; rx++)
-            if (bits & (1u << rx)) g_fill(x + rx * s, y + ry * s, s, s, color);
+            if (glyph_bit(bits, rx)) g_fill(x + rx * s, y + ry * s, s, s, color);
     }
 }
 void g_text(int x, int y, const char *str, uint32_t color, int s) {
@@ -132,18 +159,20 @@ void g_text(int x, int y, const char *str, uint32_t color, int s) {
 int g_text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
 
 /* ---- proportional text -------------------------------------------------- *
- * Per-glyph metrics are derived once from the bitmap font: the ink box (first
- * and last lit column) gives a left bearing and a tight advance; blanks get a
- * fixed word-space. Glyphs are drawn left-trimmed to their ink so spacing is
- * even. Used by the browser body for prose; the rest of the UI stays monospace.*/
+ * Per-glyph metrics are derived once from the active bitmap font: the ink box
+ * (first and last lit column) gives a left bearing and a tight advance; blanks
+ * get a fixed word-space. Glyphs are drawn left-trimmed to their ink so spacing
+ * is even. Used by the browser body for prose; the rest of the UI stays
+ * monospace. Rebuilt whenever the font face changes (gp_ready cleared).        */
 static int gp_adv[128], gp_minc[128], gp_ready = 0;
 static void gp_build(void) {
     for (int u = 0; u < 128; u++) {
-        const unsigned char *g = font8x8_basic[u];
+        int rows;
+        const unsigned char *g = glyph_rows((unsigned char)u, &rows);
         int minc = 8, maxc = -1;
-        for (int ry = 0; ry < 8; ry++) {
+        if (g) for (int ry = 0; ry < rows; ry++) {
             unsigned char b = g[ry];
-            for (int rx = 0; rx < 8; rx++) if (b & (1u << rx)) { if (rx < minc) minc = rx; if (rx > maxc) maxc = rx; }
+            for (int rx = 0; rx < 8; rx++) if (glyph_bit(b, rx)) { if (rx < minc) minc = rx; if (rx > maxc) maxc = rx; }
         }
         if (maxc < 0) { gp_adv[u] = 4; gp_minc[u] = 0; }      /* space / blank glyph */
         else          { gp_adv[u] = (maxc - minc + 1) + 1; gp_minc[u] = minc; }
@@ -158,15 +187,27 @@ int g_glyph_adv(char c, int scale) {
 void g_char_p(int x, int y, char ch, uint32_t color, int s, int italic) {
     unsigned char u = (unsigned char)ch; if (u >= 128) u = '?';
     if (!gp_ready) gp_build();
-    const unsigned char *g = font8x8_basic[u];
+    int rows;
+    const unsigned char *g = glyph_rows(u, &rows);
+    if (!g) return;
     int minc = gp_minc[u];
-    for (int ry = 0; ry < 8; ry++) {
+    for (int ry = 0; ry < rows; ry++) {
         unsigned char bits = g[ry];
-        int sk = italic ? ((7 - ry) * s) / 3 : 0;            /* fake-italic shear */
+        int sk = italic ? ((rows - 1 - ry) * s) / 3 : 0;     /* fake-italic shear */
         for (int rx = 0; rx < 8; rx++)
-            if (bits & (1u << rx)) g_fill(x + (rx - minc) * s + sk, y + ry * s, s, s, color);
+            if (glyph_bit(bits, rx)) g_fill(x + (rx - minc) * s + sk, y + ry * s, s, s, color);
     }
 }
+
+/* swap the active GUI font face; clears proportional metrics so they rebuild */
+void g_set_font(int face) {
+    int f = (face == FONT_ARIAL) ? FONT_ARIAL : FONT_RETRO;
+    if (f == g_font) return;
+    g_font = f;
+    gp_ready = 0;
+    gui_request_redraw();
+}
+int g_get_font(void) { return g_font; }
 int g_text_width_pn(const char *s, int len, int scale) {
     int w = 0; for (int i = 0; i < len; i++) w += g_glyph_adv(s[i], scale); return w;
 }

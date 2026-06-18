@@ -74,6 +74,10 @@ static const struct { const char *name; int w, h; } res_tab[] = {
 static const char *audio_names[] = { "PC Speaker", "Muted" };
 #define NAUDIO ((int)(sizeof(audio_names) / sizeof(audio_names[0])))
 
+/* ---- UI font face ------------------------------------------------------- */
+static const char *font_names[] = { "Retro 8x8", "Arial" };
+#define NFONT ((int)(sizeof(font_names) / sizeof(font_names[0])))
+
 /* ---- aspect table (output rectangle shape) ------------------------------ */
 static const struct { const char *name; int num, den; } asp_tab[] = {
     { "Auto", 0, 0 },          /* 0,0 -> preserve logical aspect */
@@ -111,6 +115,9 @@ void settings_res_dims(int i, int *w, int *h) {
 int         settings_audio_count(void)       { return NAUDIO; }
 const char *settings_audio_name(int i)       { return (i >= 0 && i < NAUDIO) ? audio_names[i] : ""; }
 
+int         settings_font_count(void)        { return NFONT; }
+const char *settings_font_name(int i)        { return (i >= 0 && i < NFONT) ? font_names[i] : ""; }
+
 int         settings_aspect_count(void)      { return NASP; }
 const char *settings_aspect_name(int i)      { return (i >= 0 && i < NASP) ? asp_tab[i].name : ""; }
 void settings_aspect_ratio(int i, int *num, int *den) {
@@ -135,6 +142,7 @@ void settings_init(void) {
     g_settings.res_index    = 0;     /* 1024x768 boot default */
     g_settings.aspect_index = 0;     /* unused (kept for ABI) */
     g_settings.audio_device = 0;     /* PC Speaker */
+    g_settings.font         = 1;     /* Arial (8x16) is the default face */
     settings_apply();
 }
 
@@ -146,5 +154,6 @@ void settings_apply(void) {
     g_theme.accent     = g_settings.accent;
     g_theme.accent_dim = shade(g_settings.accent, 158);
     pcspk_set_enabled(g_settings.audio_device == 0);   /* PC Speaker vs Muted */
+    g_set_font(g_settings.font);                        /* swap the GUI font face */
     gui_apply_display();             /* re-mode the panel + repaint if changed */
 }

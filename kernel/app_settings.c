@@ -14,7 +14,7 @@
 #include "pit.h"
 
 /* control kinds */
-enum { K_THEME = 1, K_ACCENT, K_WALLSTYLE, K_WALLCOLOR, K_RES, K_AUDIO, K_AUDIOTEST };
+enum { K_THEME = 1, K_ACCENT, K_WALLSTYLE, K_WALLCOLOR, K_RES, K_AUDIO, K_AUDIOTEST, K_FONT };
 
 static uint64_t beep_off_at;      /* pit tick to silence the test tone, 0 = idle */
 
@@ -115,6 +115,10 @@ static void settings_draw(window_t *w, int cx, int cy, int cw, int ch) {
     y = swatch_row(x0, right, y, K_WALLCOLOR, settings_wallcolor_count(),
                    settings_wallcolor, g_settings.wall_color);
 
+    y = section(x0, y, "Font");
+    y = chip_row(x0, right, y, K_FONT, settings_font_count(),
+                 settings_font_name, g_settings.font);
+
     y = section(x0, y, "Resolution");
     y = chip_row(x0, right, y, K_RES, settings_res_count(),
                  settings_res_name, g_settings.res_index);
@@ -151,6 +155,7 @@ static void apply_hot(int kind, int val) {
     case K_WALLCOLOR: g_settings.wall_color = settings_wallcolor(val); break;
     case K_RES:       g_settings.res_index = val; break;
     case K_AUDIO:     g_settings.audio_device = val; break;
+    case K_FONT:      g_settings.font = val; break;
     case K_AUDIOTEST:
         /* play 880 Hz for ~200 ms; the window tick silences it. Honours mute
          * (pcspk_tone is a no-op when the device is set to Muted). */
@@ -178,7 +183,7 @@ static void settings_click(window_t *w, int lx, int ly) {
 }
 
 void settings_app_init(void) {
-    window_t *win = gui_add_window("Settings", 580, 544, COL_ACCENT, ICON_SETTINGS);
+    window_t *win = gui_add_window("Settings", 580, 596, COL_ACCENT, ICON_SETTINGS);
     if (!win) return;
     win->draw  = settings_draw;
     win->click = settings_click;

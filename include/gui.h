@@ -45,6 +45,12 @@ void g_round(int x, int y, int w, int h, int r, uint32_t color, uint8_t alpha); 
 void g_char (int x, int y, char c, uint32_t color, int scale);
 void g_text (int x, int y, const char *s, uint32_t color, int scale);
 int  g_text_width(const char *s, int scale);
+/* font face: 0 = Retro 8x8, 1 = Arial 8x16 (default). Both are 8px advance, so
+ * horizontal layout is unchanged; Arial just draws taller glyphs. */
+enum { FONT_RETRO = 0, FONT_ARIAL = 1 };
+void g_set_font(int face);
+int  g_get_font(void);
+int  g_font_height(int scale);   /* glyph box height for the active face */
 /* proportional (variable-width) text: glyphs are trimmed to their ink box plus a
  * 1px gap, so prose reads like a real font instead of a monospace grid. italic
  * shears each row. The UI/terminal keep the monospace g_* calls above. */
