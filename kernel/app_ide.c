@@ -262,7 +262,8 @@ static int is_kw(const char *s, int n) {
 }
 static int is_builtin(const char *s, int n) {
     static const char *bi[] = { "printf","puts","putchar","cout","cin","endl","len","abs",
-        "min","max","chr","ord","Console","WriteLine","Write","Math","main","Main", 0 };
+        "min","max","chr","ord","pow","sqrt","gcd","upper","lower","substr",
+        "Console","WriteLine","Write","Math","main","Main", 0 };
     for (int i = 0; bi[i]; i++) {
         const char *k = bi[i]; int j = 0;
         while (j < n && k[j] && k[j] == s[j]) j++;
@@ -597,6 +598,9 @@ static const char *SAMPLE[NLANG] = {
 "    printf(\"BoltCC: a real C compiler\\n\");\n"
 "    for (int i = 0; i < 10; i++)\n"
 "        printf(\"fib(%d) = %d\\n\", i, fib(i));\n"
+"    printf(\"sqrt(144)=%d pow(2,10)=%d gcd(48,36)=%d\\n\",\n"
+"           sqrt(144), pow(2, 10), gcd(48, 36));\n"
+"    printf(\"upper=%s substr=%s\\n\", upper(\"bolt\"), substr(\"BoltOS\", 4, 2));\n"
 "    return 0;\n"
 "}\n",
 /* C++ */

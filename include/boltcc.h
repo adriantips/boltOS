@@ -14,7 +14,8 @@
  *  and comparison operators, &&/||/! with short-circuit, ?: , ++/-- (pre+post),
  *  compound assignment, if/else, while, for, return, break, continue, blocks,
  *  string concatenation with +, string indexing, and a small builtin library
- *  (len, str, int, abs, min, max, chr, ord). Per dialect:
+ *  (len, str, int, abs, min, max, chr, ord, pow, sqrt, gcd, upper, lower,
+ *  substr). Per dialect:
  *    C   : printf (real %d/%i/%u/%x/%c/%s/%% formatting), puts, putchar
  *    C++ : std::cout << ... << std::endl  (chained), printf, classes ignored
  *    C#  : Console.WriteLine / Console.Write  (incl. {0} {1} format), class +

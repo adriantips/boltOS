@@ -71,7 +71,8 @@ enum {
     OP_PRINT, OP_PRINTLN, OP_PRINTF, OP_CSPRINT, OP_PUTC,
     OP_BUILTIN, OP_INDEX, OP_HALT,
 };
-enum { B_LEN, B_STR, B_INT, B_ABS, B_MIN, B_MAX, B_CHR, B_ORD };
+enum { B_LEN, B_STR, B_INT, B_ABS, B_MIN, B_MAX, B_CHR, B_ORD,
+       B_POW, B_SQRT, B_GCD, B_UPPER, B_LOWER, B_SUBSTR };
 
 typedef struct { int op; long a, b; const char *s; } Instr;
 
@@ -642,6 +643,9 @@ static int builtin_id(const char *nm) {
     if (!strcmp(nm,"int")) return B_INT;  if (!strcmp(nm,"abs")) return B_ABS;
     if (!strcmp(nm,"min")) return B_MIN;  if (!strcmp(nm,"max")) return B_MAX;
     if (!strcmp(nm,"chr")) return B_CHR;  if (!strcmp(nm,"ord")) return B_ORD;
+    if (!strcmp(nm,"pow")) return B_POW;  if (!strcmp(nm,"sqrt")) return B_SQRT;
+    if (!strcmp(nm,"gcd")) return B_GCD;  if (!strcmp(nm,"substr")) return B_SUBSTR;
+    if (!strcmp(nm,"upper")) return B_UPPER; if (!strcmp(nm,"lower")) return B_LOWER;
     return -1;
 }
 
@@ -653,6 +657,8 @@ static const char *normalize_call(const char *nm) {
     if (!strcmp(nm, "Math.Abs")) return "abs";
     if (!strcmp(nm, "Math.Max")) return "max";
     if (!strcmp(nm, "Math.Min")) return "min";
+    if (!strcmp(nm, "Math.Pow")) return "pow";
+    if (!strcmp(nm, "Math.Sqrt")) return "sqrt";
     if (!strcmp(nm, "Convert.ToInt32")) return "int";
     if (!strcmp(nm, "Convert.ToString")) return "str";
     return nm;
@@ -985,6 +991,21 @@ static void vm_run(int start_ip) {
             case B_MAX: { long m = need_int(a[0],"max"); for (int i=1;i<argc;i++){long v=need_int(a[i],"max"); if(v>m)m=v;} r=VI(m); break; }
             case B_CHR: { long v = need_int(a[0],"chr"); char*d=rt_alloc(2); d[0]=(char)v; d[1]=0; r=(Val){1,0,d}; break; }
             case B_ORD: { r = VI(a[0].t==1 ? (unsigned char)(a[0].s?a[0].s[0]:0) : a[0].i); break; }
+            case B_POW: { long base=need_int(a[0],"pow"), e=argc>1?need_int(a[1],"pow"):0, v=1;
+                          for (long i=0;i<e;i++) v*=base; r=VI(v); break; }
+            case B_SQRT:{ long n=need_int(a[0],"sqrt"); if (n<=0) { r=VI(0); break; }
+                          long x=n, y=(x+1)/2; while (y<x) { x=y; y=(x+n/x)/2; } r=VI(x); break; }
+            case B_GCD: { long x=need_int(a[0],"gcd"), y=argc>1?need_int(a[1],"gcd"):0;
+                          if (x<0)x=-x; if (y<0)y=-y; while (y) { long t=x%y; x=y; y=t; } r=VI(x); break; }
+            case B_UPPER:{ const char*s=val_cstr(a[0]); int l=(int)strlen(s); char*d=rt_alloc(l+1);
+                          for (int i=0;i<l;i++){ char c=s[i]; d[i]=(c>='a'&&c<='z')?(char)(c-32):c; } d[l]=0; r=(Val){1,0,d}; break; }
+            case B_LOWER:{ const char*s=val_cstr(a[0]); int l=(int)strlen(s); char*d=rt_alloc(l+1);
+                          for (int i=0;i<l;i++){ char c=s[i]; d[i]=(c>='A'&&c<='Z')?(char)(c+32):c; } d[l]=0; r=(Val){1,0,d}; break; }
+            case B_SUBSTR:{ const char*s=val_cstr(a[0]); int sl=(int)strlen(s);
+                          long st=argc>1?need_int(a[1],"substr"):0;
+                          long ln=argc>2?need_int(a[2],"substr"):sl-st;
+                          if (st<0)st=0; if (st>sl)st=sl; if (ln<0)ln=0; if (st+ln>sl)ln=sl-st;
+                          char*d=rt_alloc((int)ln+1); memcpy(d,s+st,ln); d[ln]=0; r=(Val){1,0,d}; break; }
             }
             sp -= argc; PUSH(r); break; }
         case OP_HALT: return;
