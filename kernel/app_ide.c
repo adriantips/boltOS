@@ -62,6 +62,13 @@ static ide_t *out_active;    /* grid currently capturing kputc                  
 static const char *lang_label(int l) {
     return l == LANG_C ? "C" : l == LANG_CPP ? "C++" : l == LANG_CS ? "C#" : "Python";
 }
+/* append a non-negative integer to s at *p (caller ensures room) */
+static void put_uint(char *s, int *p, int v) {
+    char t[12]; int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v > 0) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) s[(*p)++] = t[--n];
+}
 
 /* --------------------------------------------------------- editor buffer --- */
 static editor_t *ED(void) { return &S.ed[S.lang]; }
@@ -320,6 +327,19 @@ static void ide_draw(window_t *w, int cx, int cy, int cw, int ch) {
                   active ? COL_ACCENT : COL_PANEL_3,
                   active ? 0xFFFFFF : COL_TEXT_DIM) + 6;
     }
+    /* live Ln/Col indicator in the gap after the language tabs */
+    {
+        editor_t *e = ED();
+        int ln = 1; for (int i = 0; i < e->cur; i++) if (e->buf[i] == '\n') ln++;
+        char lc[40]; int p = 0;
+        lc[p++] = 'L'; lc[p++] = 'n'; lc[p++] = ' ';
+        put_uint(lc, &p, ln);
+        lc[p++] = ','; lc[p++] = ' '; lc[p++] = 'C'; lc[p++] = 'o'; lc[p++] = 'l'; lc[p++] = ' ';
+        put_uint(lc, &p, caret_col() + 1);
+        lc[p] = 0;
+        g_text(bx + 12, by + 5, lc, COL_TEXT_DIM, 1);
+    }
+
     /* Run, then Open/Save/New on the right */
     int rx = cx + cw - 8;
     int rw = g_text_width("Run", 1) + 22;
@@ -495,8 +515,12 @@ static void ide_key(window_t *w, char c) {
         if (brace) { ed_insert(' '); ed_insert(' '); ed_insert(' '); ed_insert(' '); }
         break;
     }
+    case '\t':
+        /* soft tabs: insert four spaces, matching the auto-indent step */
+        ed_insert(' '); ed_insert(' '); ed_insert(' '); ed_insert(' ');
+        break;
     default:
-        if (c == '\t' || (unsigned char)c >= 32) ed_insert(c);
+        if ((unsigned char)c >= 32) ed_insert(c);
         break;
     }
 }
