@@ -483,6 +483,13 @@ static void files_key(window_t *w, char c) {
     clamp_scroll(st);
 }
 
+static void files_scroll(window_t *w, int delta) {
+    (void)w;
+    files_t *st = &F;
+    if (st->view) { st->view_scroll += delta * 40; clamp_view(st); }
+    else          { st->scroll      += delta * 40; clamp_scroll(st); }
+}
+
 static void files_click(window_t *w, int lx, int ly) {
     (void)w;
     files_t *st = &F;
@@ -589,6 +596,7 @@ void files_app_init(void) {
     w->draw = files_draw;
     w->key  = files_key;
     w->click = files_click;
+    w->scroll = files_scroll;
     w->min_w = 540; w->min_h = 340;
     w->x = 120; w->y = 90;
 
