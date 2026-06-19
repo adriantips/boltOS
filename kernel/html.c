@@ -518,6 +518,10 @@ html_doc *html_parse(const char *src, uint32_t len) {
                     css_decl_apply(sv, (uint32_t)strlen(sv), &col, &al, &cb, &ci, &hid, &bgc);
                 { uint32_t ic = tag_color(tag); if (ic != HCOL_NONE) col = ic; }
                 { char bgv[40]; if (get_attr(tag, "bgcolor", bgv, sizeof(bgv))) { uint32_t bc = parse_color_token(bgv); if (bc) bgc = bc; } }
+                if (strcmp(name,"body")==0 || strcmp(name,"html")==0) {     /* page-level defaults */
+                    if (bgc != HCOL_NONE) d->page_bg = bgc;
+                    if (col != HCOL_NONE) d->page_fg = col;
+                }
                 { uint8_t ia = tag_align(tag); if (ia != ALIGN_UNSET) al = ia; }
                 if (strcmp(name,"center")==0 && al == ALIGN_UNSET) al = HALIGN_CENTER;
                 int has = (col!=HCOL_NONE) || (bgc!=HCOL_NONE) || (al!=ALIGN_UNSET) || (cb>=0) || (ci>=0) || hid;

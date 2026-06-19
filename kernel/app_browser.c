@@ -178,6 +178,8 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
         html_run *r = &d->runs[ri];
         int scale, lh, italic; uint32_t dcol;
         metrics(r->style, &scale, &lh, &dcol, &italic);
+        /* dark-theme support: default body text follows the page text colour */
+        if (dcol == WEB_TEXT && st->doc && (st->doc->page_fg & 0x1000000)) dcol = st->doc->page_fg & 0xFFFFFF;
         uint32_t color = (r->color & 0x1000000) ? (r->color & 0xFFFFFF) : dcol;
 
         if (r->brk) {
@@ -474,7 +476,8 @@ static void browser_draw(window_t *w, int cx, int cy, int cw, int ch) {
     browser_t *st = &B;
     st->cw = cw; st->ch = ch;
 
-    g_fill(cx, cy, cw, ch, WEB_BG);
+    uint32_t pbg = (st->doc && (st->doc->page_bg & 0x1000000)) ? st->doc->page_bg & 0xFFFFFF : WEB_BG;
+    g_fill(cx, cy, cw, ch, pbg);
     /* toolbar */
     g_fill(cx, cy, cw, TOOLBAR_H, COL_PANEL_2);
     g_hline(cx, cy + TOOLBAR_H, cw, 0x33333F);

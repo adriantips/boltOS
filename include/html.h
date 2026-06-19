@@ -45,6 +45,8 @@ typedef struct {
     char    **hrefs;  int nhrefs;
     char    **imgs;   int nimgs;       /* <img src> values            */
     char     *title;            /* page <title>, or NULL */
+    uint32_t  page_bg;          /* <body>/<html> background: HCOL_NONE or 0x1RRGGBB */
+    uint32_t  page_fg;          /* <body>/<html> text colour: HCOL_NONE or 0x1RRGGBB */
     /* private storage */
     char     *arena;  uint32_t arena_len, arena_cap;
     int       runs_cap, hrefs_cap, imgs_cap;
