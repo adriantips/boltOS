@@ -6,6 +6,7 @@
 #include "string.h"
 #include "kheap.h"
 #include "kprintf.h"
+#include "pit.h"
 
 /* unaligned reads from the raw image */
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
@@ -22,7 +23,14 @@ static int    g_exitcode;
 
 static void   pe_emit(const char *buf, uint32_t n) { for (uint32_t i = 0; i < n; i++) kputc(buf[i]); }
 
-static uint64_t WINAPI sh_GetStdHandle(uint32_t which) { (void)which; return 2; }
+static void *resolve_import(const char *name);   /* fwd: used by GetProcAddress */
+
+/* STD_INPUT(-10)->1, STD_OUTPUT(-11)->2, STD_ERROR(-12)->3, anything else->2 */
+static uint64_t WINAPI sh_GetStdHandle(uint32_t which) {
+    if (which == (uint32_t)-10) return 1;
+    if (which == (uint32_t)-12) return 3;
+    return 2;
+}
 static int      WINAPI sh_WriteConsoleA(uint64_t h, const void *buf, uint32_t n, uint32_t *written, void *resv) {
     (void)h; (void)resv; pe_emit((const char *)buf, n); if (written) *written = n; return 1;
 }
@@ -38,7 +46,45 @@ static uint64_t WINAPI sh_GetProcessHeap(void) { return 0x00010001; }
 static void    *WINAPI sh_HeapAlloc(uint64_t h, uint32_t flags, uint64_t n) { (void)h; void *p = kmalloc(n ? n : 1); if (p && (flags & 8)) memset(p, 0, n); return p; }
 static int      WINAPI sh_HeapFree(uint64_t h, uint32_t flags, void *p) { (void)h; (void)flags; if (p) kfree(p); return 1; }
 static void     WINAPI sh_Sleep(uint32_t ms) { (void)ms; }
-static uint32_t WINAPI sh_GetTickCount(void) { return 0; }
+static uint32_t WINAPI sh_GetTickCount(void)   { return (uint32_t)pit_ticks(); }
+static uint64_t WINAPI sh_GetTickCount64(void) { return pit_ticks(); }
+
+/* memory: VirtualAlloc/Free map onto the kernel heap */
+static void    *WINAPI sh_VirtualAlloc(void *addr, uint64_t n, uint32_t type, uint32_t prot) {
+    (void)addr; (void)type; (void)prot; void *p = kmalloc(n ? n : 1); if (p) memset(p, 0, n ? n : 1); return p;
+}
+static int      WINAPI sh_VirtualFree(void *addr, uint64_t n, uint32_t type) {
+    (void)n; (void)type; if (addr) kfree(addr); return 1;
+}
+
+/* time / counters */
+static void     WINAPI sh_GetSystemTimeAsFileTime(uint64_t *ft) {
+    /* 100ns units since 1601; offset to the unix epoch + ms uptime, good enough */
+    if (ft) *ft = 116444736000000000ull + pit_ticks() * 10000ull;
+}
+static int      WINAPI sh_QueryPerformanceCounter(uint64_t *c)   { if (c) *c = pit_ticks(); return 1; }
+static int      WINAPI sh_QueryPerformanceFrequency(uint64_t *f) { if (f) *f = 1000; return 1; }
+
+/* process / module identity */
+static uint32_t WINAPI sh_GetCurrentProcessId(void) { return 1; }
+static uint32_t WINAPI sh_GetCurrentThreadId(void)  { return 1; }
+static uint64_t WINAPI sh_GetCurrentProcess(void)   { return (uint64_t)-1; }
+static int      WINAPI sh_IsProcessorFeaturePresent(uint32_t f) { (void)f; return 1; }
+static int      WINAPI sh_IsDebuggerPresent(void)   { return 0; }
+
+/* console code pages / modes (stubbed permissive) */
+static uint32_t WINAPI sh_GetConsoleOutputCP(void) { return 65001; }
+static uint32_t WINAPI sh_GetACP(void)             { return 1252; }
+static int      WINAPI sh_GetConsoleMode(uint64_t h, uint32_t *mode) { (void)h; if (mode) *mode = 3; return 1; }
+static int      WINAPI sh_SetConsoleMode(uint64_t h, uint32_t mode)  { (void)h; (void)mode; return 1; }
+static int      WINAPI sh_CloseHandle(uint64_t h)        { (void)h; return 1; }
+static int      WINAPI sh_FlushFileBuffers(uint64_t h)   { (void)h; return 1; }
+static int      WINAPI sh_SetStdHandle(uint32_t i, uint64_t h) { (void)i; (void)h; return 1; }
+
+/* dynamic loading: hand back our own shims so GetProcAddress-style code works */
+static uint64_t WINAPI sh_LoadLibraryA(const char *m)  { (void)m; return 0x20000; }
+static int      WINAPI sh_FreeLibrary(uint64_t h)      { (void)h; return 1; }
+static void    *WINAPI sh_GetProcAddress(uint64_t mod, const char *name) { (void)mod; return resolve_import(name); }
 
 /* fallback for any unresolved import: print a note and return 0 */
 static uint64_t WINAPI sh_missing(void) { return 0; }
@@ -59,6 +105,31 @@ static const shim_t SHIMS[] = {
     { "HeapFree",        (void *)sh_HeapFree },
     { "Sleep",           (void *)sh_Sleep },
     { "GetTickCount",    (void *)sh_GetTickCount },
+    { "GetTickCount64",  (void *)sh_GetTickCount64 },
+    { "VirtualAlloc",    (void *)sh_VirtualAlloc },
+    { "VirtualFree",     (void *)sh_VirtualFree },
+    { "GetSystemTimeAsFileTime", (void *)sh_GetSystemTimeAsFileTime },
+    { "QueryPerformanceCounter",   (void *)sh_QueryPerformanceCounter },
+    { "QueryPerformanceFrequency", (void *)sh_QueryPerformanceFrequency },
+    { "GetCurrentProcessId", (void *)sh_GetCurrentProcessId },
+    { "GetCurrentThreadId",  (void *)sh_GetCurrentThreadId },
+    { "GetCurrentProcess",   (void *)sh_GetCurrentProcess },
+    { "IsProcessorFeaturePresent", (void *)sh_IsProcessorFeaturePresent },
+    { "IsDebuggerPresent",   (void *)sh_IsDebuggerPresent },
+    { "GetConsoleOutputCP",  (void *)sh_GetConsoleOutputCP },
+    { "GetConsoleCP",        (void *)sh_GetConsoleOutputCP },
+    { "GetACP",              (void *)sh_GetACP },
+    { "GetOEMCP",            (void *)sh_GetACP },
+    { "GetConsoleMode",      (void *)sh_GetConsoleMode },
+    { "SetConsoleMode",      (void *)sh_SetConsoleMode },
+    { "CloseHandle",         (void *)sh_CloseHandle },
+    { "FlushFileBuffers",    (void *)sh_FlushFileBuffers },
+    { "SetStdHandle",        (void *)sh_SetStdHandle },
+    { "LoadLibraryA",        (void *)sh_LoadLibraryA },
+    { "FreeLibrary",         (void *)sh_FreeLibrary },
+    { "GetProcAddress",      (void *)sh_GetProcAddress },
+    { "GetModuleHandleW",    (void *)sh_GetModuleHandleA },
+    { "GetCommandLineW",     (void *)sh_GetCommandLineA },
     { 0, 0 },
 };
 static void *resolve_import(const char *name) {
