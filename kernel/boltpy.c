@@ -1333,12 +1333,12 @@ static uint32_t val_len(bpy_vm *vm, Value v, int *ok) {
 enum {
     B_PRINT, B_LEN, B_RANGE, B_STR, B_INT, B_BOOL, B_ABS, B_MIN, B_MAX, B_SUM,
     B_ORD, B_CHR, B_HEX, B_TYPE, B_INPUT, B_LIST, B_REPR, B_SORTED, B_REVERSED,
-    B_ENUMERATE, B_BIN, B_COUNT_
+    B_ENUMERATE, B_BIN, B_POW, B_GCD, B_DIVMOD, B_COUNT_
 };
 static const char *builtin_names[] = {
     "print", "len", "range", "str", "int", "bool", "abs", "min", "max", "sum",
     "ord", "chr", "hex", "type", "input", "list", "repr", "sorted", "reversed",
-    "enumerate", "bin", 0
+    "enumerate", "bin", "pow", "gcd", "divmod", 0
 };
 static int builtin_index(const char *name) {
     for (int i = 0; builtin_names[i]; i++) if (strcmp(builtin_names[i], name) == 0) return i;
@@ -1425,6 +1425,19 @@ static Value call_builtin(bpy_vm *vm, int idx, Value *a, int n, char **kw, Value
                   if (neg) sb_putc(&s, '-'); sb_puts(&s, "0b");
                   char tmp[68]; int k = 0; if (!u) tmp[k++] = '0'; while (u) { tmp[k++] = (char)('0' + (u & 1)); u >>= 1; }
                   while (k--) sb_putc(&s, tmp[k]); return v_strn(vm, s.b, s.len); }
+    case B_POW: { if (n < 2 || (a[0].t != VT_INT && a[0].t != VT_BOOL) || (a[1].t != VT_INT && a[1].t != VT_BOOL)) { err(vm, "TypeError: pow() needs two ints"); return v_none(); }
+                  int64_t base = a[0].u.i, e = a[1].u.i;
+                  if (e < 0) { err(vm, "ValueError: pow() negative exponent not supported"); return v_none(); }
+                  int64_t r = 1; while (e-- > 0) r *= base; return v_int(r); }
+    case B_GCD: { if (n < 2 || (a[0].t != VT_INT && a[0].t != VT_BOOL) || (a[1].t != VT_INT && a[1].t != VT_BOOL)) { err(vm, "TypeError: gcd() needs two ints"); return v_none(); }
+                  int64_t x = a[0].u.i, y = a[1].u.i; if (x < 0) x = -x; if (y < 0) y = -y;
+                  while (y) { int64_t t = x % y; x = y; y = t; } return v_int(x); }
+    case B_DIVMOD: { if (n < 2 || (a[0].t != VT_INT && a[0].t != VT_BOOL) || (a[1].t != VT_INT && a[1].t != VT_BOOL)) { err(vm, "TypeError: divmod() needs two ints"); return v_none(); }
+                  int64_t x = a[0].u.i, y = a[1].u.i;
+                  if (y == 0) { err(vm, "ZeroDivisionError: integer division or modulo by zero"); return v_none(); }
+                  int64_t q = x / y, rmd = x % y;          /* C truncates; convert to floor */
+                  if (rmd != 0 && ((rmd < 0) != (y < 0))) { q -= 1; rmd += y; }
+                  List *l = list_new(vm, 2); list_push(vm, l, v_int(q)); list_push(vm, l, v_int(rmd)); return v_list(l); }
     case B_TYPE: { if (n != 1) { err(vm, "TypeError: type() takes one argument"); return v_none(); }
                    SB s; sb_init(&s, vm); sb_puts(&s, "<class '"); sb_puts(&s, type_name(a[0])); sb_puts(&s, "'>");
                    return v_strn(vm, s.b, s.len); }

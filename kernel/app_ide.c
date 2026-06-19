@@ -262,7 +262,8 @@ static int is_kw(const char *s, int n) {
 }
 static int is_builtin(const char *s, int n) {
     static const char *bi[] = { "printf","puts","putchar","cout","cin","endl","len","abs",
-        "min","max","chr","ord","pow","sqrt","gcd","upper","lower","substr",
+        "min","max","chr","ord","pow","sqrt","gcd","upper","lower","substr","divmod",
+        "range","sum","sorted","enumerate","len",
         "Console","WriteLine","Write","Math","main","Main", 0 };
     for (int i = 0; bi[i]; i++) {
         const char *k = bi[i]; int j = 0;
@@ -632,7 +633,10 @@ static const char *SAMPLE[NLANG] = {
 "def fib(n):\n"
 "    return n if n < 2 else fib(n - 1) + fib(n - 2)\n\n"
 "for i in range(10):\n"
-"    print(\"fib(\", i, \") =\", fib(i))\n",
+"    print(\"fib(\", i, \") =\", fib(i))\n\n"
+"print(\"pow(2,10) =\", pow(2, 10))\n"
+"print(\"gcd(48,36) =\", gcd(48, 36))\n"
+"print(\"divmod(17,5) =\", divmod(17, 5))\n",
 };
 
 void ide_app_init(void) {
