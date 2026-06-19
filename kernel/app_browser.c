@@ -607,7 +607,21 @@ static void browser_draw(window_t *w, int cx, int cy, int cw, int ch) {
     struct netif *nif = netif_default();
     char link[40]; link[0] = 0;
     sappend(link, nif ? (nif->link_up ? "online" : "link down") : "no NIC", sizeof(link));
-    g_text(cx + 8, cy + ch - STATUS_H + 6, st->status, COL_TEXT_DIM, 1);
+
+    /* hovering a link previews its resolved target on the left, like a browser */
+    char hov[300]; hov[0] = 0;
+    if (st->doc && myp >= Y0 && myp < Yb && mxp < cw - SBW - 4) {
+        for (int i = 0; i < st->nhits; i++) {
+            hitrect *h = &st->hits[i];
+            if (h->kind == 0 && h->link >= 0 && h->link < st->doc->nhrefs &&
+                mxp >= h->x && mxp < h->x + h->w && myp >= h->y && myp < h->y + h->h) {
+                resolve_link(st, st->doc->hrefs[h->link], hov, sizeof(hov));
+                break;
+            }
+        }
+    }
+    g_text(cx + 8, cy + ch - STATUS_H + 6, hov[0] ? hov : st->status,
+           hov[0] ? COL_ACCENT : COL_TEXT_DIM, 1);
     g_text(cx + cw - g_text_width(link, 1) - 10, cy + ch - STATUS_H + 6, link, nif && nif->link_up ? COL_GOOD : COL_BAD, 1);
 }
 
