@@ -405,6 +405,8 @@ static void ide_draw(window_t *w, int cx, int cy, int cw, int ch) {
     g_hline(cx, oy0, cw, COL_PANEL_3);
     g_fill(cx, oy0 + 1, cw, out_h - 1, 0x0C0C12);
     g_text(cx + 8, oy0 + 5, S.running ? "Output  (running)" : "Output", COL_TEXT_DIM, 1);
+    if (S.status[0] && !S.running)
+        g_text(cx + 8 + g_text_width("Output", 1) + 16, oy0 + 5, S.status, 0x6A9955, 1);
     int otx = cx + 8, oty = oy0 + 22;
     int orows = (out_h - 26) / CELLH; if (orows < 1) orows = 1;
     int ocols = (cw - 16) / CELLW;    if (ocols > OCOLS) ocols = OCOLS;
@@ -416,10 +418,6 @@ static void ide_draw(window_t *w, int cx, int cy, int cw, int ch) {
             if (g) g_char(otx + c*CELLW, oty + r*CELLH, g, 0xCDCDCD, 1);
         }
     }
-
-    /* ---- status line (right side of toolbar area, under the tabs) ---- */
-    if (S.status[0] && S.prompt == PR_NONE)
-        g_text(cx + 8, cy + TOOLH + 4, S.status, 0x6A9955, 1);
 
     /* ---- save-as input strip ---- */
     if (S.prompt == PR_SAVE) {
