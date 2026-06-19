@@ -517,6 +517,20 @@ static void ide_key(window_t *w, char c) {
         /* soft tabs: insert four spaces, matching the auto-indent step */
         ed_insert(' '); ed_insert(' '); ed_insert(' '); ed_insert(' ');
         break;
+    case '(': case '[': case '{': {
+        /* auto-close brackets: insert the pair, leave the caret between them */
+        editor_t *e = ED();
+        char close = c == '(' ? ')' : c == '[' ? ']' : '}';
+        ed_insert(c); ed_insert(close); e->cur--;
+        break;
+    }
+    case ')': case ']': case '}': {
+        /* step over an auto-inserted closer instead of duplicating it */
+        editor_t *e = ED();
+        if (e->cur < e->len && e->buf[e->cur] == c) e->cur++;
+        else ed_insert(c);
+        break;
+    }
     default:
         if ((unsigned char)c >= 32) ed_insert(c);
         break;
