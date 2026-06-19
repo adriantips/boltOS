@@ -79,7 +79,7 @@ static void push_full(html_doc *d, const char *text, uint32_t n, uint8_t style,
     html_run *r = &d->runs[d->nruns++];
     r->text = t; r->style = style; r->link = link; r->brk = brk;
     r->kind = HRUN_TEXT; r->align = align; r->indent = indent; r->color = color;
-    r->bg = bg; r->img = -1; r->iw = r->ih = 0; r->pix = 0;
+    r->bg = bg; r->img = -1; r->iw = r->ih = 0; r->pix = 0; r->name = 0;
 }
 
 static void cpy(char *d, const char *s, uint32_t cap) {
@@ -87,14 +87,16 @@ static void cpy(char *d, const char *s, uint32_t cap) {
 }
 
 /* emit a form-control run (input / button / textarea / select) */
-static void push_input(html_doc *d, const char *label, int subtype, int w, int h,
+static void push_input(html_doc *d, const char *label, const char *name, int link,
+                       int subtype, int w, int h,
                        uint8_t brk, uint32_t color, uint8_t align, uint8_t indent) {
     if (d->nruns >= d->runs_cap) return;
     char *t = arena_push(d, label, (uint32_t)strlen(label));
     html_run *r = &d->runs[d->nruns++];
-    r->text = t ? t : ""; r->style = HSTYLE_NORMAL; r->link = -1; r->brk = brk;
+    r->text = t ? t : ""; r->style = HSTYLE_NORMAL; r->link = link; r->brk = brk;
     r->kind = HRUN_INPUT; r->align = align; r->indent = indent; r->color = color;
     r->bg = HCOL_NONE; r->img = subtype; r->iw = w; r->ih = h; r->pix = 0;
+    r->name = (name && name[0]) ? arena_push(d, name, (uint32_t)strlen(name)) : 0;
 }
 
 /* decode an entity starting at src[*i]=='&'; return decoded char, advance *i */
@@ -446,6 +448,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
     int     pending_brk = 0, space_pending = 0, line_started = 0;
     int     skip = 0, in_title = 0;
     int     list_depth = 0, bq_depth = 0;
+    int     form_link = -1;          /* href index of the enclosing <form action>  */
     char    skipname[12] = "";       /* tag whose body is being dropped */
 
     /* <style> rules collected up front, applied per opening tag */
@@ -563,13 +566,28 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 continue;
             }
             if (strcmp(name, "script") == 0) { if (!closing) { skip = 1; cpy(skipname, "script", sizeof(skipname)); } continue; }
+            if (strcmp(name, "form") == 0) {
+                FLUSH();
+                if (closing) form_link = -1;
+                else {
+                    form_link = -1;
+                    char act[256]; act[0] = 0;
+                    if (get_attr(tag, "action", act, sizeof(act)) && act[0] && d->nhrefs < d->hrefs_cap) {
+                        char *h = arena_push(d, act, (uint32_t)strlen(act));
+                        if (h) { d->hrefs[d->nhrefs] = h; form_link = d->nhrefs; d->nhrefs++; }
+                    }
+                }
+                if (pending_brk < 1) pending_brk = 1;
+                continue;
+            }
             if (strcmp(name, "input") == 0) {
                 FLUSH();
                 if (CUR_HIDDEN) continue;
                 char ty[16]; ty[0] = 0; if (get_attr(tag, "type", ty, sizeof(ty))) for (int z = 0; ty[z]; z++) ty[z] = lc(ty[z]);
                 if (strcmp(ty, "hidden") == 0) continue;
+                char nm[64]; nm[0] = 0; get_attr(tag, "name", nm, sizeof(nm));
                 if (strcmp(ty,"checkbox")==0 || strcmp(ty,"radio")==0) {
-                    push_input(d, strcmp(ty,"radio")==0 ? "( )" : "[ ]", 0, 18, 18,
+                    push_input(d, strcmp(ty,"radio")==0 ? "( )" : "[ ]", nm, form_link, 0, 18, 18,
                                (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
                     pending_brk = 0; continue;
                 }
@@ -582,7 +600,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                     get_attr(tag, "value", lbl, sizeof(lbl));
                 }
                 char sz[8]; int w = get_attr(tag, "size", sz, sizeof(sz)) ? atoi(sz) * 9 : 0;
-                push_input(d, lbl, sub, w, sub ? 26 : 22, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                push_input(d, lbl, nm, form_link, sub, w, sub ? 26 : 22, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
                 pending_brk = 0; continue;
             }
             if (strcmp(name, "textarea") == 0) {
@@ -590,7 +608,8 @@ html_doc *html_parse(const char *src, uint32_t len) {
                     FLUSH();
                     if (!CUR_HIDDEN) {
                         char ph[96]; ph[0] = 0; get_attr(tag, "placeholder", ph, sizeof(ph));
-                        push_input(d, ph, 2, 0, 60, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                        char nm[64]; nm[0] = 0; get_attr(tag, "name", nm, sizeof(nm));
+                        push_input(d, ph, nm, form_link, 2, 0, 60, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
                         pending_brk = 0;
                     }
                     skip = 1; cpy(skipname, "textarea", sizeof(skipname));
@@ -601,7 +620,8 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 if (!closing) {
                     FLUSH();
                     if (!CUR_HIDDEN) {
-                        push_input(d, "", 3, 160, 22, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                        char nm[64]; nm[0] = 0; get_attr(tag, "name", nm, sizeof(nm));
+                        push_input(d, "", nm, form_link, 3, 160, 22, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
                         pending_brk = 0;
                     }
                     skip = 1; cpy(skipname, "select", sizeof(skipname));
@@ -646,7 +666,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                         r->text = at ? at : s; r->style = HSTYLE_NORMAL; r->link = link;
                         r->brk = (uint8_t)pending_brk; r->kind = HRUN_IMG; r->align = CUR_ALIGN;
                         r->indent = CUR_INDENT; r->color = CUR_COLOR; r->bg = CUR_BG; r->img = d->nimgs;
-                        r->iw = iw; r->ih = ih; r->pix = 0;
+                        r->iw = iw; r->ih = ih; r->pix = 0; r->name = 0;
                         d->nimgs++; pending_brk = 0;
                     }
                 }

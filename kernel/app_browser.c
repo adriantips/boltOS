@@ -29,7 +29,9 @@
 #define MAXIMG     256
 #define INDENT_STEP 22
 
-typedef struct { int x, y, w, h, link; } hitrect;
+typedef struct { int x, y, w, h, link, run, kind; } hitrect;  /* kind: 0 link, 1 input */
+
+#define MAXFIELDS 32
 
 typedef struct {
     char      url[256];
@@ -46,6 +48,11 @@ typedef struct {
     int       histlen;
     image_t  *owned[MAXIMG];   /* decoded images backing the current doc */
     int       nowned;
+    /* form-field editing: a buffer per text input/textarea, keyed by run index */
+    char      fld[MAXFIELDS][96];
+    int       fld_run[MAXFIELDS];
+    int       nfld;
+    int       focus_run;       /* run index of the focused field, or -1 */
 } browser_t;
 
 static browser_t B;
@@ -59,6 +66,22 @@ static void sappend(char *d, const char *s, uint32_t cap) {
     d[n] = 0;
 }
 static void set_status(browser_t *st, const char *s) { scopy(st->status, s, sizeof(st->status)); }
+
+/* ---- form field edit buffers ------------------------------------------- */
+static void fields_reset(browser_t *st) { st->nfld = 0; st->focus_run = -1; }
+/* buffer for a field run, or 0 if none exists yet */
+static char *field_find(browser_t *st, int run) {
+    for (int i = 0; i < st->nfld; i++) if (st->fld_run[i] == run) return st->fld[i];
+    return 0;
+}
+/* buffer for a field run, allocating one (empty) on first use, or 0 if full */
+static char *field_get(browser_t *st, int run) {
+    char *b = field_find(st, run);
+    if (b) return b;
+    if (st->nfld >= MAXFIELDS) return 0;
+    st->fld_run[st->nfld] = run; st->fld[st->nfld][0] = 0;
+    return st->fld[st->nfld++];
+}
 
 /* ---- page palette ------------------------------------------------------ *
  * Web pages are authored for a white canvas with dark text, so the body is
@@ -101,6 +124,7 @@ typedef struct {
     int      italic;
     int      is_input, subtype;    /* form control: 0 field,1 button,2 area,3 select */
     uint32_t bg;                   /* element background: HCOL_NONE or 0x1RRGGBB */
+    int      run;                  /* source run index (for input focus/hit) */
 } litem;
 
 #define MAXLINE 320
@@ -122,8 +146,9 @@ static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
                 litem *it = &LINE[k];
                 int ax = cx + xstart + off + it->x;
                 if (it->is_input) {
+                    int focused = (st->focus_run == it->run);
                     uint32_t fill = it->subtype == 1 ? 0xE8F0FE : 0xFFFFFF;
-                    uint32_t brd  = it->subtype == 1 ? WEB_LINK : 0xC0C0C8;
+                    uint32_t brd  = focused ? WEB_LINK : (it->subtype == 1 ? WEB_LINK : 0xC0C0C8);
                     g_round(ax, cy + py, it->dw, it->dh, 5, fill, 255);
                     g_rect(ax, cy + py, it->dw, it->dh, brd);
                     int ty = cy + py + (it->dh - 8) / 2;
@@ -132,9 +157,21 @@ static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
                         g_text_pn(ax + (it->dw - tw) / 2, ty, it->text, it->len, WEB_LINK, 1, 0);
                     } else {                                   /* field / textarea / select */
                         int tyo = it->subtype == 2 ? cy + py + 5 : ty;
-                        if (it->len) g_text_pn(ax + 6, tyo, it->text, it->len, WEB_DIM, 1, 0);
+                        char *val = field_find(st, it->run);   /* typed text, if any */
+                        if (val && val[0]) {
+                            int vl = (int)strlen(val);
+                            g_text_pn(ax + 6, tyo, val, vl, WEB_TEXT, 1, 0);
+                            if (focused && (pit_ticks() / 500) % 2 == 0)
+                                g_fill(ax + 6 + g_text_width_pn(val, vl, 1), tyo - 1, 2, 11, WEB_LINK);
+                        } else {
+                            if (it->len) g_text_pn(ax + 6, tyo, it->text, it->len, WEB_DIM, 1, 0);
+                            if (focused && (pit_ticks() / 500) % 2 == 0)
+                                g_fill(ax + 6, tyo - 1, 2, 11, WEB_LINK);
+                        }
                         if (it->subtype == 3) g_text(ax + it->dw - 12, ty, "v", WEB_DIM, 1);
                     }
+                    if (st->nhits < (int)(sizeof(st->hits)/sizeof(st->hits[0])))
+                        st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->dw, it->dh, it->link, it->run, 1 };
                 } else if (it->is_img) {
                     if (it->pix) g_blit(ax, cy + py, it->dw, it->dh, it->pix->px, it->pix->w, it->pix->h);
                     else {
@@ -143,7 +180,7 @@ static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
                         g_text(ax + 4, cy + py + it->dh/2 - 4, it->text, WEB_DIM, 1);
                     }
                     if (it->link >= 0 && st->nhits < (int)(sizeof(st->hits)/sizeof(st->hits[0])))
-                        st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->dw, it->dh, it->link };
+                        st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->dw, it->dh, it->link, it->run, 0 };
                 } else {
                     /* inline background highlight (e.g. <code>, <mark>) when the
                      * line has no full-width block band of the same colour */
@@ -153,7 +190,7 @@ static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
                     if (it->link >= 0) {
                         g_hline(ax, cy + py + 8 * it->scale + 1, it->w, it->color);
                         if (st->nhits < (int)(sizeof(st->hits)/sizeof(st->hits[0])))
-                            st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->w, line_h, it->link };
+                            st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->w, line_h, it->link, it->run, 0 };
                     }
                 }
             }
@@ -204,7 +241,7 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
                 n = 0; cur_x = 0; line_h = 0;
             }
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, (int)strlen(r->text), 1, im, dw, dh, 0, 0, 0, r->bg };
+                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, (int)strlen(r->text), 1, im, dw, dh, 0, 0, 0, r->bg, ri };
                 n++;
             }
             cur_x += dw + 4;
@@ -226,7 +263,7 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
                 n = 0; cur_x = 0; line_h = 0;
             }
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, tlen, 0, 0, dw, dh, 0, 1, sub, r->bg };
+                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, tlen, 0, 0, dw, dh, 0, 1, sub, r->bg, ri };
                 n++;
             }
             cur_x += dw + 6;
@@ -249,7 +286,7 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
             }
             cur_x += space;
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, ww, scale, lh, color, r->link, w, wl, 0, 0, 0, 0, italic, 0, 0, r->bg };
+                LINE[n] = (litem){ cur_x, ww, scale, lh, color, r->link, w, wl, 0, 0, 0, 0, italic, 0, 0, r->bg, ri };
                 n++;
             }
             cur_x += ww;
@@ -391,6 +428,7 @@ static int load_http(browser_t *st, const char *url, int depth) {
     st->doc = html_parse(buf, (uint32_t)blen);
     kfree(buf);
     st->scroll = 0;
+    fields_reset(st);
     scopy(st->url, url, sizeof(st->url));
     fetch_images(st);
 
@@ -419,6 +457,7 @@ static int load_fs(browser_t *st, const char *path) {
     else
         st->doc = html_parse_text((const char *)n->data, n->size);
     st->scroll = 0;
+    fields_reset(st);
     scopy(st->url, p, sizeof(st->url));
     fetch_images(st);
     scopy(BW->title, n->name, sizeof(BW->title));
@@ -462,6 +501,45 @@ static void go_back(browser_t *st) {
     if (st->histlen <= 0) { set_status(st, "no history"); return; }
     char prev[256]; scopy(prev, st->history[--st->histlen], sizeof(prev));
     load_url(st, prev, 0);
+}
+
+/* Build a GET query from the form's text fields and navigate to it. `run` is
+ * the focused field or the clicked submit button; its run->link points at the
+ * enclosing <form action> (or -1 to submit to the current page). */
+static void submit_form(browser_t *st, int run) {
+    html_doc *d = st->doc;
+    if (!d || run < 0 || run >= d->nruns) return;
+    int action_link = d->runs[run].link;
+    char base[300];
+    if (action_link >= 0 && action_link < d->nhrefs)
+        resolve_link(st, d->hrefs[action_link], base, sizeof(base));
+    else
+        scopy(base, st->url, sizeof(base));
+    for (char *p = base; *p; p++) if (*p == '?') { *p = 0; break; }   /* drop old query */
+
+    char url[512]; scopy(url, base, sizeof(url));
+    int first = 1;
+    for (int i = 0; i < d->nruns; i++) {
+        html_run *r = &d->runs[i];
+        if (r->kind != HRUN_INPUT || !r->name) continue;
+        if (r->img != 0 && r->img != 2) continue;       /* text fields / textareas only */
+        char *val = field_find(st, i);
+        sappend(url, first ? "?" : "&", sizeof(url)); first = 0;
+        sappend(url, r->name, sizeof(url));
+        sappend(url, "=", sizeof(url));
+        for (char *v = val; v && *v; v++) {             /* minimal urlencode */
+            char c = *v;
+            if (c == ' ') sappend(url, "+", sizeof(url));
+            else if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.'||c=='~') {
+                char one[2] = { c, 0 }; sappend(url, one, sizeof(url));
+            } else {
+                const char *H = "0123456789ABCDEF";
+                char hx[4] = { '%', H[(c>>4)&0xF], H[c&0xF], 0 }; sappend(url, hx, sizeof(url));
+            }
+        }
+    }
+    st->focus_run = -1;
+    navigate(st, url);
 }
 
 /* ---- drawing ----------------------------------------------------------- */
@@ -546,6 +624,15 @@ static void browser_key(window_t *w, char c) {
         }
         return;
     }
+    if (st->focus_run >= 0) {                          /* typing into a form field */
+        char *b = field_get(st, st->focus_run);
+        if (!b)             st->focus_run = -1;
+        else if (c == '\n') submit_form(st, st->focus_run);
+        else if (c == 27)   st->focus_run = -1;
+        else if (c == '\b') { int l = (int)strlen(b); if (l > 0) b[l-1] = 0; }
+        else if ((unsigned char)c >= 32) { int l = (int)strlen(b); if (l < 94) { b[l] = c; b[l+1] = 0; } }
+        return;
+    }
     int vh = st->ch - TOOLBAR_H - STATUS_H;
     int maxscroll = st->content_h - vh; if (maxscroll < 0) maxscroll = 0;
     if      (c == ' ')  st->scroll += vh - 24;
@@ -585,6 +672,12 @@ static void browser_click(window_t *w, int lx, int ly) {
     for (int i = 0; i < st->nhits; i++) {
         hitrect *h = &st->hits[i];
         if (lx >= h->x && lx < h->x + h->w && ly >= h->y && ly < h->y + h->h) {
+            if (h->kind == 1) {                        /* form control */
+                int sub = (st->doc && h->run < st->doc->nruns) ? st->doc->runs[h->run].img : 0;
+                if (sub == 1) submit_form(st, h->run);       /* button: submit */
+                else { st->focus_run = h->run; field_get(st, h->run); }  /* field: focus */
+                return;
+            }
             if (st->doc && h->link >= 0 && h->link < st->doc->nhrefs) {
                 char rurl[300]; resolve_link(st, st->doc->hrefs[h->link], rurl, sizeof(rurl));
                 navigate(st, rurl);
@@ -592,6 +685,7 @@ static void browser_click(window_t *w, int lx, int ly) {
             return;
         }
     }
+    st->focus_run = -1;                                /* clicked empty space: unfocus */
 }
 
 /* ---- a built-in start page + a sample local file ----------------------- */
@@ -610,10 +704,11 @@ static const char WELCOME[] =
     "<h1>BoltOS Browser</h1>"
     "<p class=\"tag\">now with CSS styling, backgrounds and form controls</p>"
     "<p class=\"hidden\">This line is display:none and must not render.</p>"
-    "<form>"
-    "<p>Search: <input type=\"text\" placeholder=\"Type and press Go\" size=\"22\"> "
+    "<form action=\"https://html.duckduckgo.com/html/\">"
+    "<p>Search the web: <input type=\"text\" name=\"q\" placeholder=\"Click here, type, press Enter\" size=\"26\"> "
     "<input type=\"submit\" value=\"Search\"></p>"
     "</form>"
+    "<p class=\"tag\">Click a text field to focus it, type, then press Enter or Search to submit a GET query.</p>"
     "<p>A tiny web browser running on a from-scratch kernel. It speaks HTTP and "
     "HTTPS (TLS 1.2: ECDHE-X25519 / AES-128-GCM) over the BoltOS TCP/IP stack, and "
     "can open local HTML files from the ramfs. The server certificate is not "
@@ -710,6 +805,7 @@ void browser_app_init(void) {
     w->click = browser_click;
 
     scopy(B.url, "about:welcome", sizeof(B.url));
+    fields_reset(&B);
     B.doc = html_parse(WELCOME, (uint32_t)(sizeof(WELCOME) - 1));
     fetch_images(&B);
     scopy(B.addr, "", sizeof(B.addr));

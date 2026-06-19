@@ -38,6 +38,7 @@ typedef struct {
     int      img;        /* index into doc->imgs, or -1 (image runs)*/
     int      iw, ih;     /* width/height hints from attrs, 0 = none */
     void    *pix;        /* decoded image_t*, filled by the browser */
+    char    *name;       /* form-field name (HRUN_INPUT), else NULL  */
 } html_run;
 
 typedef struct {
