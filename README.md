@@ -10,7 +10,9 @@ GRUB, no Multiboot, no external libraries. Custom MBR boot chain, own kernel.
 > virtual memory management, a **persistent filesystem on real ATA disks
 > (HDD/SSD)** behind a VFS, hardware interrupts, keyboard and mouse drivers, an
 > interactive shell, a full **IPv4/TCP/UDP/TLS network stack** on an e1000 NIC, a
-> small **Python interpreter**, **PC-speaker audio**, and an image decoder.
+> **multi-language IDE** with from-scratch **C / C++ / C# compilers** and a
+> **Python interpreter**, a **GPU / display-adapter driver**, support for running
+> real **Windows PE32+ executables**, **PC-speaker audio**, and an image decoder.
 
 ## Desktop & apps
 
@@ -26,7 +28,8 @@ Bundled apps:
 - **Terminal** — the full interactive shell in a window
 - **File Explorer** — browse/open the persistent filesystem
 - **Browser** — HTML renderer over the kernel's own HTTP/HTTPS stack
-- **Python** — REPL on the in-kernel BoltPy interpreter
+- **Code** — a multi-language IDE (C / C++ / C# / Python) with syntax
+  highlighting, line numbers, a Run button and an output console
 - **Task Manager** — live process / CPU / memory view
 - **Settings** — themes and system options (persisted)
 - **Calculator**, **Clock**, **Stopwatch**, **Calendar**, **Notes** (saved to FS)
@@ -85,12 +88,54 @@ ARP, IPv4, ICMP, UDP, TCP, DNS, HTTP (`net/*.c`). Wi-Fi association is scaffolde
 in the kernel but still needs a radio driver — see the `wifi` command. The shell
 also has `browse URL` (render a page as text) and `download URL` (save to the FS).
 
-## Python
+## IDE & compilers (BoltCC + BoltPy)
 
-**BoltPy** (`kernel/boltpy.c`) is a small Python interpreter that runs inside the
-kernel — available as the **Python** GUI app and the `python` shell command. It
-covers integer arithmetic, variables, strings, `print`, conditionals, and loops
-(no host CPython, no float).
+The **Code** app (`kernel/app_ide.c`) is a real in-kernel IDE: a text editor with
+a movable caret, line numbers, mouse click-to-place, scrolling, and live syntax
+highlighting, plus a language switcher and a **Run** button that compiles and
+executes the buffer, streaming the program's output into a console pane below.
+
+- **BoltCC** (`kernel/boltcc.c`) is a from-scratch **C / C++ / C# compiler**: one
+  pipeline — lexer → recursive-descent parser → AST → **stack bytecode** → a
+  bytecode **VM**. It genuinely compiles the source and runs the emitted
+  bytecode (it is not a text interpreter). Shared across the three dialects:
+  functions with recursion and forward references, `int`/`char`/`long`/`bool`/
+  `string`/`var` declarations, the full arithmetic / bitwise / comparison
+  operator set with correct precedence, `&&`/`||`/`!` short-circuiting, `?:`,
+  `++`/`--`, compound assignment, `if`/`else`/`while`/`for`/`return`/`break`/
+  `continue`, string concatenation and indexing, and builtins (`len`, `str`,
+  `int`, `abs`, `min`, `max`, `chr`, `ord`). Per dialect:
+  - **C** — `printf` (real `%d/%i/%u/%x/%c/%s/%%` formatting), `puts`, `putchar`
+  - **C++** — `std::cout << … << std::endl` chains, `using namespace`, classes skipped
+  - **C#** — `Console.WriteLine`/`Write` (incl. `{0} {1}` formatting), `using` /
+    `namespace` / `class` unwrapped, entry point `Main()`
+- **BoltPy** (`kernel/boltpy.c`) is a small Python-3 subset interpreter — the
+  IDE's Python tab and the `python` shell command run on it. Integer arithmetic,
+  variables, strings/lists, `print`, conditionals, `while`/`for`, `def`/recursion.
+
+> The kernel has no FPU (SSE/x87 disabled), so every language here is **integer +
+> string** only — there is no floating point.
+
+## GPU / display driver
+
+`drivers/gpu.c` probes the PCI bus for a display-class (`0x03`) controller,
+identifies the adapter from its `vendor:device` id (QEMU std-VGA, VirtualBox,
+VMware SVGA II, VirtIO-GPU, Cirrus, Intel, NVIDIA, AMD), decodes BAR0 to size the
+VRAM aperture, and detects the **Bochs DISPI (VBE)** interface for runtime mode
+setting. It backs the **Graphics** line in System Info and exposes a mode list +
+`gpu_set_mode()` (the linear framebuffer itself lives in `drivers/framebuffer.c`).
+
+## Windows executables (PE32+)
+
+BoltOS can load and run real **Windows x86-64 console `.exe`** files. The loader
+(`kernel/pe.c`) parses the PE32+ headers, copies sections by RVA into a heap
+image, binds the import table against an in-kernel **kernel32 shim**
+(`GetStdHandle`, `WriteConsoleA`, `WriteFile`, `ExitProcess`, `Heap*`, … exposed
+with the Microsoft x64 ABI), and calls the entry point. The build compiles
+`user/winhello.c` into a **genuine PE32+** with the mingw toolchain and embeds it;
+run it from the shell with `winrun` (no args = the embedded demo, or
+`winrun /path/to/app.exe`). The image is position-independent (RIP-relative), so
+no base relocations are needed once imports are bound.
 
 ## Boot flow (from scratch)
 
@@ -119,6 +164,7 @@ in `RDI` and lives at physical `0x0500`.
 
 - `nasm` — bootloader, kernel asm, and the userland `crt0`
 - `clang --target=x86_64-elf` — freestanding kernel + userland C (native cross-compiler)
+- `clang --target=x86_64-w64-mingw32` — builds `user/winhello.c` into a real PE32+ `.exe`
 - `ld.lld` — link kernel to a flat binary and the user program to a static ELF64
 - `qemu-system-x86_64` — run / test
 
@@ -129,18 +175,19 @@ bash build.sh      # -> iso/os.img (+ bootable iso/boltos.iso)
 bash run.sh        # boot in QEMU, kernel output on serial (stdio)
 ```
 
-`build.sh` also assembles + links `user/hello.c` into a static ELF64 and embeds
-it in the kernel. PowerShell helpers (`rebuild-all.ps1`, `rebuild-vdi.ps1`,
-`build-and-run-vbox.bat`) build VirtualBox-friendly images.
+`build.sh` also assembles + links `user/hello.c` into a static ELF64 and compiles
+`user/winhello.c` into a real PE32+ `.exe`, embedding both in the kernel.
+PowerShell helpers (`rebuild-all.ps1`, `rebuild-vdi.ps1`, `build-and-run-vbox.bat`)
+build VirtualBox-friendly images.
 
 ## Layout
 
 ```
 boot/           Custom MBR bootloader (stage1, stage2)
-drivers/        Hardware drivers (framebuffer, keyboard, mouse, ATA HDD/SSD, e1000, PC speaker)
+drivers/        Hardware drivers (framebuffer, GPU/display, keyboard, mouse, ATA HDD/SSD, e1000, PC speaker)
 fs/             Filesystem (BoltFS: in-RAM tree, persisted to an ATA disk)
 include/        Kernel and system headers
-kernel/         Core kernel: scheduler, processes, syscalls, ELF loader, GUI + apps, shell, Python
+kernel/         Core kernel: scheduler, processes, syscalls, ELF + PE loaders, GUI + apps, shell, BoltCC compilers, Python
 libc/           Freestanding C library subset
 mm/             Memory management (PMM, heap, virtual memory, DMA)
 net/            Network stack (ARP, IP, ICMP, UDP, TCP, DNS, HTTP, TLS, crypto, e1000 glue, Wi-Fi)
@@ -152,11 +199,11 @@ run.sh          QEMU launcher
 
 ## Project Stats
 
-- **Total Lines of Code:** ~18,995
-  - **C:** 16,452 lines
+- **Total Lines of Code:** ~20,870
+  - **C:** ~18,250 lines
   - **Assembly:** 708 lines
-  - **Headers:** 1,577 lines
-  - **Shell Scripts:** 150 lines
+  - **Headers:** ~1,655 lines
+  - **Shell Scripts:** 160 lines
   - **Linker Scripts:** 62 lines
   - **Python (build tools):** 46 lines
 
@@ -168,8 +215,9 @@ The interactive OS shell supports a wide range of commands:
 - **File Inspection:** `cat`, `head`, `tail`, `hex`, `meta`, `diff`, `grep`, `checksum`, `preview`, `count`
 - **System Information:** `sysinfo`, `cpuinfo`, `meminfo`, `diskinfo`, `sync`, `uptime`, `battery`, `sensors`, `devices`, `version`, `health`
 - **Process Management:** `ps`, `kill`, `top`, `freeze`, `resume`, `services`, `service`, `jobs`, `priority`, `monitor`
+- **System (cont.):** `winrun` (run a Windows PE32+ `.exe` via the in-kernel loader)
 - **Networking:** `netinfo`, `ping`, `trace`, `ports`, `download`, `browse`, `upload`, `wifi`, `firewall`, `share`, `scan`
-- **Language:** `python` (BoltPy interpreter / REPL)
+- **Language:** `python` (BoltPy interpreter / REPL); the **Code** app compiles C / C++ / C#
 - **Bonus / Unique:** `focus`, `snapshot`, `timeline`, `vault`, `doctor`, `assistant`, `sandbox`, `workspace`, `panic`, `story`
 - **Core:** `help`, `echo`, `clear`, `mem`
 
@@ -193,6 +241,7 @@ The interactive OS shell supports a wide range of commands:
 |   +-- ata.c
 |   +-- e1000.c
 |   +-- framebuffer.c
+|   +-- gpu.c
 |   +-- keyboard.c
 |   +-- mouse.c
 |   \-- pcspk.c
@@ -200,6 +249,7 @@ The interactive OS shell supports a wide range of commands:
 |   \-- ramfs.c
 +-- include
 |   +-- ata.h            +-- gdt.h            +-- net.h
+|   +-- boltcc.h         +-- gpu.h            +-- pe.h
 |   +-- boltpy.h         +-- gui.h            +-- netif.h
 |   +-- boot.h           +-- html.h           +-- pic.h
 |   +-- commands.h       +-- http.h           +-- pit.h
@@ -229,10 +279,11 @@ The interactive OS shell supports a wide range of commands:
 |   +-- app_notes.c      +-- elf.c            +-- proc.c
 |   +-- app_paint.c      +-- font8x8.c        +-- sched.c
 |   +-- app_piano.c      +-- gdt.c            +-- serial.c
-|   +-- app_python.c     +-- settings.c       +-- shell.c
+|   +-- app_ide.c        +-- settings.c       +-- shell.c
 |   +-- app_settings.c   +-- syscall.asm      +-- sysreg.c
 |   +-- app_snake.c      +-- syscall.c        +-- user.asm
-|   \-- app_stopwatch.c  +-- app_sysinfo.c
+|   +-- app_stopwatch.c  +-- app_sysinfo.c    +-- boltcc.c
+|   \-- pe.c
 +-- libc
 |   \-- string.c
 +-- mm
@@ -247,6 +298,7 @@ The interactive OS shell supports a wide range of commands:
 \-- user
     +-- crt0.asm
     +-- hello.c
+    +-- winhello.c
     +-- ulibc.c
     +-- ulibc.h
     \-- user.ld

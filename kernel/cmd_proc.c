@@ -8,6 +8,8 @@
 #include "console.h"
 #include "keyboard.h"
 #include "io.h"
+#include "fs.h"
+#include "pe.h"
 
 static uint64_t secs_since(uint64_t start) {
     uint32_t hz = pit_hz() ? pit_hz() : 1000;
@@ -146,6 +148,29 @@ int cmd_service(int argc, char **argv) {
     else if (strcmp(act, "stop")    == 0) { s->running = 0; kprintf("%s stopped\n", s->name); }
     else if (strcmp(act, "restart") == 0) { s->running = 1; kprintf("%s restarted\n", s->name); }
     else kprintf("%s: %s  (%s)\n", s->name, s->running ? "running" : "stopped", s->kind);
+    return 0;
+}
+
+/* ------------------------------ winrun ----------------------------------- */
+/* Run a real Windows PE32+ console .exe through the in-kernel loader. With no
+ * argument it runs the embedded demo (user/winhello.c, built into a genuine PE
+ * by the mingw toolchain); with a path it loads that .exe from the filesystem. */
+extern const uint8_t _binary_winhello_exe_start[];
+extern const uint8_t _binary_winhello_exe_end[];
+
+int cmd_winrun(int argc, char **argv) {
+    const uint8_t *img; uint32_t sz;
+    if (argc > 1) {
+        fs_node *n = fs_lookup(argv[1]);
+        if (!n || n->is_dir || !n->data || !n->size) { kprintf("winrun: %s: not found\n", argv[1]); return 1; }
+        img = n->data; sz = (uint32_t)n->size;
+    } else {
+        img = _binary_winhello_exe_start;
+        sz  = (uint32_t)(_binary_winhello_exe_end - _binary_winhello_exe_start);
+    }
+    kprintf("[winrun] loading PE32+ image (%u bytes)\n", sz);
+    int code = pe_run(img, sz);
+    kprintf("[winrun] process exited with code %d\n", code);
     return 0;
 }
 

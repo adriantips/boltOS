@@ -374,6 +374,14 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         g_text(x + 2 * s, y + 3 * s, ">", c, s);
         g_fill(x + 7 * s, y + 8 * s, 5 * s, s, c);
         break;
+    case ICON_CODE:                              /* IDE: code brackets </> */
+        g_round(x, y, 16 * s, 14 * s, 3 * s, 0x101018, 255);
+        g_rect(x, y, 16 * s, 14 * s, c);
+        g_text(x + 2 * s, y + 3 * s, "<", c, s);
+        g_text(x + 10 * s, y + 3 * s, ">", c, s);
+        g_fill(x + 7 * s, y + 3 * s, s, 8 * s, c);       /* the slash (vertical hint) */
+        g_fill(x + 8 * s, y + 3 * s, s, 8 * s, COL_ACCENT);
+        break;
     case ICON_TASKMGR:
         g_fill(x + 1 * s, y + 7 * s, 2 * s, 5 * s, c);
         g_fill(x + 5 * s, y + 4 * s, 2 * s, 8 * s, c);
@@ -1238,7 +1246,7 @@ void gui_run(void) {
     terminal_app_init();
     files_app_init();
     browser_app_init();
-    python_app_init();
+    ide_app_init();
     taskmgr_app_init();
     calc_app_init();
     clock_app_init();

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include "gui.h"
 #include "hw.h"
+#include "gpu.h"
 #include "pmm.h"
 #include "fs.h"
 #include "net.h"
@@ -52,7 +53,7 @@ static void si_draw(window_t *win, int cx, int cy, int cw, int ch) {
     char buf[64], a[24], b[24];
 
     /* hardware card */
-    int cardh = 24 * 5 + 16;
+    int cardh = 24 * 6 + 16;
     g_round(x, y, w, cardh, 12, COL_PANEL_2, 255);
     int ry = y + 14;
     ry = row(x, ry, w, "Processor", cpu_brand[0] ? cpu_brand : "x86-64");
@@ -67,6 +68,17 @@ static void si_draw(window_t *win, int cx, int cy, int cw, int ch) {
     sh_utoa((uint64_t)dw, a); sh_utoa((uint64_t)dh, b);
     buf[0] = 0; kstrlcat(buf, a, sizeof(buf)); kstrlcat(buf, " x ", sizeof(buf)); kstrlcat(buf, b, sizeof(buf));
     ry = row(x, ry, w, "Display", buf);
+
+    if (gpu_present()) {
+        buf[0] = 0;
+        kstrlcat(buf, gpu_name(), sizeof(buf));
+        if (g_text_width(buf, 1) > w - 150) buf[20] = 0;   /* keep room for label */
+        if (gpu_vram_bytes()) {
+            sh_human(gpu_vram_bytes(), a);
+            kstrlcat(buf, "  ", sizeof(buf)); kstrlcat(buf, a, sizeof(buf));
+        }
+    } else { buf[0] = 0; kstrlcat(buf, "none", sizeof(buf)); }
+    ry = row(x, ry, w, "Graphics", buf);
 
     const char *media = fs_persist_media();
     buf[0] = 0;

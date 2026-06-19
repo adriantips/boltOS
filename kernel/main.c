@@ -11,6 +11,7 @@
 #include "serial.h"
 #include "console.h"
 #include "framebuffer.h"
+#include "gpu.h"
 #include "gdt.h"
 #include "interrupts.h"
 #include "pic.h"
@@ -87,6 +88,8 @@ void kmain(struct bootinfo *bi) {
                 fb_width(), fb_height(), bi->fb_addr);
     else
         kprintf("[--] no framebuffer; serial only\n");
+
+    gpu_init();   /* identify the display adapter + VRAM behind the framebuffer */
 
     gdt_init();   kprintf("[ok] GDT + TSS loaded\n");
     idt_init();   kprintf("[ok] IDT (256 vectors)\n");

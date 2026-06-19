@@ -132,6 +132,7 @@ const command_t commands[] = {
     { "diskinfo", "System",           "disk/storage status",                cmd_diskinfo },
     { "sync",     "System",           "flush filesystem to disk",           cmd_sync },
     { "uptime",   "System",           "time since boot",                    cmd_uptime },
+    { "winrun",   "System",           "run a Windows .exe (PE32+ loader)",   cmd_winrun },
     { "battery",  "System",           "battery status",                     cmd_battery },
     { "sensors",  "System",           "hardware sensors",                   cmd_sensors },
     { "devices",  "System",           "connected hardware (PCI)",           cmd_devices },

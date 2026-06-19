@@ -45,25 +45,36 @@ UCFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-p
 # embed the raw ELF as an object exposing _binary_hello_elf_start/_end
 ( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 hello.elf hello_blob.o )
 
+echo "[2c/6] windows program (user/winhello.c) -> real PE32+ EXE -> embed blob"
+# A genuine Windows x86-64 console .exe: freestanding, imports kernel32, linked
+# by the mingw toolchain. BoltOS's PE loader binds the imports to its shim.
+# NB: built with SSE/MMX/x87 disabled to match the kernel (which runs with SSE
+# off), so the PE contains only general-purpose-register code the loader can run.
+"$CLANG" --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-stack-protector \
+         -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mno-red-zone \
+         -O2 -Wl,-e,entry -Wl,--subsystem,console \
+         user/winhello.c -o build/winhello.exe -lkernel32
+( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 winhello.exe winhello_blob.o )
+
 echo "[3/6] kernel C sources"
 SRCS=(
     kernel/main.c kernel/serial.c kernel/console.c kernel/shell.c kernel/kprintf.c kernel/font8x8.c
     kernel/gdt.c kernel/idt.c kernel/interrupts.c kernel/pic.c kernel/pit.c
     kernel/hw.c kernel/pci.c kernel/sysreg.c kernel/sched.c kernel/syscall.c
-    kernel/vfs.c kernel/proc.c kernel/elf.c
+    kernel/vfs.c kernel/proc.c kernel/elf.c kernel/pe.c
     net/netif.c net/driver.c net/eth.c net/arp.c net/ip.c net/icmp.c net/udp.c
     net/tcp.c net/dns.c net/crypto.c net/tls.c net/http.c
     net/wifi.c net/firmware.c drivers/e1000.c
     kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c
     kernel/html.c kernel/image.c
     kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c kernel/app_files.c
-    kernel/app_python.c kernel/app_calc.c kernel/app_clock.c kernel/app_notes.c kernel/app_calendar.c kernel/app_piano.c kernel/app_paint.c kernel/app_mines.c kernel/app_snake.c kernel/app_2048.c kernel/app_stopwatch.c kernel/app_sysinfo.c kernel/app_life.c kernel/app_ttt.c kernel/app_colorpick.c kernel/app_memory.c kernel/app_matrix.c
+    kernel/app_ide.c kernel/app_calc.c kernel/app_clock.c kernel/app_notes.c kernel/app_calendar.c kernel/app_piano.c kernel/app_paint.c kernel/app_mines.c kernel/app_snake.c kernel/app_2048.c kernel/app_stopwatch.c kernel/app_sysinfo.c kernel/app_life.c kernel/app_ttt.c kernel/app_colorpick.c kernel/app_memory.c kernel/app_matrix.c
     kernel/settings.c
-    kernel/boltpy.c kernel/cmd_python.c
+    kernel/boltpy.c kernel/cmd_python.c kernel/boltcc.c
     fs/ramfs.c
-    drivers/keyboard.c drivers/framebuffer.c drivers/mouse.c drivers/ata.c drivers/pcspk.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
+    drivers/keyboard.c drivers/framebuffer.c drivers/gpu.c drivers/mouse.c drivers/ata.c drivers/pcspk.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
 )
-KOBJS=(build/kboot.o build/isr.o build/sc_entry.o build/hello_blob.o)
+KOBJS=(build/kboot.o build/isr.o build/sc_entry.o build/hello_blob.o build/winhello_blob.o)
 for c in "${SRCS[@]}"; do
     o="build/$(basename "${c%.c}").o"
     "$CLANG" "${CFLAGS[@]}" "$c" -o "$o"

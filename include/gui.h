@@ -88,7 +88,7 @@ struct window {
 };
 
 enum { ICON_NONE = 0, ICON_TERMINAL, ICON_TASKMGR, ICON_START, ICON_FILES, ICON_SETTINGS,
-       ICON_BROWSER, ICON_FOLDER, ICON_FILE, ICON_TRASH, ICON_CALC, ICON_CLOCK, ICON_NOTES, ICON_CALENDAR, ICON_PIANO, ICON_PAINT, ICON_MINES, ICON_SNAKE, ICON_2048, ICON_STOPWATCH, ICON_SYSINFO, ICON_LIFE, ICON_TTT, ICON_COLOR, ICON_MEMORY, ICON_MATRIX };
+       ICON_BROWSER, ICON_FOLDER, ICON_FILE, ICON_TRASH, ICON_CALC, ICON_CLOCK, ICON_NOTES, ICON_CALENDAR, ICON_PIANO, ICON_PAINT, ICON_MINES, ICON_SNAKE, ICON_2048, ICON_STOPWATCH, ICON_SYSINFO, ICON_LIFE, ICON_TTT, ICON_COLOR, ICON_MEMORY, ICON_MATRIX, ICON_CODE };
 
 window_t *gui_add_window(const char *title, int w, int h, uint32_t accent, int icon);
 void      gui_open(window_t *win);          /* show + focus + raise           */
@@ -123,7 +123,7 @@ void taskmgr_app_init(void);
 void settings_app_init(void);
 void browser_app_init(void);
 void files_app_init(void);
-void python_app_init(void);
+void ide_app_init(void);
 void calc_app_init(void);
 void clock_app_init(void);
 void notes_app_init(void);

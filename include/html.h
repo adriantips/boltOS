@@ -35,6 +35,7 @@ typedef struct {
     uint8_t  indent;     /* indent level (lists / blockquote)       */
     uint32_t color;      /* HCOL_NONE, or 0x1RRGGBB (high bit = set)*/
     uint32_t bg;         /* element background: HCOL_NONE or 0x1RRGGBB */
+    uint8_t  fscale;     /* CSS font-size -> text scale 1..3, 0 = use style default */
     int      img;        /* index into doc->imgs, or -1 (image runs)*/
     int      iw, ih;     /* width/height hints from attrs, 0 = none */
     void    *pix;        /* decoded image_t*, filled by the browser */

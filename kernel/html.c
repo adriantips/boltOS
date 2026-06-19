@@ -72,14 +72,14 @@ static char *arena_push(html_doc *d, const char *s, uint32_t n) {
 /* full run record so callers can set the extended fields */
 static void push_full(html_doc *d, const char *text, uint32_t n, uint8_t style,
                       int link, uint8_t brk, uint32_t color, uint8_t align, uint8_t indent,
-                      uint32_t bg) {
+                      uint32_t bg, uint8_t fscale) {
     if (d->nruns >= d->runs_cap) return;
     char *t = arena_push(d, text, n);
     if (!t) return;
     html_run *r = &d->runs[d->nruns++];
     r->text = t; r->style = style; r->link = link; r->brk = brk;
     r->kind = HRUN_TEXT; r->align = align; r->indent = indent; r->color = color;
-    r->bg = bg; r->img = -1; r->iw = r->ih = 0; r->pix = 0; r->name = 0;
+    r->bg = bg; r->fscale = fscale; r->img = -1; r->iw = r->ih = 0; r->pix = 0; r->name = 0;
 }
 
 static void cpy(char *d, const char *s, uint32_t cap) {
@@ -95,7 +95,7 @@ static void push_input(html_doc *d, const char *label, const char *name, int lin
     html_run *r = &d->runs[d->nruns++];
     r->text = t ? t : ""; r->style = HSTYLE_NORMAL; r->link = link; r->brk = brk;
     r->kind = HRUN_INPUT; r->align = align; r->indent = indent; r->color = color;
-    r->bg = HCOL_NONE; r->img = subtype; r->iw = w; r->ih = h; r->pix = 0;
+    r->bg = HCOL_NONE; r->fscale = 0; r->img = subtype; r->iw = w; r->ih = h; r->pix = 0;
     r->name = (name && name[0]) ? arena_push(d, name, (uint32_t)strlen(name)) : 0;
 }
 
@@ -472,7 +472,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                         : (italic || CUR_ITALIC) ? HSTYLE_ITALIC : (bold || CUR_BOLD) ? HSTYLE_BOLD : HSTYLE_NORMAL)
 
     #define FLUSH() do { if (seglen) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, \
-                                CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG); seglen = 0; pending_brk = 0; } } while (0)
+                                CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG, 0); seglen = 0; pending_brk = 0; } } while (0)
 
     for (uint32_t i = 0; i < len; ) {
         char c = src[i];
@@ -688,11 +688,11 @@ html_doc *html_parse(const char *src, uint32_t len) {
             }
             if (strcmp(name, "li") == 0 && !closing) {
                 FLUSH(); pending_brk = pending_brk < 1 ? 1 : pending_brk;
-                push_full(d, "- ", 2, HSTYLE_NORMAL, -1, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG);
+                push_full(d, "- ", 2, HSTYLE_NORMAL, -1, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG, 0);
                 pending_brk = 0; continue;
             }
             if (strcmp(name, "hr") == 0) { FLUSH(); pending_brk = 2;
-                push_full(d, "--------------------------------", 32, HSTYLE_NORMAL, -1, 2, CUR_COLOR, HALIGN_LEFT, CUR_INDENT, CUR_BG);
+                push_full(d, "--------------------------------", 32, HSTYLE_NORMAL, -1, 2, CUR_COLOR, HALIGN_LEFT, CUR_INDENT, CUR_BG, 0);
                 pending_brk = 1; continue; }
             if (strcmp(name, "p") == 0 || strcmp(name, "div") == 0 ||
                 strcmp(name, "table") == 0 || strcmp(name, "tr") == 0 ||
@@ -705,7 +705,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
             }
             if ((strcmp(name, "td") == 0 || strcmp(name, "th") == 0) && !closing) {
                 FLUSH(); /* a couple of spaces to separate table cells on a line */
-                push_full(d, "  ", 2, HSTYLE_NORMAL, -1, 0, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG);
+                push_full(d, "  ", 2, HSTYLE_NORMAL, -1, 0, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG, 0);
                 continue;
             }
             continue;   /* unknown / inline tag: ignored, text flows through */
@@ -764,12 +764,12 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 else if (pending_brk == 0 && line_started) seg[seglen++] = ' ';
             }
             space_pending = 0;
-            if (seglen >= SEG_MAX - 1) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG); seglen = 0; pending_brk = 0; }
+            if (seglen >= SEG_MAX - 1) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG, 0); seglen = 0; pending_brk = 0; }
             seg[seglen++] = c;
             line_started = 1;
         }
     }
-    if (seglen) push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG);
+    if (seglen) push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG, 0);
     if (rules) kfree(rules);
     return d;
 }
@@ -782,12 +782,12 @@ html_doc *html_parse_text(const char *src, uint32_t len) {
         char c = src[i];
         if (c == '\r') continue;
         if (c == '\n') {
-            push_full(d, seglen ? seg : " ", seglen ? seglen : 1, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0, HCOL_NONE);
+            push_full(d, seglen ? seg : " ", seglen ? seglen : 1, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0, HCOL_NONE, 0);
             seglen = 0; brk = 1; continue;
         }
         if (seglen < SEG_MAX - 1) seg[seglen++] = c;
     }
-    if (seglen) push_full(d, seg, seglen, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0, HCOL_NONE);
+    if (seglen) push_full(d, seg, seglen, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0, HCOL_NONE, 0);
     return d;
 }
 
