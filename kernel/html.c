@@ -71,14 +71,15 @@ static char *arena_push(html_doc *d, const char *s, uint32_t n) {
 
 /* full run record so callers can set the extended fields */
 static void push_full(html_doc *d, const char *text, uint32_t n, uint8_t style,
-                      int link, uint8_t brk, uint32_t color, uint8_t align, uint8_t indent) {
+                      int link, uint8_t brk, uint32_t color, uint8_t align, uint8_t indent,
+                      uint32_t bg) {
     if (d->nruns >= d->runs_cap) return;
     char *t = arena_push(d, text, n);
     if (!t) return;
     html_run *r = &d->runs[d->nruns++];
     r->text = t; r->style = style; r->link = link; r->brk = brk;
     r->kind = HRUN_TEXT; r->align = align; r->indent = indent; r->color = color;
-    r->img = -1; r->iw = r->ih = 0; r->pix = 0;
+    r->bg = bg; r->img = -1; r->iw = r->ih = 0; r->pix = 0;
 }
 
 static void cpy(char *d, const char *s, uint32_t cap) {
@@ -93,7 +94,7 @@ static void push_input(html_doc *d, const char *label, int subtype, int w, int h
     html_run *r = &d->runs[d->nruns++];
     r->text = t ? t : ""; r->style = HSTYLE_NORMAL; r->link = -1; r->brk = brk;
     r->kind = HRUN_INPUT; r->align = align; r->indent = indent; r->color = color;
-    r->img = subtype; r->iw = w; r->ih = h; r->pix = 0;
+    r->bg = HCOL_NONE; r->img = subtype; r->iw = w; r->ih = h; r->pix = 0;
 }
 
 /* decode an entity starting at src[*i]=='&'; return decoded char, advance *i */
@@ -252,6 +253,7 @@ typedef struct {
     char     sel[24];   /* bare ident, lower-cased ('*' for universal) */
     uint8_t  kind;      /* 0 tag, 1 class, 2 id, 3 universal           */
     uint32_t color;     /* HCOL_NONE or 0x1RRGGBB                       */
+    uint32_t bg;        /* background colour: HCOL_NONE or 0x1RRGGBB    */
     uint8_t  align;     /* HALIGN_* or ALIGN_UNSET                      */
     int8_t   bold;      /* -1 unset, else 0/1                           */
     int8_t   italic;    /* -1 unset, else 0/1                           */
@@ -281,7 +283,7 @@ static int cls_has(const char *cls, const char *name) {
 
 /* apply a `prop:val; prop:val` declaration list onto the field set */
 static void css_decl_apply(const char *d, uint32_t n, uint32_t *color, uint8_t *align,
-                           int8_t *bold, int8_t *italic, uint8_t *hidden) {
+                           int8_t *bold, int8_t *italic, uint8_t *hidden, uint32_t *bg) {
     uint32_t i = 0;
     while (i < n) {
         while (i < n && (d[i]==';'||d[i]==' '||d[i]=='\t'||d[i]=='\n'||d[i]=='\r')) i++;
@@ -297,6 +299,8 @@ static void css_decl_apply(const char *d, uint32_t n, uint32_t *color, uint8_t *
         val[vl] = 0;
         char *v = val; while (*v == ' ') v++;
         if      (strcmp(prop,"color")==0)       { uint32_t c = parse_color_token(v); if (c) *color = c; }
+        else if (strcmp(prop,"background-color")==0 ||
+                 strcmp(prop,"background")==0)   { uint32_t c = parse_color_token(v); if (c) *bg = c; }
         else if (strcmp(prop,"text-align")==0)  { char a = lc(v[0]); *align = a=='c'?HALIGN_CENTER : a=='r'?HALIGN_RIGHT : HALIGN_LEFT; }
         else if (strcmp(prop,"font-weight")==0) { *bold   = (lc(v[0])=='b' || (v[0]>='6'&&v[0]<='9')) ? 1 : 0; }
         else if (strcmp(prop,"font-style")==0)  { *italic = (lc(v[0])=='i' || lc(v[0])=='o') ? 1 : 0; }
@@ -346,10 +350,10 @@ static void parse_css(css_rule *rules, int *nr, const char *src, uint32_t len) {
         uint32_t b0 = i; while (i < len && src[i] != '}') i++;
         uint32_t b1 = i; if (i < len) i++;
 
-        uint32_t color = HCOL_NONE; uint8_t align = ALIGN_UNSET;
+        uint32_t color = HCOL_NONE, bg = HCOL_NONE; uint8_t align = ALIGN_UNSET;
         int8_t bold = -1, italic = -1; uint8_t hidden = 0;
-        css_decl_apply(src + b0, b1 - b0, &color, &align, &bold, &italic, &hidden);
-        if (color==HCOL_NONE && align==ALIGN_UNSET && bold<0 && italic<0 && !hidden) continue;
+        css_decl_apply(src + b0, b1 - b0, &color, &align, &bold, &italic, &hidden, &bg);
+        if (color==HCOL_NONE && bg==HCOL_NONE && align==ALIGN_UNSET && bold<0 && italic<0 && !hidden) continue;
 
         uint32_t p = s0;
         while (p < s1 && *nr < CSS_MAX) {
@@ -359,7 +363,7 @@ static void parse_css(css_rule *rules, int *nr, const char *src, uint32_t len) {
             if (sel[0]) {
                 css_rule *r = &rules[(*nr)++];
                 cpy(r->sel, sel, sizeof(r->sel));
-                r->kind = kind; r->color = color; r->align = align;
+                r->kind = kind; r->color = color; r->bg = bg; r->align = align;
                 r->bold = bold; r->italic = italic; r->hidden = hidden;
             }
             p = q + 1;
@@ -371,7 +375,7 @@ static void parse_css(css_rule *rules, int *nr, const char *src, uint32_t len) {
  * in tag < class < id specificity order */
 static void css_match(const css_rule *rules, int n, const char *tag, const char *cls,
                       const char *id, uint32_t *color, uint8_t *align,
-                      int8_t *bold, int8_t *italic, uint8_t *hidden) {
+                      int8_t *bold, int8_t *italic, uint8_t *hidden, uint32_t *bg) {
     static const uint8_t order[4] = { 3, 0, 1, 2 };
     for (int pass = 0; pass < 4; pass++) {
         uint8_t want = order[pass];
@@ -383,6 +387,7 @@ static void css_match(const css_rule *rules, int n, const char *tag, const char 
                   :           (id[0]  && streqi(rules[k].sel, id));
             if (!m) continue;
             if (rules[k].color != HCOL_NONE)  *color  = rules[k].color;
+            if (rules[k].bg    != HCOL_NONE)  *bg     = rules[k].bg;
             if (rules[k].align != ALIGN_UNSET) *align = rules[k].align;
             if (rules[k].bold   >= 0)         *bold   = rules[k].bold;
             if (rules[k].italic >= 0)         *italic = rules[k].italic;
@@ -399,8 +404,8 @@ static uint8_t tag_align(const char *tag) {
         return a=='c'?HALIGN_CENTER : a=='r'?HALIGN_RIGHT : HALIGN_LEFT;
     }
     if (get_attr(tag, "style", val, sizeof(val))) {
-        uint32_t c = HCOL_NONE; uint8_t al = ALIGN_UNSET; int8_t b=-1,it=-1; uint8_t h=0;
-        css_decl_apply(val, (uint32_t)strlen(val), &c, &al, &b, &it, &h);
+        uint32_t c = HCOL_NONE, bg = HCOL_NONE; uint8_t al = ALIGN_UNSET; int8_t b=-1,it=-1; uint8_t h=0;
+        css_decl_apply(val, (uint32_t)strlen(val), &c, &al, &b, &it, &h, &bg);
         return al;
     }
     return ALIGN_UNSET;
@@ -448,10 +453,11 @@ html_doc *html_parse(const char *src, uint32_t len) {
     int nrules = 0;
 
     /* format stack: open colour/align/css tags push a frame, popped on close */
-    struct { char name[12]; uint32_t color; uint8_t align; int8_t bold, italic; uint8_t hidden; } fst[FSTACK_MAX];
+    struct { char name[12]; uint32_t color; uint32_t bg; uint8_t align; int8_t bold, italic; uint8_t hidden; } fst[FSTACK_MAX];
     int fdepth = 0;
 
     #define CUR_COLOR  (fdepth ? fst[fdepth-1].color : HCOL_NONE)
+    #define CUR_BG     (fdepth ? fst[fdepth-1].bg : HCOL_NONE)
     #define CUR_ALIGN  (fdepth ? fst[fdepth-1].align : HALIGN_LEFT)
     #define CUR_BOLD   (fdepth && fst[fdepth-1].bold   > 0)
     #define CUR_ITALIC (fdepth && fst[fdepth-1].italic > 0)
@@ -463,7 +469,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                         : (italic || CUR_ITALIC) ? HSTYLE_ITALIC : (bold || CUR_BOLD) ? HSTYLE_BOLD : HSTYLE_NORMAL)
 
     #define FLUSH() do { if (seglen) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, \
-                                CUR_COLOR, CUR_ALIGN, CUR_INDENT); seglen = 0; pending_brk = 0; } } while (0)
+                                CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG); seglen = 0; pending_brk = 0; } } while (0)
 
     for (uint32_t i = 0; i < len; ) {
         char c = src[i];
@@ -503,21 +509,23 @@ html_doc *html_parse(const char *src, uint32_t len) {
             if (!closing && !is_void_tag(name)) {
                 char cls[96]; cls[0] = 0; get_attr(tag, "class", cls, sizeof(cls));
                 char idv[64]; idv[0] = 0; get_attr(tag, "id",    idv, sizeof(idv));
-                uint32_t col = HCOL_NONE; uint8_t al = ALIGN_UNSET;
+                uint32_t col = HCOL_NONE, bgc = HCOL_NONE; uint8_t al = ALIGN_UNSET;
                 int8_t cb = -1, ci = -1; uint8_t hid = 0;
-                if (rules) css_match(rules, nrules, name, cls, idv, &col, &al, &cb, &ci, &hid);
+                if (rules) css_match(rules, nrules, name, cls, idv, &col, &al, &cb, &ci, &hid, &bgc);
                 /* inline style / presentational attrs override the rule set */
                 char sv[160];
                 if (get_attr(tag, "style", sv, sizeof(sv)))
-                    css_decl_apply(sv, (uint32_t)strlen(sv), &col, &al, &cb, &ci, &hid);
+                    css_decl_apply(sv, (uint32_t)strlen(sv), &col, &al, &cb, &ci, &hid, &bgc);
                 { uint32_t ic = tag_color(tag); if (ic != HCOL_NONE) col = ic; }
+                { char bgv[40]; if (get_attr(tag, "bgcolor", bgv, sizeof(bgv))) { uint32_t bc = parse_color_token(bgv); if (bc) bgc = bc; } }
                 { uint8_t ia = tag_align(tag); if (ia != ALIGN_UNSET) al = ia; }
                 if (strcmp(name,"center")==0 && al == ALIGN_UNSET) al = HALIGN_CENTER;
-                int has = (col!=HCOL_NONE) || (al!=ALIGN_UNSET) || (cb>=0) || (ci>=0) || hid;
+                int has = (col!=HCOL_NONE) || (bgc!=HCOL_NONE) || (al!=ALIGN_UNSET) || (cb>=0) || (ci>=0) || hid;
                 int is_fmt = has || strcmp(name,"center")==0 || strcmp(name,"font")==0 || strcmp(name,"span")==0;
                 if (is_fmt && fdepth < FSTACK_MAX) {
                     FLUSH();                       /* preceding text is the parent's */
                     fst[fdepth].color  = (col != HCOL_NONE)   ? col : CUR_COLOR;
+                    fst[fdepth].bg     = (bgc != HCOL_NONE)   ? bgc : CUR_BG;
                     fst[fdepth].align  = (al  != ALIGN_UNSET) ? al  : CUR_ALIGN;
                     fst[fdepth].bold   = (cb >= 0) ? cb : (fdepth ? fst[fdepth-1].bold   : -1);
                     fst[fdepth].italic = (ci >= 0) ? ci : (fdepth ? fst[fdepth-1].italic : -1);
@@ -633,7 +641,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                         html_run *r = &d->runs[d->nruns++];
                         r->text = at ? at : s; r->style = HSTYLE_NORMAL; r->link = link;
                         r->brk = (uint8_t)pending_brk; r->kind = HRUN_IMG; r->align = CUR_ALIGN;
-                        r->indent = CUR_INDENT; r->color = CUR_COLOR; r->img = d->nimgs;
+                        r->indent = CUR_INDENT; r->color = CUR_COLOR; r->bg = CUR_BG; r->img = d->nimgs;
                         r->iw = iw; r->ih = ih; r->pix = 0;
                         d->nimgs++; pending_brk = 0;
                     }
@@ -656,11 +664,11 @@ html_doc *html_parse(const char *src, uint32_t len) {
             }
             if (strcmp(name, "li") == 0 && !closing) {
                 FLUSH(); pending_brk = pending_brk < 1 ? 1 : pending_brk;
-                push_full(d, "- ", 2, HSTYLE_NORMAL, -1, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                push_full(d, "- ", 2, HSTYLE_NORMAL, -1, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG);
                 pending_brk = 0; continue;
             }
             if (strcmp(name, "hr") == 0) { FLUSH(); pending_brk = 2;
-                push_full(d, "--------------------------------", 32, HSTYLE_NORMAL, -1, 2, CUR_COLOR, HALIGN_LEFT, CUR_INDENT);
+                push_full(d, "--------------------------------", 32, HSTYLE_NORMAL, -1, 2, CUR_COLOR, HALIGN_LEFT, CUR_INDENT, CUR_BG);
                 pending_brk = 1; continue; }
             if (strcmp(name, "p") == 0 || strcmp(name, "div") == 0 ||
                 strcmp(name, "table") == 0 || strcmp(name, "tr") == 0 ||
@@ -673,7 +681,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
             }
             if ((strcmp(name, "td") == 0 || strcmp(name, "th") == 0) && !closing) {
                 FLUSH(); /* a couple of spaces to separate table cells on a line */
-                push_full(d, "  ", 2, HSTYLE_NORMAL, -1, 0, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+                push_full(d, "  ", 2, HSTYLE_NORMAL, -1, 0, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG);
                 continue;
             }
             continue;   /* unknown / inline tag: ignored, text flows through */
@@ -732,12 +740,12 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 else if (pending_brk == 0 && line_started) seg[seglen++] = ' ';
             }
             space_pending = 0;
-            if (seglen >= SEG_MAX - 1) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT); seglen = 0; pending_brk = 0; }
+            if (seglen >= SEG_MAX - 1) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG); seglen = 0; pending_brk = 0; }
             seg[seglen++] = c;
             line_started = 1;
         }
     }
-    if (seglen) push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT);
+    if (seglen) push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG);
     if (rules) kfree(rules);
     return d;
 }
@@ -750,12 +758,12 @@ html_doc *html_parse_text(const char *src, uint32_t len) {
         char c = src[i];
         if (c == '\r') continue;
         if (c == '\n') {
-            push_full(d, seglen ? seg : " ", seglen ? seglen : 1, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0);
+            push_full(d, seglen ? seg : " ", seglen ? seglen : 1, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0, HCOL_NONE);
             seglen = 0; brk = 1; continue;
         }
         if (seglen < SEG_MAX - 1) seg[seglen++] = c;
     }
-    if (seglen) push_full(d, seg, seglen, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0);
+    if (seglen) push_full(d, seg, seglen, HSTYLE_PRE, -1, brk, HCOL_NONE, HALIGN_LEFT, 0, HCOL_NONE);
     return d;
 }
 

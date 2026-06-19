@@ -100,6 +100,7 @@ typedef struct {
     int      is_img; image_t *pix; int dw, dh; /* image item */
     int      italic;
     int      is_input, subtype;    /* form control: 0 field,1 button,2 area,3 select */
+    uint32_t bg;                   /* element background: HCOL_NONE or 0x1RRGGBB */
 } litem;
 
 #define MAXLINE 320
@@ -115,6 +116,8 @@ static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
         else if (align == HALIGN_RIGHT)  off = avail - linew;
         if (off < 0) off = 0;
         if (draw && py + line_h >= Y0 && py <= Yb) {
+            uint32_t lbg = LINE[0].bg;          /* block background band for the line */
+            if (lbg & 0x1000000) g_fill(cx + xstart, cy + py, avail, line_h, lbg & 0xFFFFFF);
             for (int k = 0; k < n; k++) {
                 litem *it = &LINE[k];
                 int ax = cx + xstart + off + it->x;
@@ -142,6 +145,10 @@ static void emit_line(browser_t *st, int cx, int cy, int draw, int *pen_y,
                     if (it->link >= 0 && st->nhits < (int)(sizeof(st->hits)/sizeof(st->hits[0])))
                         st->hits[st->nhits++] = (hitrect){ xstart+off+it->x, py, it->dw, it->dh, it->link };
                 } else {
+                    /* inline background highlight (e.g. <code>, <mark>) when the
+                     * line has no full-width block band of the same colour */
+                    if ((it->bg & 0x1000000) && it->bg != lbg)
+                        g_fill(ax - 2, cy + py, it->w + 4, line_h, it->bg & 0xFFFFFF);
                     g_text_pn(ax, cy + py, it->text, it->len, it->color, it->scale, it->italic);
                     if (it->link >= 0) {
                         g_hline(ax, cy + py + 8 * it->scale + 1, it->w, it->color);
@@ -195,7 +202,7 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
                 n = 0; cur_x = 0; line_h = 0;
             }
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, (int)strlen(r->text), 1, im, dw, dh, 0, 0, 0 };
+                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, (int)strlen(r->text), 1, im, dw, dh, 0, 0, 0, r->bg };
                 n++;
             }
             cur_x += dw + 4;
@@ -217,7 +224,7 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
                 n = 0; cur_x = 0; line_h = 0;
             }
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, tlen, 0, 0, dw, dh, 0, 1, sub };
+                LINE[n] = (litem){ cur_x, dw, 1, dh, color, r->link, r->text, tlen, 0, 0, dw, dh, 0, 1, sub, r->bg };
                 n++;
             }
             cur_x += dw + 6;
@@ -240,7 +247,7 @@ static void layout(browser_t *st, int cx, int cy, int draw) {
             }
             cur_x += space;
             if (n < MAXLINE) {
-                LINE[n] = (litem){ cur_x, ww, scale, lh, color, r->link, w, wl, 0, 0, 0, 0, italic, 0, 0 };
+                LINE[n] = (litem){ cur_x, ww, scale, lh, color, r->link, w, wl, 0, 0, 0, 0, italic, 0, 0, r->bg };
                 n++;
             }
             cur_x += ww;
@@ -588,13 +595,17 @@ static void browser_click(window_t *w, int lx, int ly) {
 static const char WELCOME[] =
     "<title>BoltOS Browser</title>"
     "<style>"
+    "  .bar { background: #1a73e8; color: #ffffff; text-align: center; font-weight: bold; }"
     "  h1 { color: #1a73e8; text-align: center; }"
     "  .tag { color: #5f6368; font-style: italic; text-align: center; }"
     "  .note { color: #0b7d3e; font-weight: bold; }"
+    "  .card { background: #f1f3f4; }"
+    "  code { background: #eef1f5; color: #0b7d3e; }"
     "  .hidden { display: none; }"
     "</style>"
+    "<p class=\"bar\">BoltOS &mdash; from-scratch x86-64 OS</p>"
     "<h1>BoltOS Browser</h1>"
-    "<p class=\"tag\">now with CSS styling and form controls</p>"
+    "<p class=\"tag\">now with CSS styling, backgrounds and form controls</p>"
     "<p class=\"hidden\">This line is display:none and must not render.</p>"
     "<form>"
     "<p>Search: <input type=\"text\" placeholder=\"Type and press Go\" size=\"22\"> "
@@ -622,6 +633,9 @@ static const char WELCOME[] =
     "<center><p>This paragraph is centred.</p></center>"
     "<p><img src=\"/web/logo.bmp\" alt=\"a generated gradient\"></p>"
     "<h2>Notes</h2>"
+    "<div class=\"card\"><p>Sections, cards and code blocks can now carry a "
+    "<b>background colour</b> from CSS &mdash; <code>background-color</code> and the "
+    "<code>background</code> shorthand both work, as do <code>bgcolor</code> attributes.</p></div>"
     "<p>The data path uses the e1000 NIC (the link QEMU/VirtualBox NAT exposes). "
     "Wi-Fi association is scaffolded in the kernel but needs a radio driver; see "
     "the <b>wifi</b> shell command for status.</p>";
