@@ -644,6 +644,16 @@ static void browser_key(window_t *w, char c) {
     if (st->scroll > maxscroll) st->scroll = maxscroll;
 }
 
+static void browser_scroll(window_t *w, int delta) {
+    (void)w;
+    browser_t *st = &B;
+    int vh = st->ch - TOOLBAR_H - STATUS_H;
+    int maxscroll = st->content_h - vh; if (maxscroll < 0) maxscroll = 0;
+    st->scroll += delta * 40;          /* wheel down (positive) moves the page down */
+    if (st->scroll < 0) st->scroll = 0;
+    if (st->scroll > maxscroll) st->scroll = maxscroll;
+}
+
 static void browser_click(window_t *w, int lx, int ly) {
     (void)w;
     browser_t *st = &B;
@@ -800,9 +810,10 @@ void browser_app_init(void) {
     window_t *w = gui_add_window("Browser", 780, 540, 0x66BB6A, ICON_BROWSER);
     if (!w) return;
     BW = w;
-    w->draw  = browser_draw;
-    w->key   = browser_key;
-    w->click = browser_click;
+    w->draw   = browser_draw;
+    w->key    = browser_key;
+    w->click  = browser_click;
+    w->scroll = browser_scroll;
 
     scopy(B.url, "about:welcome", sizeof(B.url));
     fields_reset(&B);

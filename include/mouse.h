@@ -16,3 +16,6 @@ int     mouse_y(void);
 uint8_t mouse_buttons(void);
 /* Returns 1 (and clears the flag) if a packet arrived since the last call. */
 int     mouse_poll_event(void);
+/* Accumulated scroll-wheel delta since last call (+ up / - down), then clears.
+ * Always 0 on a plain 3-byte mouse with no wheel. */
+int     mouse_wheel(void);

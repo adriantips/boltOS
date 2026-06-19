@@ -1093,6 +1093,19 @@ static void on_right_down(int x, int y) {
         }
 }
 
+/* scroll-wheel over a window's client area -> its scroll handler */
+static void handle_wheel(int dz) {
+    int x = mlx(), y = mly();
+    for (int z = ztop; z >= 0; z--)
+        for (int i = 0; i < nwin; i++) {
+            window_t *w = &wins[i];
+            if (!w->open || w->minimized || w->z != z) continue;
+            if (x < w->x || x >= w->x + w->w || y < w->y + TITLE_H || y >= w->y + w->h) continue;
+            if (w->scroll) { w->scroll(w, dz); dirty = 1; }
+            return;
+        }
+}
+
 static void handle_mouse(void) {
     int x = mlx(), y = mly();
     uint8_t b = mouse_buttons();
@@ -1259,6 +1272,7 @@ void gui_run(void) {
         uint64_t t0 = rdtsc();
 
         if (mouse_poll_event()) handle_mouse();
+        { int dz = mouse_wheel(); if (dz) handle_wheel(dz); }
         int ci; while ((ci = kbd_trygetc()) >= 0) handle_key((char)ci);
 
         uint64_t now = pit_ticks();

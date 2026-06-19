@@ -18,8 +18,10 @@ static volatile int     sw, sh;          /* screen bounds for clamping */
 static volatile uint8_t btns;            /* current button bitmask */
 static volatile int     evt;             /* set on every decoded packet */
 
-static volatile uint8_t pkt[3];
+static volatile uint8_t pkt[4];
 static volatile uint8_t phase;           /* which byte of the packet is next */
+static volatile uint8_t pktsz = 3;       /* 3 (plain) or 4 (IntelliMouse wheel) */
+static volatile int     wheelacc;        /* accumulated wheel delta (+up / -down) */
 
 /* Bounded spin so a missing/!ready controller can never wedge the kernel. */
 static void wait_write(void) { for (int i = 0; i < 100000; i++) if (!(inb(PS2_STATUS) & 2)) return; }
@@ -36,6 +38,27 @@ static void mouse_cmd(uint8_t v) {
     ctl_read();                          /* ACK */
 }
 
+/* finished a full packet (3 or 4 bytes): apply movement, buttons and wheel */
+static void decode_packet(void) {
+    uint8_t f = pkt[0];
+    if (f & 0xC0) return;                      /* X/Y overflow -> drop packet */
+    int dx = (int)pkt[1] - (int)((f << 4) & 0x100);   /* sign-extend 9-bit */
+    int dy = (int)pkt[2] - (int)((f << 3) & 0x100);
+    mx += dx;
+    my -= dy;                                  /* screen Y grows downward */
+    if (mx < 0)      mx = 0;
+    if (my < 0)      my = 0;
+    if (mx > sw - 1) mx = sw - 1;
+    if (my > sh - 1) my = sh - 1;
+    btns = f & 0x07;
+    if (pktsz == 4) {                          /* low nibble of byte3 is signed Z */
+        int z = pkt[3] & 0x0F;
+        if (z & 0x08) z -= 16;
+        wheelacc += z;
+    }
+    evt = 1;
+}
+
 static void on_irq(struct registers *r) {
     (void)r;
     uint8_t st = inb(PS2_STATUS);
@@ -48,22 +71,12 @@ static void on_irq(struct registers *r) {
         pkt[0] = data; phase = 1; break;
     case 1:
         pkt[1] = data; phase = 2; break;
-    case 2: {
-        pkt[2] = data; phase = 0;
-        uint8_t f = pkt[0];
-        if (f & 0xC0) break;                   /* X/Y overflow -> drop packet */
-        int dx = (int)pkt[1] - (int)((f << 4) & 0x100);   /* sign-extend 9-bit */
-        int dy = (int)pkt[2] - (int)((f << 3) & 0x100);
-        mx += dx;
-        my -= dy;                              /* screen Y grows downward */
-        if (mx < 0)      mx = 0;
-        if (my < 0)      my = 0;
-        if (mx > sw - 1) mx = sw - 1;
-        if (my > sh - 1) my = sh - 1;
-        btns = f & 0x07;
-        evt = 1;
-        break;
-    }
+    case 2:
+        pkt[2] = data;
+        if (pktsz == 4) { phase = 3; break; }
+        phase = 0; decode_packet(); break;
+    case 3:
+        pkt[3] = data; phase = 0; decode_packet(); break;
     }
 }
 
@@ -90,6 +103,17 @@ void mouse_init(int screen_w, int screen_h) {
     ctl_write(cfg);
 
     mouse_cmd(0xF6);                           /* set defaults */
+
+    /* IntelliMouse "knock": rates 200/100/80 then read device id; id 3 means a
+     * scroll wheel is present and the mouse will stream 4-byte packets. */
+    mouse_cmd(0xF3); mouse_cmd(200);
+    mouse_cmd(0xF3); mouse_cmd(100);
+    mouse_cmd(0xF3); mouse_cmd(80);
+    ctl_cmd(0xD4); ctl_write(0xF2); ctl_read();   /* get-id cmd + ACK */
+    uint8_t id = ctl_read();
+    if (id == 0x03) pktsz = 4;
+    mouse_cmd(0xF3); mouse_cmd(100);           /* restore a sane sample rate */
+
     mouse_cmd(0xF4);                           /* enable packet streaming */
 
     irq_install(12, on_irq);
@@ -99,3 +123,4 @@ int     mouse_x(void)        { return mx; }
 int     mouse_y(void)        { return my; }
 uint8_t mouse_buttons(void)  { return btns; }
 int     mouse_poll_event(void) { int e = evt; evt = 0; return e; }
+int     mouse_wheel(void)      { int w = wheelacc; wheelacc = 0; return w; }

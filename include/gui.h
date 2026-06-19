@@ -82,6 +82,7 @@ struct window {
     void (*click) (window_t *, int lx, int ly);  /* client-local left click   */
     void (*rclick)(window_t *, int lx, int ly);  /* client-local right click  */
     void (*drag) (window_t *, int lx, int ly);   /* held-button motion over client (client-local) */
+    void (*scroll)(window_t *, int delta);       /* mouse wheel over client: +up / -down */
     void (*tick) (window_t *);                    /* periodic update (~2 Hz)   */
     void  *st;                       /* app private state                      */
 };
