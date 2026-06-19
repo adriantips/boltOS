@@ -478,8 +478,25 @@ static void ide_key(window_t *w, char c) {
     case KEY_END:   { editor_t *e = ED(); e->cur = line_end(e->cur);   break; }
     case KEY_DEL:   ed_delete(); break;
     case '\b':      ed_backspace(); break;
+    case '\n': {
+        /* auto-indent: copy the current line's leading whitespace, and add one
+         * level if the line ends in an opening brace. Capture both from the
+         * original buffer before inserting (insertion shifts later indices). */
+        editor_t *e = ED();
+        int ls = line_start(e->cur);
+        int last = e->cur - 1;
+        while (last >= ls && (e->buf[last] == ' ' || e->buf[last] == '\t')) last--;
+        int brace = (last >= ls && e->buf[last] == '{');
+        char ws[64]; int ind = 0;
+        while (ls + ind < e->cur && ind < 63 &&
+               (e->buf[ls + ind] == ' ' || e->buf[ls + ind] == '\t')) { ws[ind] = e->buf[ls + ind]; ind++; }
+        ed_insert('\n');
+        for (int i = 0; i < ind; i++) ed_insert(ws[i]);
+        if (brace) { ed_insert(' '); ed_insert(' '); ed_insert(' '); ed_insert(' '); }
+        break;
+    }
     default:
-        if (c == '\n' || c == '\t' || (unsigned char)c >= 32) ed_insert(c);
+        if (c == '\t' || (unsigned char)c >= 32) ed_insert(c);
         break;
     }
 }
