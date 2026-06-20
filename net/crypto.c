@@ -160,6 +160,53 @@ void aes128_encrypt(const aes128_ctx *c, const uint8_t in[16], uint8_t out[16]) 
     memcpy(out, s, 16);
 }
 
+/* =========================== AES-256 ==================================== */
+/* 256-bit key -> 15 round keys (Nk=8, Nr=14). Same SubBytes/ShiftRows/
+ * MixColumns round as AES-128; only the key schedule and round count differ. */
+void aes256_init(aes256_ctx *c, const uint8_t key[32]) {
+    uint8_t *rk = c->rk;
+    memcpy(rk, key, 32);
+    static const uint8_t rcon[7] = {0x01,0x02,0x04,0x08,0x10,0x20,0x40};
+    /* 60 words total; words come in groups of Nk=8. */
+    for (int i = 8; i < 60; i++) {
+        uint8_t t[4];
+        uint8_t *w = rk + i*4, *wp = rk + (i-1)*4, *wk = rk + (i-8)*4;
+        t[0]=wp[0]; t[1]=wp[1]; t[2]=wp[2]; t[3]=wp[3];
+        if (i % 8 == 0) {
+            uint8_t tmp = t[0]; t[0]=sbox[t[1]]; t[1]=sbox[t[2]]; t[2]=sbox[t[3]]; t[3]=sbox[tmp];
+            t[0] ^= rcon[i/8 - 1];
+        } else if (i % 8 == 4) {
+            t[0]=sbox[t[0]]; t[1]=sbox[t[1]]; t[2]=sbox[t[2]]; t[3]=sbox[t[3]];
+        }
+        for (int j = 0; j < 4; j++) w[j] = wk[j] ^ t[j];
+    }
+}
+
+void aes256_encrypt(const aes256_ctx *c, const uint8_t in[16], uint8_t out[16]) {
+    uint8_t s[16];
+    const uint8_t *rk = c->rk;
+    for (int i = 0; i < 16; i++) s[i] = in[i] ^ rk[i];
+    for (int round = 1; round <= 14; round++) {
+        for (int i = 0; i < 16; i++) s[i] = sbox[s[i]];
+        uint8_t t[16];
+        static const uint8_t sr[16] = {0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11};
+        for (int i = 0; i < 16; i++) t[i] = s[sr[i]];
+        if (round != 14) {
+            for (int col = 0; col < 4; col++) {
+                uint8_t *p = t + col*4;
+                uint8_t a0=p[0],a1=p[1],a2=p[2],a3=p[3];
+                p[0] = (uint8_t)(xtime(a0) ^ (xtime(a1)^a1) ^ a2 ^ a3);
+                p[1] = (uint8_t)(a0 ^ xtime(a1) ^ (xtime(a2)^a2) ^ a3);
+                p[2] = (uint8_t)(a0 ^ a1 ^ xtime(a2) ^ (xtime(a3)^a3));
+                p[3] = (uint8_t)((xtime(a0)^a0) ^ a1 ^ a2 ^ xtime(a3));
+            }
+        }
+        const uint8_t *krk = rk + round*16;
+        for (int i = 0; i < 16; i++) s[i] = t[i] ^ krk[i];
+    }
+    memcpy(out, s, 16);
+}
+
 /* =========================== AES-128-GCM ================================ */
 /* GF(2^128) multiply, blocks big-endian, reduction poly per SP 800-38D. */
 static void gf_mul(uint8_t *x, const uint8_t *y) {
@@ -201,55 +248,54 @@ static void inc32(uint8_t ctr[16]) {
     for (int i = 15; i >= 12; i--) { if (++ctr[i]) break; }
 }
 
+/* GCM is cipher-agnostic: it only needs a 128-bit block encrypt. A function
+ * pointer lets the same core drive AES-128 or AES-256 (and any future block
+ * cipher). `ks` is the opaque key schedule passed straight back to `enc`. */
+typedef void (*blk_enc)(const void *ks, const uint8_t in[16], uint8_t out[16]);
+static void aes128_blk(const void *ks, const uint8_t in[16], uint8_t out[16]) {
+    aes128_encrypt((const aes128_ctx *)ks, in, out);
+}
+
 /* CTR-mode keystream XOR starting from counter block icb (icb is advanced). */
-static void gctr(const aes128_ctx *ks, uint8_t icb[16],
+static void gctr(blk_enc enc, const void *ks, uint8_t icb[16],
                  const uint8_t *in, uint32_t len, uint8_t *out) {
     uint8_t s[16];
     for (uint32_t off = 0; off < len; off += 16) {
-        aes128_encrypt(ks, icb, s);
+        enc(ks, icb, s);
         inc32(icb);
         uint32_t n = len - off; if (n > 16) n = 16;
         for (uint32_t i = 0; i < n; i++) out[off+i] = in[off+i] ^ s[i];
     }
 }
 
-static void gcm_core(const uint8_t key[16], const uint8_t iv[12],
+static void gcm_core(blk_enc enc, const void *ks, const uint8_t iv[12],
                      const uint8_t *aad, uint32_t aadlen,
                      const uint8_t *in, uint32_t len, uint8_t *out, uint8_t tag[16]) {
-    aes128_ctx ks; aes128_init(&ks, key);
-    uint8_t H[16] = {0}; aes128_encrypt(&ks, H, H);
+    uint8_t H[16] = {0}; enc(ks, H, H);
 
     uint8_t j0[16];
     memcpy(j0, iv, 12); j0[12]=0; j0[13]=0; j0[14]=0; j0[15]=1;
 
     uint8_t ctr[16]; memcpy(ctr, j0, 16); inc32(ctr);
-    gctr(&ks, ctr, in, len, out);
+    gctr(enc, ks, ctr, in, len, out);
 
     /* tag = E(J0) XOR GHASH(H, AAD, C); C is the ciphertext (out) */
     uint8_t s[16]; ghash(H, aad, aadlen, out, len, s);
-    uint8_t ej0[16]; aes128_encrypt(&ks, j0, ej0);
+    uint8_t ej0[16]; enc(ks, j0, ej0);
     for (int i = 0; i < 16; i++) tag[i] = s[i] ^ ej0[i];
 }
 
-void aes_gcm_seal(const uint8_t key[16], const uint8_t iv[12],
-                  const uint8_t *aad, uint32_t aadlen,
-                  const uint8_t *pt, uint32_t ptlen,
-                  uint8_t *ct, uint8_t tag[16]) {
-    gcm_core(key, iv, aad, aadlen, pt, ptlen, ct, tag);
-}
-
-int aes_gcm_open(const uint8_t key[16], const uint8_t iv[12],
-                 const uint8_t *aad, uint32_t aadlen,
-                 const uint8_t *ct, uint32_t ctlen,
-                 const uint8_t tag[16], uint8_t *pt) {
+static int gcm_open(blk_enc enc, const void *ks, const uint8_t iv[12],
+                    const uint8_t *aad, uint32_t aadlen,
+                    const uint8_t *ct, uint32_t ctlen,
+                    const uint8_t tag[16], uint8_t *pt) {
     /* Recompute the tag over the ciphertext, then decrypt. GHASH is over C, so
      * deriving the tag before producing plaintext is fine and matches seal(). */
-    aes128_ctx ks; aes128_init(&ks, key);
-    uint8_t H[16] = {0}; aes128_encrypt(&ks, H, H);
+    uint8_t H[16] = {0}; enc(ks, H, H);
     uint8_t j0[16]; memcpy(j0, iv, 12); j0[12]=0; j0[13]=0; j0[14]=0; j0[15]=1;
 
     uint8_t s[16]; ghash(H, aad, aadlen, ct, ctlen, s);
-    uint8_t ej0[16]; aes128_encrypt(&ks, j0, ej0);
+    uint8_t ej0[16]; enc(ks, j0, ej0);
     uint8_t want[16];
     for (int i = 0; i < 16; i++) want[i] = s[i] ^ ej0[i];
 
@@ -257,8 +303,138 @@ int aes_gcm_open(const uint8_t key[16], const uint8_t iv[12],
     for (int i = 0; i < 16; i++) diff |= want[i] ^ tag[i];
 
     uint8_t ctr[16]; memcpy(ctr, j0, 16); inc32(ctr);
-    gctr(&ks, ctr, ct, ctlen, pt);
+    gctr(enc, ks, ctr, ct, ctlen, pt);
     return diff ? -1 : 0;
+}
+
+void aes_gcm_seal(const uint8_t key[16], const uint8_t iv[12],
+                  const uint8_t *aad, uint32_t aadlen,
+                  const uint8_t *pt, uint32_t ptlen,
+                  uint8_t *ct, uint8_t tag[16]) {
+    aes128_ctx ks; aes128_init(&ks, key);
+    gcm_core(aes128_blk, &ks, iv, aad, aadlen, pt, ptlen, ct, tag);
+}
+
+int aes_gcm_open(const uint8_t key[16], const uint8_t iv[12],
+                 const uint8_t *aad, uint32_t aadlen,
+                 const uint8_t *ct, uint32_t ctlen,
+                 const uint8_t tag[16], uint8_t *pt) {
+    aes128_ctx ks; aes128_init(&ks, key);
+    return gcm_open(aes128_blk, &ks, iv, aad, aadlen, ct, ctlen, tag, pt);
+}
+
+static void aes256_blk(const void *ks, const uint8_t in[16], uint8_t out[16]) {
+    aes256_encrypt((const aes256_ctx *)ks, in, out);
+}
+void aes256_gcm_seal(const uint8_t key[32], const uint8_t iv[12],
+                     const uint8_t *aad, uint32_t aadlen,
+                     const uint8_t *pt, uint32_t ptlen,
+                     uint8_t *ct, uint8_t tag[16]) {
+    aes256_ctx ks; aes256_init(&ks, key);
+    gcm_core(aes256_blk, &ks, iv, aad, aadlen, pt, ptlen, ct, tag);
+}
+int aes256_gcm_open(const uint8_t key[32], const uint8_t iv[12],
+                    const uint8_t *aad, uint32_t aadlen,
+                    const uint8_t *ct, uint32_t ctlen,
+                    const uint8_t tag[16], uint8_t *pt) {
+    aes256_ctx ks; aes256_init(&ks, key);
+    return gcm_open(aes256_blk, &ks, iv, aad, aadlen, ct, ctlen, tag, pt);
+}
+
+/* =========================== SHA-512 / SHA-384 ========================== */
+static uint64_t ror64(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
+
+static const uint64_t K512[80] = {
+0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,
+0x3956c25bf348b538ULL,0x59f111f1b605d019ULL,0x923f82a4af194f9bULL,0xab1c5ed5da6d8118ULL,
+0xd807aa98a3030242ULL,0x12835b0145706fbeULL,0x243185be4ee4b28cULL,0x550c7dc3d5ffb4e2ULL,
+0x72be5d74f27b896fULL,0x80deb1fe3b1696b1ULL,0x9bdc06a725c71235ULL,0xc19bf174cf692694ULL,
+0xe49b69c19ef14ad2ULL,0xefbe4786384f25e3ULL,0x0fc19dc68b8cd5b5ULL,0x240ca1cc77ac9c65ULL,
+0x2de92c6f592b0275ULL,0x4a7484aa6ea6e483ULL,0x5cb0a9dcbd41fbd4ULL,0x76f988da831153b5ULL,
+0x983e5152ee66dfabULL,0xa831c66d2db43210ULL,0xb00327c898fb213fULL,0xbf597fc7beef0ee4ULL,
+0xc6e00bf33da88fc2ULL,0xd5a79147930aa725ULL,0x06ca6351e003826fULL,0x142929670a0e6e70ULL,
+0x27b70a8546d22ffcULL,0x2e1b21385c26c926ULL,0x4d2c6dfc5ac42aedULL,0x53380d139d95b3dfULL,
+0x650a73548baf63deULL,0x766a0abb3c77b2a8ULL,0x81c2c92e47edaee6ULL,0x92722c851482353bULL,
+0xa2bfe8a14cf10364ULL,0xa81a664bbc423001ULL,0xc24b8b70d0f89791ULL,0xc76c51a30654be30ULL,
+0xd192e819d6ef5218ULL,0xd69906245565a910ULL,0xf40e35855771202aULL,0x106aa07032bbd1b8ULL,
+0x19a4c116b8d2d0c8ULL,0x1e376c085141ab53ULL,0x2748774cdf8eeb99ULL,0x34b0bcb5e19b48a8ULL,
+0x391c0cb3c5c95a63ULL,0x4ed8aa4ae3418acbULL,0x5b9cca4f7763e373ULL,0x682e6ff3d6b2b8a3ULL,
+0x748f82ee5defb2fcULL,0x78a5636f43172f60ULL,0x84c87814a1f0ab72ULL,0x8cc702081a6439ecULL,
+0x90befffa23631e28ULL,0xa4506cebde82bde9ULL,0xbef9a3f7b2c67915ULL,0xc67178f2e372532bULL,
+0xca273eceea26619cULL,0xd186b8c721c0c207ULL,0xeada7dd6cde0eb1eULL,0xf57d4f7fee6ed178ULL,
+0x06f067aa72176fbaULL,0x0a637dc5a2c898a6ULL,0x113f9804bef90daeULL,0x1b710b35131c471bULL,
+0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,
+0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL };
+
+static void sha512_block(sha512_ctx *c, const uint8_t *p) {
+    uint64_t w[80];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint64_t)p[i*8]<<56)|((uint64_t)p[i*8+1]<<48)|((uint64_t)p[i*8+2]<<40)|
+               ((uint64_t)p[i*8+3]<<32)|((uint64_t)p[i*8+4]<<24)|((uint64_t)p[i*8+5]<<16)|
+               ((uint64_t)p[i*8+6]<<8)|(uint64_t)p[i*8+7];
+    }
+    for (int i = 16; i < 80; i++) {
+        uint64_t s0 = ror64(w[i-15],1) ^ ror64(w[i-15],8) ^ (w[i-15] >> 7);
+        uint64_t s1 = ror64(w[i-2],19) ^ ror64(w[i-2],61) ^ (w[i-2] >> 6);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint64_t a=c->h[0],b=c->h[1],cc=c->h[2],d=c->h[3],e=c->h[4],f=c->h[5],g=c->h[6],h=c->h[7];
+    for (int i = 0; i < 80; i++) {
+        uint64_t S1 = ror64(e,14) ^ ror64(e,18) ^ ror64(e,41);
+        uint64_t ch = (e & f) ^ (~e & g);
+        uint64_t t1 = h + S1 + ch + K512[i] + w[i];
+        uint64_t S0 = ror64(a,28) ^ ror64(a,34) ^ ror64(a,39);
+        uint64_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+        uint64_t t2 = S0 + maj;
+        h=g; g=f; f=e; e=d+t1; d=cc; cc=b; b=a; a=t1+t2;
+    }
+    c->h[0]+=a; c->h[1]+=b; c->h[2]+=cc; c->h[3]+=d;
+    c->h[4]+=e; c->h[5]+=f; c->h[6]+=g; c->h[7]+=h;
+}
+
+void sha384_init(sha512_ctx *c) {
+    c->h[0]=0xcbbb9d5dc1059ed8ULL; c->h[1]=0x629a292a367cd507ULL;
+    c->h[2]=0x9159015a3070dd17ULL; c->h[3]=0x152fecd8f70e5939ULL;
+    c->h[4]=0x67332667ffc00b31ULL; c->h[5]=0x8eb44a8768581511ULL;
+    c->h[6]=0xdb0c2e0d64f98fa7ULL; c->h[7]=0x47b5481dbefa4fa4ULL;
+    c->total = 0; c->n = 0;
+}
+
+void sha512_update(sha512_ctx *c, const void *data, uint32_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    c->total += len;
+    while (len) {
+        uint32_t take = 128 - c->n; if (take > len) take = len;
+        memcpy(c->buf + c->n, p, take);
+        c->n += take; p += take; len -= take;
+        if (c->n == 128) { sha512_block(c, c->buf); c->n = 0; }
+    }
+}
+
+/* SHA-384 digest (first 48 bytes of the SHA-512 state). */
+void sha384_final(sha512_ctx *c, uint8_t out[48]) {
+    uint64_t bits = c->total * 8;             /* < 2^64 bits for our messages */
+    uint8_t pad = 0x80;
+    sha512_update(c, &pad, 1);
+    uint8_t z = 0;
+    while (c->n != 112) sha512_update(c, &z, 1);
+    uint8_t lb[16] = {0};                     /* 128-bit length, high half zero */
+    for (int i = 0; i < 8; i++) lb[8+i] = (uint8_t)(bits >> (56 - 8*i));
+    sha512_update(c, lb, 16);
+    for (int i = 0; i < 6; i++)               /* 6 words = 48 bytes */
+        for (int j = 0; j < 8; j++) out[i*8+j] = (uint8_t)(c->h[i] >> (56 - 8*j));
+}
+
+void hmac_sha384(const uint8_t *key, uint32_t klen,
+                 const uint8_t *msg, uint32_t mlen, uint8_t out[48]) {
+    uint8_t k[128], ipad[128], opad[128], inner[48];
+    memset(k, 0, 128);
+    if (klen > 128) { sha512_ctx t; sha384_init(&t); sha512_update(&t, key, klen); sha384_final(&t, k); }
+    else memcpy(k, key, klen);
+    for (int i = 0; i < 128; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    sha512_ctx c;
+    sha384_init(&c); sha512_update(&c, ipad, 128); sha512_update(&c, msg, mlen); sha384_final(&c, inner);
+    sha384_init(&c); sha512_update(&c, opad, 128); sha512_update(&c, inner, 48); sha384_final(&c, out);
 }
 
 /* =========================== X25519 ===================================== */

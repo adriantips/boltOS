@@ -40,6 +40,7 @@ typedef struct {
     int      iw, ih;     /* width/height hints from attrs, 0 = none */
     void    *pix;        /* decoded image_t*, filled by the browser */
     char    *name;       /* form-field name (HRUN_INPUT), else NULL  */
+    char    *elid;       /* id of the enclosing element, or NULL (for getElementById) */
 } html_run;
 
 typedef struct {
@@ -49,9 +50,11 @@ typedef struct {
     char     *title;            /* page <title>, or NULL */
     uint32_t  page_bg;          /* <body>/<html> background: HCOL_NONE or 0x1RRGGBB */
     uint32_t  page_fg;          /* <body>/<html> text colour: HCOL_NONE or 0x1RRGGBB */
+    char    **scripts; int nscripts, scripts_cap;  /* captured <script> bodies (kmalloc'd) */
     /* private storage */
     char     *arena;  uint32_t arena_len, arena_cap;
     int       runs_cap, hrefs_cap, imgs_cap;
+    char     *cur_id;           /* transient: id of element being parsed (for run->elid) */
 } html_doc;
 
 /* Parse len bytes of HTML into a freshly allocated doc, or NULL on OOM. */

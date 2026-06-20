@@ -47,15 +47,18 @@ struct tls_conn {
     struct tcp_conn *tcp;
     int          established;
 
-    uint8_t  cw_key[16], sw_key[16], cw_iv[4], sw_iv[4];
+    uint8_t  cw_key[32], sw_key[32], cw_iv[4], sw_iv[4];
     uint64_t wseq, rseq;
     int      tx_secure, rx_secure;
+    uint8_t  key_len;            /* 16 (AES-128) or 32 (AES-256)             */
+    uint8_t  sha384;             /* 1 if the suite's PRF/transcript is SHA384 */
 
     uint8_t  client_random[32], server_random[32];
     uint8_t  master[48];
     uint8_t  kx_priv[32], kx_pub[32];
 
-    sha256_ctx hs_hash;          /* running handshake transcript */
+    sha256_ctx hs_hash;          /* running handshake transcript (SHA-256)   */
+    sha512_ctx hs_hash384;       /* parallel SHA-384 transcript (suite TBD)  */
 
     uint8_t  in[INBUF];   uint32_t in_len;          /* raw TCP bytes              */
     uint8_t  rec[RECBUF];                           /* one decrypted record       */
@@ -83,25 +86,41 @@ static void rng_bytes(uint8_t *p, uint32_t n) {
 static void put16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v & 0xff; }
 static void put_seq(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8*i)); }
 
-/* TLS 1.2 PRF (P_SHA256). out gets outlen bytes. */
-static void prf(const uint8_t *sec, uint32_t slen, const char *label,
-                const uint8_t *seed, uint32_t seedlen, uint8_t *out, uint32_t outlen) {
-    uint8_t ls[128]; uint32_t llen = (uint32_t)strlen(label);
+/* TLS 1.2 PRF. P_SHA256 for the AES-128 suites, P_SHA384 for AES-256-GCM-
+ * SHA384. `h384` selects the hash; the HMAC block size H is 32 or 48. */
+static void hmac_h(int h384, const uint8_t *key, uint32_t klen,
+                   const uint8_t *msg, uint32_t mlen, uint8_t *out) {
+    if (h384) hmac_sha384(key, klen, msg, mlen, out);
+    else      hmac_sha256(key, klen, msg, mlen, out);
+}
+static void prf_h(int h384, const uint8_t *sec, uint32_t slen, const char *label,
+                  const uint8_t *seed, uint32_t seedlen, uint8_t *out, uint32_t outlen) {
+    uint32_t H = h384 ? 48 : 32;
+    uint8_t ls[160]; uint32_t llen = (uint32_t)strlen(label);
     memcpy(ls, label, llen); memcpy(ls + llen, seed, seedlen);
     uint32_t lslen = llen + seedlen;
-    uint8_t a[32]; hmac_sha256(sec, slen, ls, lslen, a);    /* A(1) */
+    uint8_t a[48]; hmac_h(h384, sec, slen, ls, lslen, a);   /* A(1) */
     uint32_t done = 0;
     while (done < outlen) {
-        uint8_t in[32 + 128]; memcpy(in, a, 32); memcpy(in + 32, ls, lslen);
-        uint8_t blk[32]; hmac_sha256(sec, slen, in, 32 + lslen, blk);
-        uint32_t n = outlen - done; if (n > 32) n = 32;
+        uint8_t in[48 + 160]; memcpy(in, a, H); memcpy(in + H, ls, lslen);
+        uint8_t blk[48]; hmac_h(h384, sec, slen, in, H + lslen, blk);
+        uint32_t n = outlen - done; if (n > H) n = H;
         memcpy(out + done, blk, n); done += n;
-        hmac_sha256(sec, slen, a, 32, a);                   /* A(i+1) */
+        hmac_h(h384, sec, slen, a, H, a);                   /* A(i+1) */
     }
 }
 
 static void transcript_add(struct tls_conn *c, const uint8_t *body, uint32_t blen) {
-    sha256_update(&c->hs_hash, body - 4, 4 + blen);         /* body-4 = msg header */
+    /* The cipher suite (and thus which hash matters) is unknown until the
+     * ServerHello, so feed both transcripts and pick one once it is. */
+    sha256_update(&c->hs_hash,    body - 4, 4 + blen);      /* body-4 = msg header */
+    sha512_update(&c->hs_hash384, body - 4, 4 + blen);
+}
+
+/* Snapshot the negotiated transcript digest into out; returns its length. */
+static uint32_t transcript_digest(struct tls_conn *c, uint8_t out[48]) {
+    if (c->sha384) { sha512_ctx s = c->hs_hash384; sha384_final(&s, out); return 48; }
+    sha256_ctx s = c->hs_hash; sha256_final(&s, out); return 32;
 }
 
 /* ------------------------ raw TCP input buffering ----------------------- */
@@ -138,9 +157,10 @@ static int record_read(struct tls_conn *c, uint8_t *type, uint8_t *out,
         uint8_t nonce[12]; memcpy(nonce, c->sw_iv, 4); memcpy(nonce + 4, p, 8);
         uint8_t aad[13];
         put_seq(aad, c->rseq); aad[8] = t; aad[9] = 3; aad[10] = 3; put16(aad + 11, (uint16_t)ctlen);
-        if (aes_gcm_open(c->sw_key, nonce, aad, 13, p + 8, ctlen, p + 8 + ctlen, out) != 0) {
-            DBG("tls: bad GCM tag\n"); return -1;
-        }
+        int bad = c->key_len == 32
+            ? aes256_gcm_open(c->sw_key, nonce, aad, 13, p + 8, ctlen, p + 8 + ctlen, out)
+            : aes_gcm_open(c->sw_key, nonce, aad, 13, p + 8, ctlen, p + 8 + ctlen, out);
+        if (bad != 0) { DBG("tls: bad GCM tag\n"); return -1; }
         *outlen = ctlen; c->rseq++;
     } else {
         memcpy(out, p, len);
@@ -167,7 +187,8 @@ static int record_send_enc(struct tls_conn *c, uint8_t type,
     uint8_t nonce[12]; memcpy(nonce, c->cw_iv, 4); memcpy(nonce + 4, p, 8);
     uint8_t aad[13];
     put_seq(aad, c->wseq); aad[8] = type; aad[9] = 3; aad[10] = 3; put16(aad + 11, (uint16_t)len);
-    aes_gcm_seal(c->cw_key, nonce, aad, 13, data, len, p + 8, p + 8 + len);
+    if (c->key_len == 32) aes256_gcm_seal(c->cw_key, nonce, aad, 13, data, len, p + 8, p + 8 + len);
+    else                  aes_gcm_seal(c->cw_key, nonce, aad, 13, data, len, p + 8, p + 8 + len);
     uint32_t rlen = 8 + len + 16;
     c->out[0] = type; c->out[1] = 3; c->out[2] = 3; put16(c->out + 3, (uint16_t)rlen);
     c->wseq++;
@@ -199,7 +220,7 @@ static int hs_next(struct tls_conn *c, uint8_t *mtype, uint8_t **body,
         uint8_t t; uint32_t rl;
         int r = record_read(c, &t, c->rec, &rl, timeout);
         if (r <= 0) return r;
-        if (t == REC_ALERT) return -2;
+        if (t == REC_ALERT) { DBG("tls: alert level=%d desc=%d\n", c->rec[0], c->rec[1]); return -2; }
         if (t != REC_HS) return -3;
         if (c->hs_len + rl > HSBUF) return -1;
         memcpy(c->hs + c->hs_len, c->rec, rl);
@@ -213,9 +234,11 @@ static uint32_t build_client_hello(struct tls_conn *c, const char *sni, uint8_t 
     buf[p++] = 3; buf[p++] = 3;                         /* client_version 1.2 */
     memcpy(buf + p, c->client_random, 32); p += 32;
     buf[p++] = 0;                                       /* session_id len = 0 */
-    put16(buf + p, 4); p += 2;                          /* cipher suites: 2    */
-    put16(buf + p, 0xC02B); p += 2;                     /* ECDHE_ECDSA_AES128_GCM */
-    put16(buf + p, 0xC02F); p += 2;                     /* ECDHE_RSA_AES128_GCM   */
+    put16(buf + p, 8); p += 2;                          /* cipher suites: 4    */
+    put16(buf + p, 0xC02B); p += 2;                     /* ECDHE_ECDSA_AES128_GCM_SHA256 */
+    put16(buf + p, 0xC02F); p += 2;                     /* ECDHE_RSA_AES128_GCM_SHA256   */
+    put16(buf + p, 0xC02C); p += 2;                     /* ECDHE_ECDSA_AES256_GCM_SHA384 */
+    put16(buf + p, 0xC030); p += 2;                     /* ECDHE_RSA_AES256_GCM_SHA384   */
     buf[p++] = 1; buf[p++] = 0;                         /* compression: null  */
 
     uint32_t ext_len_at = p; p += 2;                    /* extensions length  */
@@ -230,9 +253,12 @@ static uint32_t build_client_hello(struct tls_conn *c, const char *sni, uint8_t 
     put16(buf + p, (uint16_t)hlen); p += 2;
     memcpy(buf + p, sni, hlen); p += hlen;
 
-    /* supported_groups: x25519 only */
-    put16(buf + p, 0x000a); p += 2; put16(buf + p, 4); p += 2;
-    put16(buf + p, 2); p += 2; put16(buf + p, 0x001d); p += 2;
+    /* supported_groups: x25519, secp256r1, secp384r1 */
+    put16(buf + p, 0x000a); p += 2; put16(buf + p, 8); p += 2;
+    put16(buf + p, 6); p += 2;
+    put16(buf + p, 0x001d); p += 2;                     /* x25519     */
+    put16(buf + p, 0x0017); p += 2;                     /* secp256r1  */
+    put16(buf + p, 0x0018); p += 2;                     /* secp384r1  */
 
     /* ec_point_formats: uncompressed */
     put16(buf + p, 0x000b); p += 2; put16(buf + p, 2); p += 2;
@@ -257,6 +283,7 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
     uint8_t msg[800];
 
     sha256_init(&c->hs_hash);
+    sha384_init(&c->hs_hash384);
     rng_bytes(c->client_random, 32);
 
     /* ClientHello */
@@ -269,11 +296,20 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
     rng_bytes(c->kx_priv, 32);
     x25519(c->kx_pub, c->kx_priv, x25519_basepoint);
 
+    /* Bound the whole handshake, not just each record read: a server that
+     * trickles a large flight (or stalls mid-flight) must not hang the UI. */
+    uint64_t t_end = pit_ticks() + timeout;
+
     /* ---- server flight: ServerHello, Certificate, ServerKeyExchange, Done -- */
-    uint8_t server_pub[32]; int have_pub = 0, got_sh = 0, done = 0;
+    uint8_t server_pub[65]; int have_pub = 0, got_sh = 0, done = 0;
+    int kx_curve = 0;                 /* 0 = x25519, 1 = secp256r1 (P-256) */
+    uint8_t ec_priv[32];              /* our ephemeral P-256 private scalar */
+    uint8_t ec_pub[65];               /* our ephemeral P-256 public point   */
     while (!done) {
+        uint64_t now = pit_ticks();
+        if (now >= t_end) { DBG("tls: handshake deadline\n"); return -1; }
         uint8_t mt; uint8_t *b; uint32_t bl;
-        int r = hs_next(c, &mt, &b, &bl, timeout);
+        int r = hs_next(c, &mt, &b, &bl, (uint32_t)(t_end - now));
         if (r != 1) { DBG("tls: hs_next=%d\n", r); return -1; }
         transcript_add(c, b, bl);
         switch (mt) {
@@ -283,7 +319,10 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
             uint32_t o = 34; uint8_t sid = b[o++]; o += sid;
             if (o + 3 > bl) return -1;
             uint16_t suite = ((uint16_t)b[o] << 8) | b[o+1];
-            if (suite != 0xC02B && suite != 0xC02F) { DBG("tls: bad suite %x\n", suite); return -1; }
+            if      (suite == 0xC02B || suite == 0xC02F) { c->key_len = 16; c->sha384 = 0; }
+            else if (suite == 0xC02C || suite == 0xC030) { c->key_len = 32; c->sha384 = 1; }
+            else { DBG("tls: bad suite %x\n", suite); return -1; }
+            DBG("tls: suite=%x keylen=%d sha384=%d\n", suite, c->key_len, c->sha384);
             got_sh = 1;
             break;
         }
@@ -293,10 +332,15 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
             if (bl < 4) return -1;
             if (b[0] != 3) return -1;               /* named_curve */
             uint16_t curve = ((uint16_t)b[1] << 8) | b[2];
-            if (curve != 0x001d) { DBG("tls: curve %x not x25519\n", curve); return -1; }
             uint8_t pl = b[3];
-            if (pl != 32 || 4u + pl > bl) return -1;
-            memcpy(server_pub, b + 4, 32);
+            if (4u + pl > bl) return -1;
+            if (curve == 0x001d) {                  /* x25519 */
+                if (pl != 32) return -1;
+                memcpy(server_pub, b + 4, 32); kx_curve = 0;
+            } else if (curve == 0x0017) {           /* secp256r1 / P-256 */
+                if (pl != 65 || b[4] != 0x04) return -1;
+                memcpy(server_pub, b + 4, 65); kx_curve = 1;
+            } else { DBG("tls: curve %x unsupported\n", curve); return -1; }
             have_pub = 1;
             break;                                  /* signature deliberately skipped */
         }
@@ -313,34 +357,49 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
 
     /* ---- derive keys ---- */
     uint8_t pms[32];
-    x25519(pms, c->kx_priv, server_pub);
+    if (kx_curve == 1) {                        /* P-256 ECDHE */
+        rng_bytes(ec_priv, 32);
+        p256_clamp_priv(ec_priv);
+        p256_pub_from_priv(ec_priv, ec_pub);
+        if (p256_ecdh(pms, ec_priv, server_pub) != 0) { DBG("tls: p256 ecdh failed\n"); return -1; }
+    } else {
+        x25519(pms, c->kx_priv, server_pub);
+    }
 
     uint8_t seed[64];
     memcpy(seed, c->client_random, 32); memcpy(seed + 32, c->server_random, 32);
-    prf(pms, 32, "master secret", seed, 64, c->master, 48);
+    prf_h(c->sha384, pms, 32, "master secret", seed, 64, c->master, 48);
 
     memcpy(seed, c->server_random, 32); memcpy(seed + 32, c->client_random, 32);
-    uint8_t kb[40];
-    prf(c->master, 48, "key expansion", seed, 64, kb, 40);
-    memcpy(c->cw_key, kb,      16);
-    memcpy(c->sw_key, kb + 16, 16);
-    memcpy(c->cw_iv,  kb + 32, 4);
-    memcpy(c->sw_iv,  kb + 36, 4);
+    uint32_t kl = c->key_len;                /* key block: 2 keys + 2 fixed IVs */
+    uint8_t kb[2*32 + 8];
+    prf_h(c->sha384, c->master, 48, "key expansion", seed, 64, kb, 2*kl + 8);
+    memcpy(c->cw_key, kb,           kl);
+    memcpy(c->sw_key, kb + kl,      kl);
+    memcpy(c->cw_iv,  kb + 2*kl,    4);
+    memcpy(c->sw_iv,  kb + 2*kl + 4, 4);
 
     /* ---- ClientKeyExchange ---- */
-    msg[0] = HS_CKE; msg[1] = 0; put16(msg + 2, 33);
-    msg[4] = 32; memcpy(msg + 5, c->kx_pub, 32);
-    transcript_add(c, msg + 4, 33);
-    if (record_send_plain(c, REC_HS, 3, msg, 4 + 33) < 0) return -1;
+    if (kx_curve == 1) {                         /* P-256: send 65-byte point */
+        msg[0] = HS_CKE; msg[1] = 0; put16(msg + 2, 66);
+        msg[4] = 65; memcpy(msg + 5, ec_pub, 65);
+        transcript_add(c, msg + 4, 66);
+        if (record_send_plain(c, REC_HS, 3, msg, 4 + 66) < 0) return -1;
+    } else {
+        msg[0] = HS_CKE; msg[1] = 0; put16(msg + 2, 33);
+        msg[4] = 32; memcpy(msg + 5, c->kx_pub, 32);
+        transcript_add(c, msg + 4, 33);
+        if (record_send_plain(c, REC_HS, 3, msg, 4 + 33) < 0) return -1;
+    }
 
     /* ---- ChangeCipherSpec, then encrypted client Finished ---- */
     uint8_t one = 1;
     if (record_send_plain(c, REC_CCS, 3, &one, 1) < 0) return -1;
     c->tx_secure = 1; c->wseq = 0;
 
-    uint8_t th[32]; sha256_ctx snap = c->hs_hash; sha256_final(&snap, th);
+    uint8_t th[48]; uint32_t thl = transcript_digest(c, th);
     uint8_t vd[12];
-    prf(c->master, 48, "client finished", th, 32, vd, 12);
+    prf_h(c->sha384, c->master, 48, "client finished", th, thl, vd, 12);
     msg[0] = HS_FINISHED; msg[1] = 0; put16(msg + 2, 12);
     memcpy(msg + 4, vd, 12);
     transcript_add(c, msg + 4, 12);                 /* covered by server Finished */
@@ -349,8 +408,10 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
     /* ---- server flight 2: [NewSessionTicket] CCS Finished ---- */
     int got_fin = 0;
     while (!got_fin) {
+        uint64_t now = pit_ticks();
+        if (now >= t_end) { DBG("tls: handshake deadline (flight2)\n"); return -1; }
         uint8_t t; uint32_t rl;
-        int r = record_read(c, &t, c->rec, &rl, timeout);
+        int r = record_read(c, &t, c->rec, &rl, (uint32_t)(t_end - now));
         if (r != 1) { DBG("tls: flight2 read=%d\n", r); return -1; }
         if (t == REC_CCS) { c->rx_secure = 1; c->rseq = 0; continue; }
         if (t == REC_ALERT) { DBG("tls: server alert\n"); return -1; }
@@ -365,9 +426,8 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
             if (mt == HS_NEW_TICKET) {
                 transcript_add(c, b, ml);           /* precedes server Finished */
             } else if (mt == HS_FINISHED) {
-                uint8_t exp[12]; sha256_ctx s2 = c->hs_hash; uint8_t h2[32];
-                sha256_final(&s2, h2);
-                prf(c->master, 48, "server finished", h2, 32, exp, 12);
+                uint8_t exp[12]; uint8_t h2[48]; uint32_t h2l = transcript_digest(c, h2);
+                prf_h(c->sha384, c->master, 48, "server finished", h2, h2l, exp, 12);
                 if (ml != 12 || memcmp(exp, b, 12) != 0) { DBG("tls: server Finished mismatch\n"); return -1; }
                 got_fin = 1;
                 break;
@@ -376,6 +436,7 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
         }
     }
 
+    DBG("tls: handshake ok (keylen=%d sha384=%d)\n", c->key_len, c->sha384);
     c->established = 1;
     return 0;
 }

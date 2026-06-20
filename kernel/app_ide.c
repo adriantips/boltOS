@@ -19,6 +19,8 @@
 #include "kprintf.h"
 #include "fs.h"
 #include "vfs.h"
+#include "pe.h"
+#include "kheap.h"
 
 #define IDE_DIR "/home/Documents"
 
@@ -153,6 +155,71 @@ static void ide_run(void) {
 
     out_puts(rc ? "\n\n[ program exited with errors ]\n" : "\n\n[ program finished ]\n");
     /* keep the tail visible */
+    S.otop = S.oy;
+}
+
+static void set_status(const char *s);   /* fwd */
+
+/* --------------------------------------------------- build a real .exe ----- */
+/* Compile the current buffer into a genuine Windows PE32+ console .exe (BoltCC /
+ * BoltPython baked in via the boltrt template) and drop it in IDE_DIR. The file
+ * runs on Windows 11 and under BoltOS itself (`winrun NAME.exe`). */
+static void ide_build(void) {
+    editor_t *e = ED();
+    e->buf[e->len] = 0;
+    out_clear();
+    out_puts("[ build ]  emitting Windows PE32+ .exe ("); out_puts(lang_label(S.lang)); out_puts(")\n\n");
+
+    /* IDE language ids line up with pe_build_exe's: 0=C 1=C++ 2=C# 3=Python */
+    uint32_t sz = 0;
+    uint8_t *img = pe_build_exe(S.lang, (const uint8_t *)e->buf, (uint32_t)e->len, &sz);
+    if (!img) {
+        out_puts(21u + (uint32_t)e->len + 1u > 65536u
+                 ? "build failed: source too large (max ~64 KiB)\n"
+                 : "build failed: out of memory or corrupt stub\n");
+        set_status("Build failed");
+        S.otop = S.oy;
+        return;
+    }
+
+    /* output name: remembered filename with ext -> .exe, else prog.exe */
+    char name[80]; int p = 0;
+    if (S.fnlen > 0) {
+        int dot = -1;
+        for (int i = 0; i < S.fnlen; i++) if (S.fname[i] == '.') dot = i;
+        int stop = (dot > 0) ? dot : S.fnlen;
+        for (int i = 0; i < stop && p < (int)sizeof(name) - 5; i++) name[p++] = S.fname[i];
+    } else {
+        const char *b = "prog"; for (const char *q = b; *q; q++) name[p++] = *q;
+    }
+    name[p++] = '.'; name[p++] = 'e'; name[p++] = 'x'; name[p++] = 'e'; name[p] = 0;
+
+    if (!fs_lookup(IDE_DIR)) fs_create(IDE_DIR, 1);
+    char path[160]; int pp = 0;
+    for (const char *d = IDE_DIR; *d; d++) path[pp++] = *d;
+    path[pp++] = '/';
+    for (int i = 0; name[i] && pp < (int)sizeof(path) - 1; i++) path[pp++] = name[i];
+    path[pp] = 0;
+
+    file *fo = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!fo) { kfree(img); out_puts("build failed: cannot write output file\n"); set_status("Build failed"); S.otop = S.oy; return; }
+    vfs_write(fo, img, (uint64_t)sz);
+    vfs_close(fo);
+    fs_sync();
+    kfree(img);
+
+    out_puts("wrote "); out_puts(IDE_DIR); out_puts("/"); out_puts(name);
+    out_puts("  ("); { char n[12]; int q = 0; put_uint(n, &q, (int)sz); n[q] = 0; out_puts(n); }
+    out_puts(" bytes)\n\n");
+    out_puts("  run here:    winrun "); out_puts(name); out_puts("\n");
+    out_puts("  on Windows:  copy it out and double-click / run it\n");
+
+    char msg[120]; int m = 0;
+    const char *pre = "Built ";
+    for (const char *q = pre; *q; q++) msg[m++] = *q;
+    for (int i = 0; name[i] && m < (int)sizeof(msg) - 1; i++) msg[m++] = name[i];
+    msg[m] = 0;
+    set_status(msg);
     S.otop = S.oy;
 }
 
@@ -298,7 +365,7 @@ static void compute_colors(editor_t *e, uint8_t *colr) {
 typedef struct { int x, y, w, h, id; } hot_t;
 static hot_t hots[12]; static int nhot;
 static int ide_ox, ide_oy;       /* client origin for client-local hot rects   */
-enum { H_TABBASE = 100, H_RUN = 1, H_NEW = 2, H_OPEN = 3, H_SAVE = 4 };
+enum { H_TABBASE = 100, H_RUN = 1, H_NEW = 2, H_OPEN = 3, H_SAVE = 4, H_BUILD = 5 };
 
 /* open-dialog file list hit rects */
 static struct { int x, y, w, h; fs_node *n; } olist[64];
@@ -346,6 +413,8 @@ static void ide_draw(window_t *w, int cx, int cy, int cw, int ch) {
     int rx = cx + cw - 8;
     int rw = g_text_width("Run", 1) + 22;
     rx -= rw; btn(rx, by, "Run", H_RUN, 0x2EA043, 0xFFFFFF);
+    int bw = g_text_width("Build .exe", 1) + 22;
+    rx -= bw + 6; btn(rx, by, "Build .exe", H_BUILD, 0x0E639C, 0xFFFFFF);
     int nw = g_text_width("New", 1) + 22;
     rx -= nw + 6; btn(rx, by, "New", H_NEW, COL_PANEL_3, COL_TEXT);
     int sw = g_text_width("Save", 1) + 22;
@@ -555,6 +624,7 @@ static void ide_click(window_t *w, int lx, int ly) {
         hot_t *h = &hots[i];
         if (lx < h->x || lx >= h->x + h->w || ly < h->y || ly >= h->y + h->h) continue;
         if (h->id == H_RUN) ide_run();
+        else if (h->id == H_BUILD) ide_build();
         else if (h->id == H_NEW) { editor_t *e = ED(); e->len = 0; e->cur = 0; e->top = 0; e->buf[0] = 0;
                                    S.fname[0] = 0; S.fnlen = 0; set_status("New buffer"); }
         else if (h->id == H_SAVE) begin_save();

@@ -11,11 +11,15 @@
 #include "pit.h"
 #include "kprintf.h"
 #include "string.h"
+#include "commands.h"
+#include "keyboard.h"
+#include "firewall.h"
 
 /* ===========================================================================
- *  Networking commands. ping/netinfo now ride the real IPv4 stack (P3) over the
- *  e1000 driver. Transports without a stack yet (download/upload/share) still
- *  report honestly. The in-RAM firewall ruleset is real editable state.
+ *  Networking commands. ping/netinfo/download/browse/share ride the real IPv4
+ *  stack over the e1000 driver. `share` does real LAN file transfer over UDP
+ *  (discovery + stop-and-wait). The in-RAM firewall ruleset is real editable
+ *  state. upload (HTTP POST) still reports honestly.
  * ===========================================================================*/
 
 static int find_nic(struct pci_dev *out) {
@@ -211,11 +215,292 @@ int cmd_upload(int argc, char **argv) {
     return 1;
 }
 
+/* ===========================================================================
+ *  share -- real LAN file transfer over UDP (port 7373).
+ *
+ *  One machine runs `share recv` and listens; another runs `share` (which
+ *  broadcast-discovers receivers on the same Wi-Fi/LAN, lists them, and lets
+ *  you pick one) or `share send IP PATH` to target directly. Transfer is a
+ *  simple stop-and-wait reliable protocol over UDP: OFFER/ACCEPT to set up,
+ *  DATA/ACK per 1 KB chunk with retransmit, then DONE.
+ * ===========================================================================*/
+#define SHARE_PORT   7373
+#define SHARE_MAGIC  0x42534852u            /* 'BSHR' */
+#define SHARE_CHUNK  1024
+#define SHARE_MAXFILE (4u * 1024 * 1024)    /* 4 MiB cap (kernel heap budget) */
+enum { SH_DISC = 1, SH_ANN, SH_OFFER, SH_ACCEPT, SH_DATA, SH_ACK, SH_DONE };
+
+struct shdr {
+    uint32_t magic;
+    uint8_t  type, pad;
+    uint16_t seq;
+    uint32_t arg;
+} __attribute__((packed));
+
+static struct {
+    int      active;                /* listener registered                     */
+    int      mode;                  /* 0 = sender/discovery, 1 = receiver       */
+    char     myname[32];            /* advertised name (receiver)              */
+    /* discovery results (sender) */
+    struct { uint32_t ip; char name[32]; } peers[16];
+    int      npeer;
+    /* sender transfer state (written by the RX callback) */
+    volatile int      got_accept;
+    volatile int      last_ack;     /* highest DATA seq the peer ACKed, or -1   */
+    /* receiver transfer state */
+    volatile int      recv_busy, recv_done;
+    uint32_t recv_src;
+    char     recv_name[64];
+    uint32_t recv_size, recv_got;
+    uint16_t recv_expect;
+    uint8_t *recv_buf;
+} S;
+
+/* build + send one share packet (payload optional, capped to one chunk) */
+static void sh_send(uint32_t ip, uint8_t type, uint16_t seq, uint32_t arg,
+                    const void *pl, uint16_t pll) {
+    struct netif *nif = netif_default();
+    if (!nif) return;
+    uint8_t buf[sizeof(struct shdr) + SHARE_CHUNK];
+    struct shdr *h = (struct shdr *)buf;
+    h->magic = htonl(SHARE_MAGIC);
+    h->type  = type; h->pad = 0;
+    h->seq   = htons(seq);
+    h->arg   = htonl(arg);
+    if (pll > SHARE_CHUNK) pll = SHARE_CHUNK;
+    if (pl && pll) memcpy(buf + sizeof(*h), pl, pll);
+    udp_send(nif, ip, SHARE_PORT, SHARE_PORT, buf, (uint16_t)(sizeof(*h) + pll));
+}
+
+/* the single UDP listener: dispatches by our current role */
+static void share_cb(uint32_t src, uint16_t sport, const uint8_t *data, uint16_t len) {
+    (void)sport;
+    if (len < sizeof(struct shdr)) return;
+    const struct shdr *h = (const struct shdr *)data;
+    if (ntohl(h->magic) != SHARE_MAGIC) return;
+    const uint8_t *pl = data + sizeof(*h);
+    uint16_t pll = (uint16_t)(len - sizeof(*h));
+    uint8_t  type = h->type;
+
+    if (S.mode == 1) {                          /* ---- receiver role ---- */
+        switch (type) {
+        case SH_DISC:                           /* advertise ourselves */
+            sh_send(src, SH_ANN, 0, 0, S.myname, (uint16_t)strlen(S.myname));
+            break;
+        case SH_OFFER: {                        /* incoming file */
+            if (S.recv_busy && src != S.recv_src) break;   /* one at a time */
+            uint32_t size = ntohl(h->arg);
+            if (size > SHARE_MAXFILE) break;
+            if (!S.recv_busy) {
+                uint32_t i = 0;
+                for (; i < pll && i < sizeof(S.recv_name) - 1; i++) S.recv_name[i] = (char)pl[i];
+                S.recv_name[i] = 0;
+                S.recv_buf = (uint8_t *)kmalloc(size ? size : 1);
+                if (!S.recv_buf) break;
+                S.recv_size = size; S.recv_got = 0; S.recv_expect = 0;
+                S.recv_src = src; S.recv_busy = 1;
+            }
+            sh_send(src, SH_ACCEPT, 0, 0, 0, 0);           /* (re)accept */
+            break; }
+        case SH_DATA: {
+            if (!S.recv_busy || src != S.recv_src) break;
+            uint16_t seq = ntohs(h->seq);
+            if (seq == S.recv_expect) {
+                uint32_t room = S.recv_size - S.recv_got;
+                uint32_t take = pll < room ? pll : room;
+                if (take) memcpy(S.recv_buf + S.recv_got, pl, take);
+                S.recv_got += take; S.recv_expect++;
+            }
+            sh_send(src, SH_ACK, seq, 0, 0, 0);            /* ack (even dups) */
+            break; }
+        case SH_DONE:
+            if (!S.recv_busy || src != S.recv_src) break;
+            sh_send(src, SH_ACK, h->seq ? ntohs(h->seq) : 0, 1, 0, 0);
+            S.recv_done = 1;
+            break;
+        }
+    } else {                                    /* ---- sender / discovery role ---- */
+        switch (type) {
+        case SH_ANN: {                          /* a receiver answered discovery */
+            for (int i = 0; i < S.npeer; i++) if (S.peers[i].ip == src) return;
+            if (S.npeer < 16) {
+                S.peers[S.npeer].ip = src;
+                uint32_t i = 0;
+                for (; i < pll && i < sizeof(S.peers[0].name) - 1; i++)
+                    S.peers[S.npeer].name[i] = (char)pl[i];
+                S.peers[S.npeer].name[i] = 0;
+                S.npeer++;
+            }
+            break; }
+        case SH_ACCEPT: S.got_accept = 1; break;
+        case SH_ACK:    S.last_ack = ntohs(h->seq); break;
+        }
+    }
+}
+
+/* pump the stack until *flag reaches want, or timeout. returns 1 if reached. */
+static int sh_wait(volatile int *flag, int want, uint32_t ms) {
+    uint64_t start = pit_ticks();
+    while (pit_ticks() - start < ms) {
+        netif_poll_all();
+        if (*flag == want) return 1;
+        __asm__ volatile("hlt");
+    }
+    return *flag == want;
+}
+
+/* send file f to a known peer. assumes the listener is registered, mode 0. */
+static int share_send_to(uint32_t ip, fs_node *f) {
+    const char *base = strrchr(f->name, '/');
+    base = base ? base + 1 : f->name;
+    uint32_t size = f->size;
+
+    /* handshake: OFFER -> ACCEPT, retransmit a few times */
+    S.got_accept = 0;
+    int ok = 0;
+    for (int tries = 0; tries < 12 && !ok; tries++) {
+        sh_send(ip, SH_OFFER, 0, size, base, (uint16_t)strlen(base));
+        ok = sh_wait(&S.got_accept, 1, 300);
+    }
+    if (!ok) { kprintf("share: target did not accept (no response)\n"); return 1; }
+
+    /* DATA chunks, stop-and-wait with retransmit */
+    uint32_t nchunks = size ? (size + SHARE_CHUNK - 1) / SHARE_CHUNK : 0;
+    kprintf("sending '%s' (%u bytes, %u chunks)\n", base, size, nchunks);
+    for (uint32_t seq = 0; seq < nchunks; seq++) {
+        uint32_t off = seq * SHARE_CHUNK;
+        uint16_t clen = (uint16_t)((size - off < SHARE_CHUNK) ? size - off : SHARE_CHUNK);
+        S.last_ack = -1;
+        int acked = 0;
+        for (int tries = 0; tries < 20 && !acked; tries++) {
+            sh_send(ip, SH_DATA, (uint16_t)seq, 0, f->data + off, clen);
+            uint64_t start = pit_ticks();
+            while (pit_ticks() - start < 250) {
+                netif_poll_all();
+                if (S.last_ack == (int)seq) { acked = 1; break; }
+                __asm__ volatile("hlt");
+            }
+        }
+        if (!acked) { kprintf("\nshare: transfer stalled at chunk %u\n", seq); return 1; }
+        if ((seq & 31) == 0 || seq == nchunks - 1) { kputc('.'); }
+    }
+    /* DONE (best effort, a few times) */
+    for (int i = 0; i < 4; i++) { sh_send(ip, SH_DONE, 0, nchunks, 0, 0); sh_wait(&S.got_accept, 2, 60); }
+    kprintf("\nsent %u bytes to ", size); print_ip(ip); kprintf("\n");
+    return 0;
+}
+
+static void share_name_default(char *out, int cap) {
+    /* "bolt-<last octet of our IP>" */
+    char num[8]; sh_utoa(net_ip & 0xFF, num);
+    int n = 0; const char *p = "bolt-";
+    while (*p && n < cap - 1) out[n++] = *p++;
+    for (const char *q = num; *q && n < cap - 1; ) out[n++] = *q++;
+    out[n] = 0;
+}
+
+/* `share recv [name]` -- listen, advertise, receive one file, save it. */
+static int share_recv(int argc, char **argv) {
+    if (!netif_default()) { kprintf("share: no network interface\n"); return 1; }
+    memset(&S, 0, sizeof(S));
+    S.mode = 1;
+    if (argc >= 3) { uint32_t n = 0; for (; argv[2][n] && n < sizeof(S.myname) - 1; n++) S.myname[n] = argv[2][n]; S.myname[n] = 0; }
+    else share_name_default(S.myname, sizeof(S.myname));
+
+    udp_listen(SHARE_PORT, share_cb); S.active = 1;
+    kprintf("share: listening as '%s' on ", S.myname); print_ip(net_ip);
+    kprintf(":%d\nwaiting for a file... (press ESC to cancel)\n", SHARE_PORT);
+
+    int cancelled = 0;
+    while (!S.recv_done) {
+        netif_poll_all();
+        int k = kbd_trygetc();
+        if (k == 27) { cancelled = 1; break; }       /* ESC */
+        __asm__ volatile("hlt");
+    }
+
+    int rc = 0;
+    if (S.recv_done) {
+        fs_node *fn = fs_lookup(S.recv_name);
+        if (!fn) fn = fs_create(S.recv_name, 0);
+        if (!fn || fn->is_dir) { kprintf("share: cannot save '%s'\n", S.recv_name); rc = 1; }
+        else {
+            fs_write(fn, S.recv_buf, S.recv_got);
+            kprintf("received '%s' (%u bytes) from ", S.recv_name, S.recv_got);
+            print_ip(S.recv_src); kprintf(" -> saved\n");
+        }
+    } else if (cancelled) {
+        kprintf("share: cancelled\n");
+    }
+    udp_unlisten(SHARE_PORT);
+    if (S.recv_buf) kfree(S.recv_buf);
+    S.active = 0;
+    return rc;
+}
+
 int cmd_share(int argc, char **argv) {
-    (void)argv;
-    if (argc < 2) { kprintf("usage: share PATH\n"); return 1; }
-    no_net("share");
-    return 1;
+    if (argc < 2) {
+        kprintf("usage:\n");
+        kprintf("  share recv [name]     listen and receive a file (run on the target)\n");
+        kprintf("  share PATH            discover targets on the LAN, pick one, send PATH\n");
+        kprintf("  share send IP PATH    send PATH directly to a known IP\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "recv") == 0) return share_recv(argc, argv);
+    if (!netif_default()) { kprintf("share: no network interface\n"); return 1; }
+
+    /* `share send IP PATH` -- direct */
+    if (strcmp(argv[1], "send") == 0) {
+        if (argc < 4) { kprintf("usage: share send IP PATH\n"); return 1; }
+        int ok; uint32_t ip = net_parse_ipv4(argv[2], &ok);
+        if (!ok) { kprintf("share: invalid address '%s'\n", argv[2]); return 1; }
+        fs_node *f = fs_lookup(argv[3]);
+        if (!f || f->is_dir || !f->data) { kprintf("share: not a file: %s\n", argv[3]); return 1; }
+        if (f->size > SHARE_MAXFILE) { kprintf("share: file too large (max 4 MiB)\n"); return 1; }
+        memset(&S, 0, sizeof(S)); S.mode = 0;
+        udp_listen(SHARE_PORT, share_cb); S.active = 1;
+        int rc = share_send_to(ip, f);
+        udp_unlisten(SHARE_PORT); S.active = 0;
+        return rc;
+    }
+
+    /* `share PATH` -- discover targets, choose one, send */
+    fs_node *f = fs_lookup(argv[1]);
+    if (!f || f->is_dir || !f->data) { kprintf("share: not a file: %s\n", argv[1]); return 1; }
+    if (f->size > SHARE_MAXFILE) { kprintf("share: file too large (max 4 MiB)\n"); return 1; }
+
+    memset(&S, 0, sizeof(S)); S.mode = 0;
+    udp_listen(SHARE_PORT, share_cb); S.active = 1;
+
+    kprintf("share: searching for targets on the LAN...\n");
+    uint64_t start = pit_ticks();
+    int blasts = 0;
+    while (pit_ticks() - start < 1600) {
+        if ((pit_ticks() - start) >= (uint64_t)blasts * 400) {   /* DISC every 400ms */
+            sh_send(0xFFFFFFFFu, SH_DISC, 0, 0, 0, 0); blasts++;
+        }
+        netif_poll_all();
+        __asm__ volatile("hlt");
+    }
+
+    if (S.npeer == 0) {
+        kprintf("share: no targets found. (run 'share recv' on the other machine)\n");
+        udp_unlisten(SHARE_PORT); S.active = 0;
+        return 1;
+    }
+    kprintf("found %d target(s):\n", S.npeer);
+    for (int i = 0; i < S.npeer; i++) {
+        kprintf("  %d) %s  ", i + 1, S.peers[i].name); print_ip(S.peers[i].ip); kprintf("\n");
+    }
+    kprintf("select target [1-%d, 0=cancel]: ", S.npeer);
+    char sel[16]; sh_readline(sel, sizeof(sel));
+    int idx = atoi(sel);
+    int rc = 1;
+    if (idx >= 1 && idx <= S.npeer) rc = share_send_to(S.peers[idx - 1].ip, f);
+    else kprintf("share: cancelled\n");
+
+    udp_unlisten(SHARE_PORT); S.active = 0;
+    return rc;
 }
 
 int cmd_wifi(int argc, char **argv) {
@@ -274,37 +559,55 @@ int cmd_scan(int argc, char **argv) {
     return 0;
 }
 
-/* firewall: an in-RAM ruleset. It is real state you can edit/list, but with no
- * network stack it filters nothing - kept for when a NIC driver lands. */
-#define FW_MAX 16
-#define FW_LEN 48
-static char fw_rules[FW_MAX][FW_LEN];
-static int  fw_count;
-static int  fw_enabled;
+/* firewall: a real packet filter. The ruleset lives in net/firewall.c and the
+ * IPv4 layer drops anything a BLOCK rule rejects, inbound and outbound. */
+static void fw_usage(void) {
+    kprintf("usage: firewall [on|off|status|stats|clear|default allow|block]\n");
+    kprintf("       firewall add <allow|block> [in|out] [tcp|udp|icmp]\n");
+    kprintf("                    [ip ADDR[/PREFIX]] [port N]\n");
+    kprintf("  e.g. firewall add block out tcp port 80\n");
+    kprintf("       firewall add block in icmp\n");
+    kprintf("       firewall add block ip 93.184.216.0/24\n");
+}
 
 int cmd_firewall(int argc, char **argv) {
     const char *act = (argc > 1) ? argv[1] : "status";
-    if (strcmp(act, "on") == 0)        { fw_enabled = 1; kprintf("firewall enabled\n"); }
-    else if (strcmp(act, "off") == 0)  { fw_enabled = 0; kprintf("firewall disabled\n"); }
-    else if (strcmp(act, "clear") == 0){ fw_count = 0;   kprintf("firewall rules cleared\n"); }
-    else if (strcmp(act, "add") == 0) {
-        if (argc < 3) { kprintf("usage: firewall add RULE\n"); return 1; }
-        if (fw_count >= FW_MAX) { kprintf("firewall: rule table full\n"); return 1; }
-        char *r = fw_rules[fw_count];
-        uint32_t L = 0;
-        for (int i = 2; i < argc && L < FW_LEN - 1; i++) {
-            if (i > 2 && L < FW_LEN - 1) r[L++] = ' ';
-            for (const char *s = argv[i]; *s && L < FW_LEN - 1; ) r[L++] = *s++;
-        }
-        r[L] = 0;
-        fw_count++;
-        kprintf("rule added (#%d)\n", fw_count);
-    } else if (strcmp(act, "list") == 0 || strcmp(act, "status") == 0) {
-        kprintf("firewall: %s, %d rule(s)\n", fw_enabled ? "ENABLED" : "disabled", fw_count);
-        for (int i = 0; i < fw_count; i++) kprintf("  %d) %s\n", i + 1, fw_rules[i]);
-        kprintf("(advisory: no NIC bound, so nothing is actually filtered)\n");
-    } else {
-        kprintf("usage: firewall [on|off|add RULE|list|clear]\n");
+    if (strcmp(act, "on") == 0)        { fw_set_enabled(1); kprintf("firewall enabled\n"); }
+    else if (strcmp(act, "off") == 0)  { fw_set_enabled(0); kprintf("firewall disabled\n"); }
+    else if (strcmp(act, "clear") == 0){ fw_clear();        kprintf("firewall rules cleared\n"); }
+    else if (strcmp(act, "default") == 0) {
+        if (argc < 3) { fw_usage(); return 1; }
+        if (strcmp(argv[2], "allow") == 0)      fw_set_default(1);
+        else if (strcmp(argv[2], "block") == 0) fw_set_default(0);
+        else { fw_usage(); return 1; }
+        kprintf("default policy: %s\n", fw_get_default() ? "allow" : "block");
     }
+    else if (strcmp(act, "add") == 0) {
+        if (argc < 3) { fw_usage(); return 1; }
+        /* rebuild the raw rule text for display */
+        char raw[56]; uint32_t L = 0;
+        for (int i = 2; i < argc && L < sizeof(raw) - 1; i++) {
+            if (i > 2 && L < sizeof(raw) - 1) raw[L++] = ' ';
+            for (const char *s = argv[i]; *s && L < sizeof(raw) - 1; ) raw[L++] = *s++;
+        }
+        raw[L] = 0;
+        int rc = fw_add(argc - 2, argv + 2, raw);
+        if (rc == 0)       kprintf("rule added (#%d)\n", fw_count());
+        else if (rc == -2) kprintf("firewall: rule table full\n");
+        else { kprintf("firewall: bad rule\n"); fw_usage(); return 1; }
+    }
+    else if (strcmp(act, "stats") == 0) {
+        uint32_t p, b; fw_stats(&p, &b);
+        kprintf("firewall: %s  passed=%u blocked=%u\n",
+                fw_enabled() ? "ENABLED" : "disabled", p, b);
+    }
+    else if (strcmp(act, "list") == 0 || strcmp(act, "status") == 0) {
+        kprintf("firewall: %s, default %s, %d rule(s)\n",
+                fw_enabled() ? "ENABLED" : "disabled",
+                fw_get_default() ? "allow" : "block", fw_count());
+        for (int i = 0; i < fw_count(); i++)
+            kprintf("  %d) %s\n", i + 1, fw_rule_text(i));
+    }
+    else { fw_usage(); }
     return 0;
 }

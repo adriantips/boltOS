@@ -15,3 +15,15 @@
  *  location  <- value of a redirect's Location header (3xx), if non-NULL. */
 int http_get(const char *url, char *out, uint32_t cap,
              int *status, char *location, uint32_t loc_cap);
+
+/* ---- keep-alive session: reuse one connection for many same-host fetches --
+ * http_open() connects (status: 0 ok, -3 DNS, -4 TCP, -5 TLS). http_fetch()
+ * sends one keep-alive GET and reads exactly one length-delimited response
+ * (returns body length, or -1). http_conn_can_reuse() reports whether a URL
+ * targets the same scheme/host/port and the connection is still live. */
+struct http_conn;
+struct http_conn *http_open(const char *url, int *status);
+int  http_conn_can_reuse(struct http_conn *c, const char *url);
+int  http_fetch(struct http_conn *c, const char *url, char *out, uint32_t cap,
+                int *status, char *location, uint32_t loc_cap);
+void http_close_conn(struct http_conn *c);

@@ -62,10 +62,15 @@ void pmm_init(struct bootinfo *bi) {
             if (is_used(f)) { set_free(f); used_frames--; }
     }
 
-    /* ...and reserve the low 2 MiB (IVT, bootloader, kernel, page tables) plus
-     * the bitmap storage itself. */
-    pmm_reserve_range(0, 0x200000);
-    pmm_reserve_range(bm, bm_bytes);
+    /* ...and reserve everything from address 0 up to the end of the bitmap in
+     * one contiguous range: low memory (IVT, bootloader, page tables), the whole
+     * kernel image incl. .bss, and the bitmap itself (which sits just past the
+     * kernel). This scales with the kernel size -- a hardcoded 2 MiB low reserve
+     * would let .bss past 2 MiB be handed out once the kernel grows large (e.g.
+     * with big embedded blobs), silently corrupting kernel state. */
+    uint64_t reserved_top = (bm + bm_bytes + FRAME - 1) & ~(FRAME - 1);
+    if (reserved_top < 0x200000) reserved_top = 0x200000;
+    pmm_reserve_range(0, reserved_top);
 
     kprintf("[pmm] E820 map (%u entries):\n", n);
     for (uint32_t i = 0; i < n; i++)

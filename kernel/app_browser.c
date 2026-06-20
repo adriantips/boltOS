@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "gui.h"
 #include "html.h"
+#include "js.h"
 #include "image.h"
 #include "http.h"
 #include "net.h"
@@ -26,6 +27,7 @@
 #define HTTP_CAP   (256 * 1024)
 #define IMG_FETCH_CAP (1536 * 1024)   /* per-image download buffer            */
 #define IMG_BUDGET    (7 * 1024 * 1024) /* total resident decoded-image budget */
+#define IMG_TIME_BUDGET 14000           /* ms (PIT@1kHz) max spent fetching images */
 #define MAXIMG     256
 #define INDENT_STEP 22
 
@@ -53,6 +55,8 @@ typedef struct {
     int       fld_run[MAXFIELDS];
     int       nfld;
     int       focus_run;       /* run index of the focused field, or -1 */
+    char     *js_str[96];      /* strings allocated by page scripts (innerHTML=...) */
+    int       njs;
 } browser_t;
 
 static browser_t B;
@@ -313,6 +317,12 @@ static void url_host(const char *url, char *out, uint32_t cap) {
 /* resolve href (possibly relative) against the current page url */
 static void resolve_link(browser_t *st, const char *href, char *out, uint32_t cap) {
     if (is_remote(href)) { scopy(out, href, cap); return; }
+    if (href[0] == '/' && href[1] == '/') {            /* protocol-relative //host/path */
+        out[0] = 0;
+        sappend(out, is_https(st->url) ? "https:" : "http:", cap);
+        sappend(out, href, cap);
+        return;
+    }
     if (href[0] == '#') { scopy(out, st->url, cap); return; }
 
     if (is_remote(st->url)) {
@@ -351,17 +361,31 @@ static void free_images(browser_t *st) {
     st->nowned = 0;
 }
 
-static image_t *fetch_one(browser_t *st, const char *src) {
+/* Fetch+decode one image into the shared buffer. `psess` holds a keep-alive
+ * connection reused across same-host images so a page's images cost a single
+ * TLS handshake instead of one per image. */
+static image_t *fetch_one(browser_t *st, const char *src,
+                          uint8_t *buf, uint32_t bufcap, struct http_conn **psess) {
     char url[300]; resolve_link(st, src, url, sizeof(url));
-    const uint8_t *data = 0; uint32_t dlen = 0; uint8_t *buf = 0; image_t *im = 0;
+    const uint8_t *data = 0; uint32_t dlen = 0; image_t *im = 0;
     if (is_remote(url)) {
-        buf = (uint8_t *)kmalloc(IMG_FETCH_CAP);
-        if (!buf) return 0;
+        if (*psess && !http_conn_can_reuse(*psess, url)) { http_close_conn(*psess); *psess = 0; }
+        if (!*psess) { int code; *psess = http_open(url, &code); }
+        if (!*psess) return 0;
         int code = 0; char loc[256];
-        int blen = http_get(url, (char *)buf, IMG_FETCH_CAP, &code, loc, sizeof(loc));
+        int blen = http_fetch(*psess, url, (char *)buf, bufcap, &code, loc, sizeof(loc));
+        if (blen < 0) {                                /* stale connection: one retry */
+            http_close_conn(*psess); *psess = 0;
+            int c2; *psess = http_open(url, &c2);
+            if (*psess) blen = http_fetch(*psess, url, (char *)buf, bufcap, &code, loc, sizeof(loc));
+        }
         if (code >= 300 && code < 400 && loc[0]) {     /* one redirect hop */
             char rurl[300]; resolve_link(st, loc, rurl, sizeof(rurl));
-            blen = http_get(rurl, (char *)buf, IMG_FETCH_CAP, &code, loc, sizeof(loc));
+            if (!*psess || !http_conn_can_reuse(*psess, rurl)) {
+                if (*psess) http_close_conn(*psess);
+                int c3; *psess = http_open(rurl, &c3);
+            }
+            if (*psess) blen = http_fetch(*psess, rurl, (char *)buf, bufcap, &code, loc, sizeof(loc));
         }
         if (blen > 0) { data = buf; dlen = (uint32_t)blen; }
     } else {
@@ -370,44 +394,245 @@ static image_t *fetch_one(browser_t *st, const char *src) {
         if (nf && !nf->is_dir) { data = nf->data; dlen = nf->size; }
     }
     if (data) im = image_decode(data, dlen);
-    if (buf) kfree(buf);
     return im;
 }
 
+/* ===========================================================================
+ *  Page scripts: run captured <script> bodies through the BoltJS engine with a
+ *  DOM host bound to this doc. Scripts can read/rewrite element text by id,
+ *  set the title, and console.log to the status line. A DOM node handle is the
+ *  1-based index of the first run carrying that id.
+ * ===========================================================================*/
+static void js_free_strings(browser_t *st) {
+    for (int i = 0; i < st->njs; i++) if (st->js_str[i]) kfree(st->js_str[i]);
+    st->njs = 0;
+}
+static char *js_keep(browser_t *st, const char *s) {        /* own a copy for a run->text */
+    uint32_t n = (uint32_t)strlen(s);
+    char *p = (char *)kmalloc(n + 1);
+    if (!p) return 0;
+    memcpy(p, s, n); p[n] = 0;
+    if (st->njs < 96) st->js_str[st->njs++] = p;
+    return p;
+}
+/* strip HTML tags + decode nothing fancy: innerHTML -> visible plain text */
+static void strip_tags(const char *in, char *out, uint32_t cap) {
+    uint32_t o = 0; int intag = 0;
+    for (const char *p = in; *p && o < cap - 1; p++) {
+        if (*p == '<') { intag = 1; continue; }
+        if (*p == '>') { intag = 0; continue; }
+        if (!intag) out[o++] = *p;
+    }
+    out[o] = 0;
+}
+static int jh_find_id(browser_t *st, const char *id) {
+    html_doc *d = st->doc; if (!d) return -1;
+    for (int i = 0; i < d->nruns; i++)
+        if (d->runs[i].elid && strcmp(d->runs[i].elid, id) == 0) return i;
+    return -1;
+}
+static js_dom_node jh_by_id(void *ud, const char *id) {
+    browser_t *st = (browser_t *)ud; int idx = jh_find_id(st, id);
+    return idx < 0 ? 0 : (js_dom_node)(uint64_t)(idx + 1);
+}
+static js_dom_node jh_by_tag(void *ud, const char *tag, int index) {
+    (void)ud; (void)tag; (void)index; return 0;
+}
+static int jh_get_inner(void *ud, js_dom_node n, char *out, uint32_t cap) {
+    browser_t *st = (browser_t *)ud; html_doc *d = st->doc;
+    int idx = (int)(uint64_t)n - 1; if (!d || idx < 0 || idx >= d->nruns) { if(cap)out[0]=0; return 0; }
+    const char *eid = d->runs[idx].elid; uint32_t o = 0; out[0] = 0;
+    for (int i = idx; i < d->nruns && o < cap - 1; i++)
+        if (d->runs[i].elid && eid && strcmp(d->runs[i].elid, eid) == 0)
+            for (const char *p = d->runs[i].text; *p && o < cap - 1; p++) out[o++] = *p;
+    out[o] = 0; return 1;
+}
+static void jh_set_node(browser_t *st, js_dom_node n, const char *text) {
+    html_doc *d = st->doc; int idx = (int)(uint64_t)n - 1;
+    if (!d || idx < 0 || idx >= d->nruns) return;
+    const char *eid = d->runs[idx].elid;
+    char *keep = js_keep(st, text); if (!keep) return;
+    d->runs[idx].text = keep;                       /* first run gets the new text */
+    if (eid) for (int i = idx + 1; i < d->nruns; i++)/* blank the rest of the element */
+        if (d->runs[i].elid && strcmp(d->runs[i].elid, eid) == 0) d->runs[i].text = "";
+}
+static void jh_set_inner(void *ud, js_dom_node n, const char *html) {
+    char plain[4096]; strip_tags(html, plain, sizeof plain);
+    jh_set_node((browser_t *)ud, n, plain);
+}
+static void jh_set_text(void *ud, js_dom_node n, const char *text) {
+    jh_set_node((browser_t *)ud, n, text);
+}
+static void jh_write(void *ud, const char *html) {          /* document.write -> append a run */
+    browser_t *st = (browser_t *)ud; html_doc *d = st->doc;
+    if (!d || d->nruns >= d->runs_cap) return;
+    char plain[2048]; strip_tags(html, plain, sizeof plain);
+    if (!plain[0]) return;
+    char *keep = js_keep(st, plain); if (!keep) return;
+    html_run *r = &d->runs[d->nruns++];
+    memset(r, 0, sizeof(*r));
+    r->text = keep; r->style = HSTYLE_NORMAL; r->link = -1; r->img = -1; r->brk = 1;
+}
+static void jh_title(void *ud, const char *t) {
+    (void)ud; if (BW) scopy(BW->title, t, sizeof(BW->title));
+}
+static void jh_log(void *ud, const char *m) {
+    browser_t *st = (browser_t *)ud; char s[120]; s[0]=0;
+    sappend(s, "console: ", sizeof s); sappend(s, m, sizeof s); set_status(st, s);
+}
+static void run_scripts(browser_t *st) {
+    html_doc *d = st->doc;
+    if (!d || d->nscripts == 0) return;
+    js_host host = { st, jh_by_id, jh_by_tag, jh_set_inner, jh_get_inner,
+                     jh_set_text, jh_write, jh_title, jh_log };
+    char err[160];
+    for (int i = 0; i < d->nscripts; i++) {
+        const char *src = d->scripts[i]; if (!src) continue;
+        js_run(src, (uint32_t)strlen(src), &host, err, sizeof err);
+    }
+}
+
 /* Resolve, download and decode every <img> in the current doc; wire decoded
- * pixels back onto the runs. Bounded by a count and a resident-memory budget. */
+ * pixels back onto the runs. Bounded by a count, a resident-memory budget and
+ * a wall-clock budget so an image-heavy page can't freeze the UI for minutes.
+ * Same-host images share one keep-alive connection. */
 static void fetch_images(browser_t *st) {
     html_doc *d = st->doc;
     if (!d || d->nimgs == 0) return;
     image_t **cache = (image_t **)kmalloc((uint32_t)d->nimgs * sizeof(image_t *));
     if (!cache) return;
     for (int i = 0; i < d->nimgs; i++) cache[i] = 0;
+    uint8_t *buf = (uint8_t *)kmalloc(IMG_FETCH_CAP);
+    if (!buf) { kfree(cache); return; }
 
+    struct http_conn *sess = 0;
     uint32_t budget = 0;
+    uint64_t t0 = pit_ticks();
     for (int i = 0; i < d->nimgs; i++) {
         if (st->nowned >= MAXIMG || budget >= IMG_BUDGET) break;
+        if (pit_ticks() - t0 > IMG_TIME_BUDGET) break;   /* keep the page responsive */
         set_status(st, "Loading images...");
         gui_pump();                                   /* keep the UI alive */
-        image_t *im = fetch_one(st, d->imgs[i]);
+        image_t *im = fetch_one(st, d->imgs[i], buf, IMG_FETCH_CAP, &sess);
         if (im) {
             cache[i] = im;
             st->owned[st->nowned++] = im;
             budget += (uint32_t)im->w * im->h * 4;
         }
     }
+    if (sess) http_close_conn(sess);
+    kfree(buf);
     for (int ri = 0; ri < d->nruns; ri++)
         if (d->runs[ri].kind == HRUN_IMG && d->runs[ri].img >= 0 && d->runs[ri].img < d->nimgs)
             d->runs[ri].pix = cache[d->runs[ri].img];
     kfree(cache);
 }
 
+/* ===========================================================================
+ *  YouTube renderer. YouTube builds its pages with JavaScript, but it also
+ *  embeds the data in an `ytInitialData` JSON blob inside a <script>. We can't
+ *  run that app (it needs a full browser engine + video codecs), but we CAN
+ *  scrape the embedded data: pull the videoId + title for each result and emit
+ *  a plain HTML list whose links point at the real /watch pages. That makes
+ *  YouTube *search* show real YouTube videos; playback stays out of reach.
+ * ===========================================================================*/
+static int is_youtube(const char *url) {
+    const char *h = url;
+    if (strncmp(h,"http://",7)==0) h+=7; else if (strncmp(h,"https://",8)==0) h+=8;
+    return strncmp(h,"www.youtube.com",15)==0 || strncmp(h,"youtube.com",11)==0 ||
+           strncmp(h,"m.youtube.com",13)==0   || strncmp(h,"youtu.be",8)==0;
+}
+static const char *find_sub(const char *h, const char *end, const char *needle) {
+    uint32_t nl = (uint32_t)strlen(needle);
+    for (const char *p=h; p+nl<=end; p++) { uint32_t k=0; for(;k<nl;k++) if(p[k]!=needle[k])break; if(k==nl)return p; }
+    return 0;
+}
+/* copy a JSON string value (p at first char after the opening quote) into out */
+static const char *json_str(const char *p, const char *end, char *out, uint32_t cap) {
+    uint32_t o=0;
+    while (p<end && *p!='"' && o<cap-1) {
+        if (*p=='\\' && p+1<end) {
+            char e=p[1];
+            if(e=='n'||e=='t'){ out[o++]=' '; p+=2; continue; }
+            if(e=='"'||e=='\\'||e=='/'){ out[o++]=e; p+=2; continue; }
+            if(e=='u' && p+5<end){ int v=0; for(int k=2;k<6;k++){ char c=p[k];
+                    int hv=(c>='0'&&c<='9')?c-'0':(c>='a'&&c<='f')?c-'a'+10:(c>='A'&&c<='F')?c-'A'+10:0; v=v*16+hv; }
+                out[o++] = (v>=32 && v<127) ? (char)v : (v==0x26?'&':' '); p+=6; continue; }
+            out[o++]=e; p+=2; continue;
+        }
+        out[o++]=*p++;
+    }
+    out[o]=0;
+    return p;
+}
+/* Build a plain-HTML page from YouTube's embedded JSON. Returns length. */
+static int youtube_build(const char *raw, uint32_t len, char *out, uint32_t outcap, const char *url) {
+    const char *end = raw + len; uint32_t o = 0;
+    #define YPUT(s) do { for (const char *q=(s); *q && o<outcap-1; ) out[o++]=*q++; } while(0)
+    int is_watch = (find_sub(url, url+strlen(url), "/watch") != 0);
+
+    YPUT("<html><head><title>YouTube (BoltOS)</title></head><body>");
+    YPUT("<h1>YouTube</h1>");
+
+    if (is_watch) {
+        /* watch page: show title + description from videoDetails */
+        const char *vd = find_sub(raw, end, "\"videoDetails\":{");
+        char title[256]=""; char desc[1024]="";
+        if (vd) {
+            const char *tt = find_sub(vd, vd+4000<end?vd+4000:end, "\"title\":\"");
+            if (tt) json_str(tt+9, end, title, sizeof title);
+            const char *dd = find_sub(vd, vd+8000<end?vd+8000:end, "\"shortDescription\":\"");
+            if (dd) json_str(dd+20, end, desc, sizeof desc);
+        }
+        YPUT("<h2>"); for(char*c=title;*c&&o<outcap-300;c++) if(*c!='<'&&*c!='>') out[o++]=*c; YPUT("</h2>");
+        YPUT("<p><b>Note:</b> BoltOS shows YouTube's page data; video playback needs codecs not present.</p>");
+        YPUT("<p>"); for(char*c=desc;*c&&o<outcap-300;c++) if(*c!='<'&&*c!='>') out[o++]=*c; YPUT("</p>");
+        YPUT("</body></html>"); out[o]=0; return (int)o;
+    }
+
+    YPUT("<p>Real YouTube results (titles link to the watch page; playback needs codecs not present).</p>");
+    char seen[48][12]; int nseen=0;
+    const char *p = raw;
+    while (o < outcap-400 && nseen < 40) {
+        const char *vid = find_sub(p, end, "\"videoId\":\"");
+        if (!vid) break;
+        const char *idp = vid + 11;
+        char id[12]; int k=0; while (idp+k<end && idp[k]!='"' && k<11){ id[k]=idp[k]; k++; } id[k]=0;
+        p = idp + (k>0?k:1);
+        if (k != 11) continue;
+        int dup=0; for(int i=0;i<nseen;i++) if(strcmp(seen[i],id)==0){dup=1;break;}
+        if (dup) continue;
+        const char *win = idp+2500<end?idp+2500:end;
+        const char *titlestart;
+        const char *tt = find_sub(idp, win, "\"title\":{\"runs\":[{\"text\":\"");
+        if (tt) titlestart = tt + strlen("\"title\":{\"runs\":[{\"text\":\"");
+        else { tt = find_sub(idp, win, "\"text\":\""); if (!tt) continue; titlestart = tt + 8; }
+        char title[200]; json_str(titlestart, end, title, sizeof title);
+        if (!title[0]) continue;
+        if (nseen<48){ for(int z=0;z<12;z++)seen[nseen][z]=id[z]; nseen++; }
+        YPUT("<p><a href=\"https://www.youtube.com/watch?v=");
+        YPUT(id); YPUT("\">");
+        for (char *c=title; *c && o<outcap-200; c++) if (*c!='<' && *c!='>') out[o++]=*c;
+        YPUT("</a></p>");
+    }
+    if (nseen==0) YPUT("<p>(no video data found)</p>");
+    YPUT("</body></html>");
+    out[o]=0;
+    return (int)o;
+}
+
 static int load_http(browser_t *st, const char *url, int depth) {
     set_status(st, "Connecting...");
-    char *buf = (char *)kmalloc(HTTP_CAP);
+    int yt = is_youtube(url);
+    /* YouTube pages are ~2 MB; the ytInitialData result list runs through the
+     * first ~1.2 MB (≈20 videos). Cap the read there so a slow link finishes
+     * in reasonable time instead of pulling the whole bundle. */
+    uint32_t cap = yt ? (1200u*1024) : HTTP_CAP;
+    char *buf = (char *)kmalloc(cap);
     if (!buf) { set_status(st, "out of memory"); return 0; }
 
     int code = 0; char loc[256];
-    int blen = http_get(url, buf, HTTP_CAP, &code, loc, sizeof(loc));
+    int blen = http_get(url, buf, cap, &code, loc, sizeof(loc));
     if (blen < 0) {
         if (code == -3)      set_status(st, "DNS lookup failed");
         else if (code == -4) set_status(st, "connection failed / timed out");
@@ -424,12 +649,23 @@ static int load_http(browser_t *st, const char *url, int depth) {
     }
 
     free_images(st);
+    js_free_strings(st);
     if (st->doc) { html_free(st->doc); st->doc = 0; }
-    st->doc = html_parse(buf, (uint32_t)blen);
+    if (yt) {                                  /* scrape YouTube's embedded data */
+        char *page = (char *)kmalloc(128 * 1024);
+        if (page) {
+            int n = youtube_build(buf, (uint32_t)blen, page, 128 * 1024, url);
+            st->doc = html_parse(page, (uint32_t)n);
+            kfree(page);
+        } else st->doc = html_parse(buf, (uint32_t)blen);
+    } else {
+        st->doc = html_parse(buf, (uint32_t)blen);
+    }
     kfree(buf);
     st->scroll = 0;
     fields_reset(st);
     scopy(st->url, url, sizeof(st->url));
+    run_scripts(st);
     fetch_images(st);
 
     char num[16]; sh_utoa((uint64_t)blen, num);
@@ -451,6 +687,7 @@ static int load_fs(browser_t *st, const char *path) {
     if (n->is_dir) { set_status(st, "that is a directory, not a file"); return 0; }
 
     free_images(st);
+    js_free_strings(st);
     if (st->doc) { html_free(st->doc); st->doc = 0; }
     if (ends_with(n->name, ".html") || ends_with(n->name, ".htm"))
         st->doc = html_parse((const char *)n->data, n->size);
@@ -459,6 +696,7 @@ static int load_fs(browser_t *st, const char *path) {
     st->scroll = 0;
     fields_reset(st);
     scopy(st->url, p, sizeof(st->url));
+    run_scripts(st);
     fetch_images(st);
     scopy(BW->title, n->name, sizeof(BW->title));
 
@@ -469,10 +707,105 @@ static int load_fs(browser_t *st, const char *path) {
     return 1;
 }
 
+/* Percent-encode a query into a DuckDuckGo HTML search URL. DDG's html
+ * endpoint returns plain markup (no JS), so its results render natively --
+ * this is what makes typing a search term in the address bar actually work. */
+static void build_search_url(const char *q, char *out, uint32_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    const char *pre = "https://html.duckduckgo.com/html/?q=";
+    uint32_t o = 0;
+    for (const char *p = pre; *p && o < cap - 1; ) out[o++] = *p++;
+    for (const char *p = q; *p && o + 4 < cap; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~')
+            out[o++] = (char)ch;
+        else if (ch == ' ') out[o++] = '+';
+        else { out[o++] = '%'; out[o++] = hex[ch >> 4]; out[o++] = hex[ch & 15]; }
+    }
+    out[o] = 0;
+}
+
+/* Google and Bing build their results with JavaScript: a non-JS client gets a
+ * "please enable JavaScript" shell with no result links. So when the user
+ * submits the Google/Bing search box (or navigates such a results URL), pull
+ * the q= term out and re-issue the search against DuckDuckGo's html endpoint,
+ * which returns plain markup we render. This is what makes "Google search"
+ * actually produce results here -- same query, a backend that works without JS. */
+static int rewrite_serp(const char *url, char *out, uint32_t cap) {
+    const char *h = url;
+    if (strncmp(h, "http://", 7) == 0)  h += 7;
+    else if (strncmp(h, "https://", 8) == 0) h += 8;
+    /* host must be a google.* or bing.* results path */
+    int is_g = (strncmp(h, "www.google.", 11) == 0 || strncmp(h, "google.", 7) == 0);
+    int is_b = (strncmp(h, "www.bing.", 9) == 0 || strncmp(h, "bing.", 5) == 0);
+    if (!is_g && !is_b) return 0;
+    const char *slash = strchr(h, '/');
+    if (!slash || strncmp(slash, "/search", 7) != 0) return 0;
+    const char *qs = strchr(slash, '?');
+    if (!qs) return 0;
+    /* find the q= parameter */
+    const char *q = 0;
+    for (const char *p = qs + 1; *p; ) {
+        if ((p[0]=='q'||p[0]=='Q') && p[1]=='=') { q = p + 2; break; }
+        while (*p && *p != '&') p++;
+        if (*p == '&') p++;
+    }
+    if (!q) return 0;
+    uint32_t o = 0;
+    const char *pre = "https://html.duckduckgo.com/html/?q=";
+    for (const char *p = pre; *p && o < cap - 1; ) out[o++] = *p++;
+    for (const char *p = q; *p && *p != '&' && o < cap - 1; p++) out[o++] = *p;   /* q is already URL-encoded */
+    out[o] = 0;
+    return 1;
+}
+
+/* DuckDuckGo wraps every result link as duckduckgo.com/l/?uddg=<encoded-target>
+ * &rut=... -- a click-tracking redirect that answers with a 200 + client-side
+ * redirect (not an HTTP 30x we follow), so it renders blank. Unwrap it: pull
+ * uddg=, percent-decode it, and navigate straight to the real destination. */
+static int hexv(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static int unwrap_ddg_link(const char *url, char *out, uint32_t cap) {
+    const char *h = url;
+    if (strncmp(h, "http://", 7) == 0)  h += 7;
+    else if (strncmp(h, "https://", 8) == 0) h += 8;
+    if (strncmp(h, "duckduckgo.com/l/", 17) != 0 &&
+        strncmp(h, "www.duckduckgo.com/l/", 21) != 0 &&
+        strncmp(h, "links.duckduckgo.com/l/", 23) != 0) return 0;
+    const char *q = 0;
+    for (const char *p = h; *p; p++)
+        if (p[0]=='u' && p[1]=='d' && p[2]=='d' && p[3]=='g' && p[4]=='=') { q = p + 5; break; }
+    if (!q) return 0;
+    uint32_t o = 0;
+    for (const char *p = q; *p && *p != '&' && o < cap - 1; ) {
+        if (*p == '%' && p[1] && p[2]) {
+            int hi = hexv(p[1]), lo = hexv(p[2]);
+            if (hi >= 0 && lo >= 0) { out[o++] = (char)(hi * 16 + lo); p += 3; continue; }
+        }
+        if (*p == '+') { out[o++] = ' '; p++; continue; }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+    return o > 0;
+}
+
 static void load_url(browser_t *st, const char *url, int depth) {
     /* trim leading spaces */
     while (*url == ' ') url++;
     if (!*url) return;
+
+    /* transparent Google/Bing -> renderable-search rewrite (see rewrite_serp) */
+    char serp[420];
+    if (depth == 0 && rewrite_serp(url, serp, sizeof(serp))) url = serp;
+
+    /* unwrap a DuckDuckGo result-link redirect to its real destination */
+    char unwrapped[420];
+    if (depth < 4 && unwrap_ddg_link(url, unwrapped, sizeof(unwrapped))) url = unwrapped;
 
     int ok;
     if (is_remote(url)) {
@@ -480,14 +813,22 @@ static void load_url(browser_t *st, const char *url, int depth) {
     } else if (url[0] == '/' || strncmp(url, "file:", 5) == 0) {
         ok = load_fs(st, url);
     } else {
-        /* host-looking (a dot before any slash) -> http, else local */
+        /* Decide between a host to open, a local file, and a web search.
+         * host-looking = a dot before any slash and no spaces. A bare token
+         * that names an existing local file opens it; anything else (a phrase,
+         * or a word with no matching file) becomes a web search. */
         const char *slash = strchr(url, '/');
         const char *dot   = strchr(url, '.');
-        if (dot && (!slash || dot < slash)) {
+        int spaced = (strchr(url, ' ') != 0);
+        fs_node *local = spaced ? 0 : fs_lookup(url);
+        if (!spaced && dot && (!slash || dot < slash)) {
             char full[300]; full[0] = 0; sappend(full, "http://", sizeof(full)); sappend(full, url, sizeof(full));
             ok = load_http(st, full, depth);
-        } else {
+        } else if (local && !local->is_dir) {
             ok = load_fs(st, url);
+        } else {
+            char surl[400]; build_search_url(url, surl, sizeof(surl));
+            ok = load_http(st, surl, depth);
         }
     }
     if (ok) { scopy(st->addr, st->url, sizeof(st->addr)); st->addr_len = (int)strlen(st->addr); st->editing = 0; }

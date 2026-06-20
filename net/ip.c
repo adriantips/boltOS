@@ -1,7 +1,17 @@
 #include <stdint.h>
 #include "net.h"
 #include "netif.h"
+#include "firewall.h"
 #include "string.h"
+
+/* remote port (host order) carried in a TCP/UDP payload: outbound wants the
+ * destination port (bytes 2..3), inbound wants the source port (bytes 0..1). */
+static uint16_t peer_port(uint8_t proto, const uint8_t *l4, uint16_t l4len, int want_dst) {
+    if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) return 0;
+    uint16_t off = want_dst ? 2 : 0;
+    if (l4len < (uint16_t)(off + 2)) return 0;
+    return (uint16_t)((l4[off] << 8) | l4[off + 1]);
+}
 
 static uint16_t ip_id;
 static uint8_t  ippkt[1500];
@@ -11,10 +21,21 @@ int ip_output(struct netif *nif, uint32_t dst_ip, uint8_t proto,
     if (!nif) return -1;
     if (20 + len > sizeof(ippkt)) return -1;
 
-    /* next hop: dst if on-link, else the gateway */
-    uint32_t nexthop = ((dst_ip & net_mask) == (net_ip & net_mask)) ? dst_ip : net_gw;
+    /* firewall: drop outbound datagrams a BLOCK rule rejects */
+    if (!fw_check(FW_OUT, proto, dst_ip, peer_port(proto, payload, len, 1)))
+        return -1;
+
+    /* broadcast (limited 255.255.255.255 or directed subnet bcast) goes straight
+     * to the Ethernet broadcast address with no ARP -- used by share discovery. */
     uint8_t mac[6];
-    if (!arp_lookup(nexthop, mac)) { arp_request(nif, nexthop); return -1; }
+    uint32_t subnet_bcast = net_ip | ~net_mask;
+    if (dst_ip == 0xFFFFFFFFu || dst_ip == subnet_bcast) {
+        for (int i = 0; i < 6; i++) mac[i] = 0xFF;
+    } else {
+        /* next hop: dst if on-link, else the gateway */
+        uint32_t nexthop = ((dst_ip & net_mask) == (net_ip & net_mask)) ? dst_ip : net_gw;
+        if (!arp_lookup(nexthop, mac)) { arp_request(nif, nexthop); return -1; }
+    }
 
     struct ip_hdr *h = (struct ip_hdr *)ippkt;
     h->ver_ihl    = 0x45;
@@ -51,6 +72,11 @@ void ip_input(struct netif *nif, const uint8_t *pkt, uint16_t len,
 
     const uint8_t *data = pkt + ihl;
     uint16_t dlen = (uint16_t)(total - ihl);
+
+    /* firewall: drop inbound datagrams a BLOCK rule rejects */
+    if (!fw_check(FW_IN, h->proto, src, peer_port(h->proto, data, dlen, 0)))
+        return;
+
     switch (h->proto) {
     case IPPROTO_ICMP: icmp_input(nif, src, data, dlen); break;
     case IPPROTO_UDP:  udp_input(nif, src, data, dlen);  break;

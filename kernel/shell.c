@@ -133,6 +133,7 @@ const command_t commands[] = {
     { "sync",     "System",           "flush filesystem to disk",           cmd_sync },
     { "uptime",   "System",           "time since boot",                    cmd_uptime },
     { "winrun",   "System",           "run a Windows .exe (PE32+ loader)",   cmd_winrun },
+    { "compile",  "System",           "compile .c/.cpp/.cs/.py to a real .exe",cmd_compile },
     { "battery",  "System",           "battery status",                     cmd_battery },
     { "sensors",  "System",           "hardware sensors",                   cmd_sensors },
     { "devices",  "System",           "connected hardware (PCI)",           cmd_devices },
@@ -181,6 +182,7 @@ const command_t commands[] = {
     { "echo",     "Core",             "print text back",                    cmd_echo },
     { "clear",    "Core",             "clear the screen",                   cmd_clear },
     { "python",   "Core",             "BoltPython REPL / run a .py file",    cmd_python },
+    { "js",       "Core",             "run JavaScript (BoltJS engine)",     cmd_js },
 };
 const int commands_count = (int)(sizeof(commands) / sizeof(commands[0]));
 

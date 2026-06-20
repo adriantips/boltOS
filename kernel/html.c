@@ -80,6 +80,7 @@ static void push_full(html_doc *d, const char *text, uint32_t n, uint8_t style,
     r->text = t; r->style = style; r->link = link; r->brk = brk;
     r->kind = HRUN_TEXT; r->align = align; r->indent = indent; r->color = color;
     r->bg = bg; r->fscale = fscale; r->img = -1; r->iw = r->ih = 0; r->pix = 0; r->name = 0;
+    r->elid = d->cur_id;
 }
 
 static void cpy(char *d, const char *s, uint32_t cap) {
@@ -97,6 +98,7 @@ static void push_input(html_doc *d, const char *label, const char *name, int lin
     r->kind = HRUN_INPUT; r->align = align; r->indent = indent; r->color = color;
     r->bg = HCOL_NONE; r->fscale = 0; r->img = subtype; r->iw = w; r->ih = h; r->pix = 0;
     r->name = (name && name[0]) ? arena_push(d, name, (uint32_t)strlen(name)) : 0;
+    r->elid = d->cur_id;
 }
 
 /* decode an entity starting at src[*i]=='&'; return decoded char, advance *i */
@@ -160,6 +162,23 @@ static int decode_entity(const char *src, uint32_t *i, uint32_t len) {
     }
     if (out >= 0) { *i = j + 1; return out; }
     return -1;
+}
+
+/* Decode HTML entities in-place in a URL/attribute string. Only ASCII
+ * expansions are applied (e.g. &amp; -> &, &#x2F; -> /); a non-entity '&' or a
+ * non-ASCII sentinel is left as the literal '&'. Without this, hrefs such as
+ * DuckDuckGo's "...&amp;rut=..." stay malformed and the server 400s the click. */
+static void decode_url_entities(char *s) {
+    uint32_t len = (uint32_t)strlen(s), r = 0, w = 0;
+    while (r < len) {
+        if (s[r] == '&') {
+            uint32_t i = r;
+            int e = decode_entity(s, &i, len);
+            if (e >= 0) { s[w++] = (char)e; r = i; continue; }
+        }
+        s[w++] = s[r++];
+    }
+    s[w] = 0;
 }
 
 /* extract a quoted/bare attribute value (case-insensitive name) into out */
@@ -421,11 +440,13 @@ static html_doc *doc_alloc(uint32_t len) {
     d->runs_cap  = (int)(len / 3 + 64); if (d->runs_cap > 24000) d->runs_cap = 24000;
     d->hrefs_cap = (int)(len / 40 + 32); if (d->hrefs_cap > 4000) d->hrefs_cap = 4000;
     d->imgs_cap  = (int)(len / 80 + 16); if (d->imgs_cap > 1024) d->imgs_cap = 1024;
+    d->scripts_cap = 16;
     d->arena = (char *)kmalloc(d->arena_cap);
     d->runs  = (html_run *)kmalloc((uint32_t)d->runs_cap * sizeof(html_run));
     d->hrefs = (char **)kmalloc((uint32_t)d->hrefs_cap * sizeof(char *));
     d->imgs  = (char **)kmalloc((uint32_t)d->imgs_cap * sizeof(char *));
-    if (!d->arena || !d->runs || !d->hrefs || !d->imgs) { html_free(d); return 0; }
+    d->scripts = (char **)kmalloc((uint32_t)d->scripts_cap * sizeof(char *));
+    if (!d->arena || !d->runs || !d->hrefs || !d->imgs || !d->scripts) { html_free(d); return 0; }
     return d;
 }
 
@@ -458,6 +479,12 @@ html_doc *html_parse(const char *src, uint32_t len) {
     /* format stack: open colour/align/css tags push a frame, popped on close */
     struct { char name[12]; uint32_t color; uint32_t bg; uint8_t align; int8_t bold, italic; uint8_t hidden; } fst[FSTACK_MAX];
     int fdepth = 0;
+
+    /* id stack: tracks the innermost element id so runs can be tagged for
+     * getElementById()/innerHTML. Pushed on an id-bearing open tag, popped on
+     * the matching close. */
+    struct { char *id; char name[12]; } idst[32];
+    int idsp = 0;
 
     #define CUR_COLOR  (fdepth ? fst[fdepth-1].color : HCOL_NONE)
     #define CUR_BG     (fdepth ? fst[fdepth-1].bg : HCOL_NONE)
@@ -548,6 +575,22 @@ html_doc *html_parse(const char *src, uint32_t len) {
             }
             if (fchanged) style = EFF_STYLE();
 
+            /* id stack maintenance (independent of the format stack) */
+            if (!closing && !is_void_tag(name)) {
+                char idv2[64]; idv2[0] = 0;
+                if (get_attr(tag, "id", idv2, sizeof(idv2)) && idv2[0] && idsp < 32) {
+                    FLUSH();                               /* text so far belongs to the parent id */
+                    idst[idsp].id = arena_push(d, idv2, (uint32_t)strlen(idv2));
+                    cpy(idst[idsp].name, name, sizeof(idst[idsp].name));
+                    idsp++;
+                    d->cur_id = idst[idsp-1].id;
+                }
+            } else if (closing && idsp > 0 && strcmp(idst[idsp-1].name, name) == 0) {
+                FLUSH();                                   /* flush this element's text first */
+                idsp--;
+                d->cur_id = idsp ? idst[idsp-1].id : 0;
+            }
+
             if (strcmp(name, "style") == 0) {
                 if (!closing && rules) {
                     uint32_t s0 = i;
@@ -565,7 +608,27 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 }
                 continue;
             }
-            if (strcmp(name, "script") == 0) { if (!closing) { skip = 1; cpy(skipname, "script", sizeof(skipname)); } continue; }
+            if (strcmp(name, "script") == 0) {
+                if (!closing) {
+                    uint32_t s0 = i;                       /* content begins after '>' */
+                    while (i < len) {                      /* scan to </script> */
+                        if (src[i]=='<' && i+1<len && src[i+1]=='/') {
+                            uint32_t k=i+2, z=0; char nm[8];
+                            while (k<len && z<7 && src[k]!='>' && src[k]!=' ') nm[z++]=lc(src[k++]);
+                            nm[z]=0;
+                            if (strcmp(nm,"script")==0) break;
+                        }
+                        i++;
+                    }
+                    if (d->scripts && d->nscripts < d->scripts_cap && i > s0) {
+                        uint32_t n = i - s0;
+                        char *sc = (char *)kmalloc(n + 1);
+                        if (sc) { for (uint32_t z=0; z<n; z++) sc[z]=src[s0+z]; sc[n]=0; d->scripts[d->nscripts++]=sc; }
+                    }
+                    while (i < len && src[i] != '>') i++; if (i < len) i++;   /* eat </script> */
+                }
+                continue;
+            }
             if (strcmp(name, "form") == 0) {
                 FLUSH();
                 if (closing) form_link = -1;
@@ -573,6 +636,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                     form_link = -1;
                     char act[256]; act[0] = 0;
                     if (get_attr(tag, "action", act, sizeof(act)) && act[0] && d->nhrefs < d->hrefs_cap) {
+                        decode_url_entities(act);
                         char *h = arena_push(d, act, (uint32_t)strlen(act));
                         if (h) { d->hrefs[d->nhrefs] = h; form_link = d->nhrefs; d->nhrefs++; }
                     }
@@ -641,6 +705,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 if (!closing) {
                     char href[256]; get_attr(tag, "href", href, sizeof(href));
                     if (href[0] && d->nhrefs < d->hrefs_cap) {
+                        decode_url_entities(href);
                         char *h = arena_push(d, href, (uint32_t)strlen(href));
                         if (h) { d->hrefs[d->nhrefs] = h; link = d->nhrefs; d->nhrefs++; }
                     }
@@ -797,5 +862,6 @@ void html_free(html_doc *d) {
     if (d->runs)  kfree(d->runs);
     if (d->hrefs) kfree(d->hrefs);
     if (d->imgs)  kfree(d->imgs);
+    if (d->scripts) { for (int i = 0; i < d->nscripts; i++) if (d->scripts[i]) kfree(d->scripts[i]); kfree(d->scripts); }
     kfree(d);
 }

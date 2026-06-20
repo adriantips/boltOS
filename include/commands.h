@@ -51,7 +51,7 @@ int cmd_health(int, char **); int cmd_sync(int, char **);
 int cmd_ps(int, char **);     int cmd_kill(int, char **);   int cmd_top(int, char **);
 int cmd_freeze(int, char **); int cmd_resume(int, char **); int cmd_services(int, char **);
 int cmd_service(int, char **);int cmd_jobs(int, char **);   int cmd_priority(int, char **);
-int cmd_monitor(int, char **); int cmd_winrun(int, char **);
+int cmd_monitor(int, char **); int cmd_winrun(int, char **); int cmd_compile(int, char **);
 
 /* ---- handlers: Networking ----------------------------------------------- */
 int cmd_netinfo(int, char **);int cmd_ping(int, char **);   int cmd_trace(int, char **);
@@ -68,3 +68,4 @@ int cmd_story(int, char **);
 /* ---- handlers: Core ----------------------------------------------------- */
 int cmd_help(int, char **);   int cmd_echo(int, char **);   int cmd_clear(int, char **);
 int cmd_mem(int, char **);    int cmd_python(int, char **);
+int cmd_js(int, char **);

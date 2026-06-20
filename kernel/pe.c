@@ -160,9 +160,12 @@ int pe_run(const uint8_t *image, uint32_t size) {
     uint32_t sizeimg   = rd32(opt + 56);
     uint32_t sizehdr   = rd32(opt + 60);
     uint32_t numrva    = rd32(opt + 108);
+    uint64_t image_base = rd64(opt + 24);                 /* PE32+ ImageBase */
     uint32_t imp_rva = 0, imp_sz = 0;
     if (numrva > 1) { imp_rva = rd32(opt + 112 + 8 * 1); imp_sz = rd32(opt + 112 + 8 * 1 + 4); }
     (void)imp_sz;
+    uint32_t rel_rva = 0, rel_sz = 0;                     /* data dir 5 = base relocs */
+    if (numrva > 5) { rel_rva = rd32(opt + 112 + 8 * 5); rel_sz = rd32(opt + 112 + 8 * 5 + 4); }
     if (!sizeimg || sizeimg > 64u * 1024 * 1024) { kprintf("[pe] bad SizeOfImage\n"); return -1; }
 
     uint8_t *img = (uint8_t *)kmalloc(sizeimg);
@@ -180,6 +183,37 @@ int pe_run(const uint8_t *image, uint32_t size) {
         uint32_t rawpt = rd32(s + 20);
         if ((uint64_t)vaddr + rawsz > sizeimg || (uint64_t)rawpt + rawsz > size) continue;
         if (rawsz) memcpy(img + vaddr, image + rawpt, rawsz);
+    }
+
+    /* apply base relocations: the image is loaded at `img`, not its preferred
+     * ImageBase, so every absolute address baked into the code/data (jump tables,
+     * pointer tables like `static const char *t[]`) must be shifted by the delta.
+     * Without this, such pointers fault when dereferenced (they point at the old
+     * ImageBase). RIP-relative code needs no fixups, which is why a tiny program
+     * runs even when this is skipped -- but the compilers baked into boltrt do. */
+    int64_t delta = (int64_t)((uint64_t)(uintptr_t)img - image_base);
+    if (rel_rva && rel_sz && delta) {
+        uint32_t p = rel_rva, end = rel_rva + rel_sz;
+        while (p + 8 <= end && p + 8 <= sizeimg) {
+            uint32_t page = rd32(img + p);
+            uint32_t blk  = rd32(img + p + 4);
+            if (blk < 8) break;
+            uint32_t nent = (blk - 8) / 2;
+            for (uint32_t i = 0; i < nent; i++) {
+                uint16_t e = rd16(img + p + 8 + i * 2);
+                uint32_t type = e >> 12, off = e & 0xFFF;
+                if (type == 0) continue;                  /* ABSOLUTE: padding   */
+                uint32_t target = page + off;
+                if (type == 10) {                         /* DIR64               */
+                    if (target + 8 > sizeimg) continue;
+                    uint64_t v = rd64(img + target);
+                    v += (uint64_t)delta;
+                    memcpy(img + target, &v, 8);
+                }
+                /* PE32+ from this toolchain emits only DIR64/ABSOLUTE */
+            }
+            p += blk;
+        }
     }
 
     /* bind imports: write resolved shim pointers into the IAT (FirstThunk) */

@@ -60,6 +60,30 @@ void fs_init(void) {
         "BoltOS in-RAM filesystem.\n"
         "Files live in the kernel heap and reset on reboot.\n"
         "Create one with:  write notes.txt hello world\n", 122);
+
+    /* A JavaScript demo page: open it in the Browser (address: /home/jsdemo.html)
+     * to see the BoltJS engine read and rewrite the DOM. */
+    f = fs_create("/home/jsdemo.html", 0);
+    if (f) {
+        const char *js =
+            "<html><head><title>JS Demo</title></head><body>"
+            "<h1>BoltJS DOM Demo</h1>"
+            "<p id=\"out\">placeholder text (should be replaced)</p>"
+            "<p id=\"list\">loop result here</p>"
+            "<div id=\"calc\">calc result here</div>"
+            "<script>"
+            "document.getElementById('out').innerHTML = 'This text was set by JavaScript!';"
+            "var s=''; for(var i=1;i<=5;i++){ s += i*i + ' '; }"
+            "document.getElementById('list').textContent = 'Squares 1..5: ' + s;"
+            "function fact(n){ return n<=1 ? 1 : n*fact(n-1); }"
+            "document.getElementById('calc').innerHTML = '7! = ' + fact(7) + ', and 10! = ' + fact(10);"
+            "document.title = 'BoltJS ran on this page';"
+            "document.write('<p>This paragraph was generated at runtime by document.write().</p>');"
+            "console.log('script finished; fact(6)=' + fact(6));"
+            "</script>"
+            "</body></html>";
+        fs_write(f, js, (uint32_t)strlen(js));
+    }
 }
 
 fs_node *fs_root(void) { return root_; }
