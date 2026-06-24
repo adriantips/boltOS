@@ -34,6 +34,11 @@ Bundled apps:
 - **File Explorer** — browse/open the persistent filesystem
 - **Browser** — a layout-engine web browser (DOM + CSS cascade + box/flex/grid +
   JavaScript) over the kernel's own HTTP/HTTPS stack
+- **OldBrowser** — a **NetSurf** port: the NetSurf core architecture (nsurl,
+  content cache, handler pipeline, `browser_window` + back/forward history) with
+  its classic framebuffer-frontend toolbar (Back / Forward / Reload / Stop /
+  Home, address bar, throbber, bookmarks), rendering through the BoltOS layout
+  engine over the kernel TCP/TLS stack
 - **Code** — a multi-language IDE (C / C++ / C# / Python) with syntax
   highlighting, line numbers, a Run button and an output console
 - **Task Manager** — live process / CPU / memory view
@@ -141,6 +146,36 @@ ARP, IPv4, ICMP, UDP, TCP, DNS, HTTP, a **firewall** (`net/firewall.c`), and TLS
 (`net/*.c`). Wi-Fi association is scaffolded in the kernel but still needs a radio
 driver — see the `wifi` command. The shell also has `browse URL` (render a page as
 text) and `download URL` (save to the FS).
+
+## OldBrowser — a NetSurf port
+
+**OldBrowser** is a port of **NetSurf** — the small, fast, portable C web browser
+— onto BoltOS. NetSurf is built around a clean split between a portable *core*
+(content cache + handler pipeline + `browser_window` state machine) and
+per-platform *frontends*; OldBrowser reproduces that architecture faithfully.
+The port lives under `oldbrowser/`, with each file mapping to the NetSurf
+subsystem named in its banner:
+
+| OldBrowser file        | NetSurf module                                   |
+| ---------------------- | ------------------------------------------------ |
+| `ob_nsurl.c`           | `utils/nsurl.c` + `utils/url.c` — URL object, RFC 3986 `nsurl_join` |
+| `ob_llcache.c`         | `content/llcache.c` — fetch + redirect following, `about:` pages |
+| `ob_content.c`         | `content/content.c` + handlers — `text/html`, `text/plain`, `image/*` |
+| `ob_window.c`          | `desktop/browser_window.c` + `browser_history.c` — navigation, back/forward |
+| `ob_hotlist.c`         | `desktop/hotlist.c` — bookmarks, persisted to the filesystem |
+| `ob_fbtk.c`            | `frontends/framebuffer/fbtk` — the widget toolkit |
+| `ob_gui.c`             | `frontends/framebuffer/gui.c` — toolbar, throbber, viewport, status bar |
+
+Where NetSurf leans on **libdom** and **libcss**, this port drives BoltOS's own
+DOM tree (`kernel/dom.c`) and CSS-cascade + box/flex/grid layout engine
+(`kernel/layout.c`); where it uses **libnsgif / libnspng**, it calls the BoltOS
+image decoder (`kernel/image.c`); fetches ride the kernel **HTTP/HTTPS** stack
+(`net/http.c`). The result is the recognisable NetSurf chrome — a toolbar of
+**Back / Forward / Reload / Stop / Home**, an address bar, an animated
+**throbber** and a bookmark toggle — over a scrolling content viewport. Typed
+addresses that don't look like URLs become a web search; the `about:welcome`
+home page and `about:credits` render offline. The BoltOS window glue is
+`kernel/app_oldbrowser.c`.
 
 ## IDE & compilers (BoltCC + BoltPy)
 
@@ -258,6 +293,7 @@ build VirtualBox-friendly images.
 ```
 boot/           Custom MBR bootloader (stage1, stage2)
 doom/           Vendored doomgeneric port + in-house libc shim + BoltOS platform layer
+oldbrowser/     NetSurf port (OldBrowser): nsurl, content cache + handlers, browser_window, fbtk frontend
 drivers/        Hardware drivers (framebuffer, GPU/display, keyboard, mouse, ATA HDD/SSD, NVMe, xHCI USB, e1000, PC speaker)
 fs/             Filesystem (BoltFS: in-RAM tree, persisted via the block layer)
 include/        Kernel and system headers

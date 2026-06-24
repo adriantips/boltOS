@@ -35,7 +35,7 @@ static int g_font = FONT_ARIAL;
 #define TITLE_H    32
 #define TASKBAR_H  48
 #define RADIUS     9
-#define MAX_WIN    32
+#define MAX_WIN    40
 #define DI_W       80              /* desktop icon cell width  */
 #define DI_H       86              /* desktop icon cell height */
 #define MAX_PW     3840            /* largest panel we allocate backbuffers for */
@@ -442,6 +442,19 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         g_hline(cxx - r, cyy, 2 * r, in);                       /* equator       */
         g_hline(cxx - r + s, cyy - 3 * s, 2 * (r - s), in);     /* latitude lines*/
         g_hline(cxx - r + s, cyy + 3 * s, 2 * (r - s), in);
+        break;
+    }
+    case ICON_OLDBROWSER: {                     /* antique brass globe (NetSurf) */
+        int cxx = x + 8 * s, cyy = y + 8 * s, r = 7 * s;
+        g_round(cxx - r, cyy - r, 2 * r, 2 * r, r, 0xC8A867, 255); /* brass disc */
+        uint32_t in = 0x6B4F2A;                                  /* engraved sepia */
+        g_vline(cxx, cyy - r, 2 * r, in);                       /* meridian      */
+        g_hline(cxx - r, cyy, 2 * r, in);                       /* equator       */
+        g_hline(cxx - r + s, cyy - 3 * s, 2 * (r - s), in);     /* latitudes     */
+        g_hline(cxx - r + s, cyy + 3 * s, 2 * (r - s), in);
+        g_vline(cxx - 3 * s, cyy - r + 2 * s, 2 * r - 4 * s, in); /* meridians   */
+        g_vline(cxx + 3 * s, cyy - r + 2 * s, 2 * r - 4 * s, in);
+        (void)c;
         break;
     }
     case ICON_FOLDER: {                         /* manila folder (Windows-ish) */
@@ -1529,6 +1542,7 @@ void gui_run(void) {
     terminal_app_init();
     files_app_init();
     browser_app_init();
+    oldbrowser_app_init();
     ide_app_init();
     taskmgr_app_init();
     calc_app_init();
