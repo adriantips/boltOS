@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "ata.h"
+#include "blk.h"
 #include "io.h"
 #include "string.h"
 #include "kprintf.h"
@@ -130,6 +131,8 @@ static int probe_one(uint16_t io, uint16_t ctrl, uint8_t slave, ata_dev *out) {
     return 1;
 }
 
+static void ata_blk_register(ata_dev *d, int idx);
+
 void ata_init(void) {
     if (g_inited) return;
     g_inited = 1;
@@ -149,7 +152,32 @@ void ata_init(void) {
         kprintf("     [%d] %s  %luMiB  %s%s\n", i,
                 ata_media(d), (unsigned long)mb, d->lba48 ? "lba48 " : "lba28 ",
                 d->model[0] ? d->model : "(disk)");
+        ata_blk_register(d, i);
     }
+}
+
+/* --- block-layer integration --------------------------------------------- */
+static int ata_blk_read(blkdev_t *b, uint64_t lba, uint32_t count, void *buf) {
+    return ata_read((ata_dev *)b->drv, lba, count, buf);
+}
+static int ata_blk_write(blkdev_t *b, uint64_t lba, uint32_t count, const void *buf) {
+    return ata_write((ata_dev *)b->drv, lba, count, buf);
+}
+static void ata_blk_register(ata_dev *d, int idx) {
+    blkdev_t b;
+    memset(&b, 0, sizeof b);
+    b.sectors     = d->sectors;
+    b.sector_size = ATA_SECTOR;
+    b.is_ssd      = d->is_ssd;
+    /* primary master (0x1F0, master) is the boot image disk */
+    b.is_boot     = (d->io_base == 0x1F0 && d->slave == 0);
+    b.drv         = d;
+    b.read        = ata_blk_read;
+    b.write       = ata_blk_write;
+    b.name[0] = 'a'; b.name[1] = 't'; b.name[2] = 'a';
+    b.name[3] = (char)('0' + idx); b.name[4] = 0;
+    strncpy(b.model, d->model[0] ? d->model : "ATA disk", sizeof b.model - 1);
+    blk_register(&b);
 }
 
 int      ata_count(void)        { return g_count; }

@@ -219,6 +219,44 @@ static int hexval(char c) {
     return -1;
 }
 
+static int iabs(int x) { return x < 0 ? -x : x; }
+static int clamp255(int x) { return x < 0 ? 0 : x > 255 ? 255 : x; }
+
+/* HSL (h:deg, s/l:percent) -> 8-bit RGB, integer math only (no FPU). */
+static void hsl_to_rgb(int h, int s, int l, int *R, int *G, int *B) {
+    h = ((h % 360) + 360) % 360;
+    if (s < 0) s = 0; if (s > 100) s = 100;
+    if (l < 0) l = 0; if (l > 100) l = 100;
+    int c = (255 * (100 - iabs(2*l - 100)) * s) / 10000;     /* chroma 0..255 */
+    int x = c * (60 - iabs((h % 120) - 60)) / 60;
+    int m = 255 * l / 100 - c / 2;
+    int r, g, b;
+    if      (h <  60) { r = c; g = x; b = 0; }
+    else if (h < 120) { r = x; g = c; b = 0; }
+    else if (h < 180) { r = 0; g = c; b = x; }
+    else if (h < 240) { r = 0; g = x; b = c; }
+    else if (h < 300) { r = x; g = 0; b = c; }
+    else              { r = c; g = 0; b = x; }
+    *R = clamp255(r + m); *G = clamp255(g + m); *B = clamp255(b + m);
+}
+
+/* read an int; supports trailing '%' (scaled 0..100 -> 0..255 when pct!=0). p
+ * advanced past the number. */
+static int read_num(const char **pp, int as_pct_of_255) {
+    const char *p = *pp;
+    while (*p == ' ' || *p == ',' || *p == '\t') p++;
+    int neg = 0; if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
+    int v = 0, any = 0;
+    while (*p >= '0' && *p <= '9') { v = v*10 + (*p - '0'); p++; any = 1; }
+    if (*p == '.') { p++; while (*p >= '0' && *p <= '9') p++; }   /* drop fraction */
+    int pct = 0; if (*p == '%') { pct = 1; p++; }
+    *pp = p;
+    if (!any) return -1;
+    if (neg) v = -v;
+    if (pct && as_pct_of_255) v = v * 255 / 100;
+    return v;
+}
+
 /* parse a CSS/HTML colour token -> 0x1RRGGBB (set bit) or HCOL_NONE */
 static uint32_t parse_color_token(const char *v) {
     while (*v == ' ') v++;
@@ -233,14 +271,51 @@ static uint32_t parse_color_token(const char *v) {
                                        | (uint32_t)(hexval(h[2])*17);
         return HCOL_NONE;
     }
+    /* functional notation: rgb()/rgba()/hsl()/hsla(), space- or comma-separated */
+    if ((lc(v[0])=='r'&&lc(v[1])=='g'&&lc(v[2])=='b') ||
+        (lc(v[0])=='h'&&lc(v[1])=='s'&&lc(v[2])=='l')) {
+        int is_hsl = lc(v[0]) == 'h';
+        const char *p = v + 3;
+        if (lc(*p) == 'a') p++;            /* rgba/hsla */
+        while (*p == ' ') p++;
+        if (*p != '(') return HCOL_NONE;
+        p++;
+        if (is_hsl) {
+            int h = read_num(&p, 0);       /* hue: degrees */
+            int s = read_num(&p, 0);       /* % */
+            int l = read_num(&p, 0);       /* % */
+            if (h < 0 && s < 0) return HCOL_NONE;
+            int R, G, B; hsl_to_rgb(h < 0 ? 0 : h, s, l, &R, &G, &B);
+            return 0x1000000u | ((uint32_t)R<<16) | ((uint32_t)G<<8) | (uint32_t)B;
+        } else {
+            int r = read_num(&p, 1), g = read_num(&p, 1), b = read_num(&p, 1);
+            if (r < 0 || g < 0 || b < 0) return HCOL_NONE;
+            return 0x1000000u | ((uint32_t)clamp255(r)<<16)
+                              | ((uint32_t)clamp255(g)<<8) | (uint32_t)clamp255(b);
+        }
+    }
+    char low[20]; uint32_t i = 0; while (v[i] && v[i] != ' ' && v[i] != ';' && i < sizeof(low)-1) { low[i] = lc(v[i]); i++; } low[i] = 0;
+    if (strcmp(low,"transparent")==0 || strcmp(low,"none")==0 || strcmp(low,"inherit")==0 ||
+        strcmp(low,"initial")==0 || strcmp(low,"currentcolor")==0) return HCOL_NONE;
     struct { const char *n; uint32_t c; } named[] = {
-        {"black",0x000000},{"white",0xFFFFFF},{"red",0xE04040},{"green",0x40C040},
-        {"blue",0x5070E0},{"yellow",0xE0E040},{"orange",0xE0A040},{"purple",0xA060E0},
-        {"gray",0x909090},{"grey",0x909090},{"silver",0xC0C0C0},{"navy",0x303080},
-        {"teal",0x40A0A0},{"maroon",0x903030},{"lime",0x60E060},{"cyan",0x40D0E0},
-        {"magenta",0xE040E0},{"pink",0xE090B0},{"gold",0xE0C040},{"brown",0xA07040},
+        {"black",0x000000},{"white",0xFFFFFF},{"red",0xE04040},{"green",0x008000},
+        {"blue",0x5070E0},{"yellow",0xE0E040},{"orange",0xE0A040},{"purple",0x800080},
+        {"gray",0x808080},{"grey",0x808080},{"silver",0xC0C0C0},{"navy",0x000080},
+        {"teal",0x008080},{"maroon",0x800000},{"lime",0x00FF00},{"cyan",0x40D0E0},
+        {"aqua",0x00FFFF},{"fuchsia",0xFF00FF},{"olive",0x808000},
+        {"magenta",0xE040E0},{"pink",0xFFC0CB},{"gold",0xFFD700},{"brown",0xA07040},
+        {"indigo",0x4B0082},{"violet",0xEE82EE},{"crimson",0xDC143C},{"coral",0xFF7F50},
+        {"salmon",0xFA8072},{"khaki",0xF0E68C},{"orchid",0xDA70D6},{"plum",0xDDA0DD},
+        {"tan",0xD2B48C},{"beige",0xF5F5DC},{"ivory",0xFFFFF0},{"azure",0xF0FFFF},
+        {"lavender",0xE6E6FA},{"turquoise",0x40E0D0},{"tomato",0xFF6347},{"chocolate",0xD2691E},
+        {"darkblue",0x00008B},{"darkgreen",0x006400},{"darkred",0x8B0000},{"darkgray",0xA9A9A9},
+        {"darkgrey",0xA9A9A9},{"lightgray",0xD3D3D3},{"lightgrey",0xD3D3D3},{"lightblue",0xADD8E6},
+        {"lightgreen",0x90EE90},{"steelblue",0x4682B4},{"royalblue",0x4169E1},{"skyblue",0x87CEEB},
+        {"dodgerblue",0x1E90FF},{"cornflowerblue",0x6495ED},{"slategray",0x708090},{"slategrey",0x708090},
+        {"dimgray",0x696969},{"dimgrey",0x696969},{"gainsboro",0xDCDCDC},{"whitesmoke",0xF5F5F5},
+        {"firebrick",0xB22222},{"forestgreen",0x228B22},{"seagreen",0x2E8B57},{"goldenrod",0xDAA520},
+        {"hotpink",0xFF69B4},{"deeppink",0xFF1493},{"midnightblue",0x191970},{"rebeccapurple",0x663399},
     };
-    char low[16]; uint32_t i = 0; while (v[i] && i < sizeof(low)-1) { low[i] = lc(v[i]); i++; } low[i] = 0;
     for (uint32_t k = 0; k < sizeof(named)/sizeof(named[0]); k++)
         if (strcmp(low, named[k].n) == 0) return 0x1000000u | named[k].c;
     return HCOL_NONE;
@@ -279,6 +354,7 @@ typedef struct {
     int8_t   bold;      /* -1 unset, else 0/1                           */
     int8_t   italic;    /* -1 unset, else 0/1                           */
     uint8_t  hidden;    /* display:none / visibility:hidden             */
+    uint8_t  fscale;    /* font-size scale 1..3, 0 unset                */
 } css_rule;
 
 static int streqi(const char *a, const char *b) {
@@ -302,9 +378,30 @@ static int cls_has(const char *cls, const char *name) {
     return 0;
 }
 
+/* CSS font-size token -> text scale 1..3 (0 = leave unset). Integer only;
+ * px/pt treated as px, em/rem/% relative to a 16px base, keywords mapped. */
+static uint8_t css_fontsize_scale(const char *v) {
+    while (*v == ' ') v++;
+    if ((*v >= '0' && *v <= '9') || *v == '.') {
+        int num = 0, any = 0; const char *p = v;
+        while (*p >= '0' && *p <= '9') { num = num*10 + (*p - '0'); p++; any = 1; }
+        if (*p == '.') { p++; while (*p >= '0' && *p <= '9') p++; }   /* drop fraction */
+        if (!any && *v != '.') return 0;
+        if (*p == '%')                              return num >= 200 ? 3 : num >= 125 ? 2 : 1;
+        if ((p[0]|32) == 'e' && (p[1]|32) == 'm')   return num >= 2   ? 3 : num >= 1   ? 2 : 1;
+        return num >= 30 ? 3 : num >= 19 ? 2 : 1;   /* px / pt / unitless */
+    }
+    char a = v[0]|32;
+    if (a == 'x') return 3;                          /* x-large / xx-large */
+    if (a == 'l') return 2;                          /* large / larger */
+    if (a == 's' || a == 'm') return 1;              /* small / smaller / medium */
+    return 0;
+}
+
 /* apply a `prop:val; prop:val` declaration list onto the field set */
 static void css_decl_apply(const char *d, uint32_t n, uint32_t *color, uint8_t *align,
-                           int8_t *bold, int8_t *italic, uint8_t *hidden, uint32_t *bg) {
+                           int8_t *bold, int8_t *italic, uint8_t *hidden, uint32_t *bg,
+                           uint8_t *fscale) {
     uint32_t i = 0;
     while (i < n) {
         while (i < n && (d[i]==';'||d[i]==' '||d[i]=='\t'||d[i]=='\n'||d[i]=='\r')) i++;
@@ -325,6 +422,7 @@ static void css_decl_apply(const char *d, uint32_t n, uint32_t *color, uint8_t *
         else if (strcmp(prop,"text-align")==0)  { char a = lc(v[0]); *align = a=='c'?HALIGN_CENTER : a=='r'?HALIGN_RIGHT : HALIGN_LEFT; }
         else if (strcmp(prop,"font-weight")==0) { *bold   = (lc(v[0])=='b' || (v[0]>='6'&&v[0]<='9')) ? 1 : 0; }
         else if (strcmp(prop,"font-style")==0)  { *italic = (lc(v[0])=='i' || lc(v[0])=='o') ? 1 : 0; }
+        else if (strcmp(prop,"font-size")==0)   { if (fscale) { uint8_t s = css_fontsize_scale(v); if (s) *fscale = s; } }
         else if (strcmp(prop,"display")==0)     { if (lc(v[0])=='n') *hidden = 1; }
         else if (strcmp(prop,"visibility")==0)  { if (lc(v[0])=='h') *hidden = 1; }
     }
@@ -372,9 +470,9 @@ static void parse_css(css_rule *rules, int *nr, const char *src, uint32_t len) {
         uint32_t b1 = i; if (i < len) i++;
 
         uint32_t color = HCOL_NONE, bg = HCOL_NONE; uint8_t align = ALIGN_UNSET;
-        int8_t bold = -1, italic = -1; uint8_t hidden = 0;
-        css_decl_apply(src + b0, b1 - b0, &color, &align, &bold, &italic, &hidden, &bg);
-        if (color==HCOL_NONE && bg==HCOL_NONE && align==ALIGN_UNSET && bold<0 && italic<0 && !hidden) continue;
+        int8_t bold = -1, italic = -1; uint8_t hidden = 0, fscale = 0;
+        css_decl_apply(src + b0, b1 - b0, &color, &align, &bold, &italic, &hidden, &bg, &fscale);
+        if (color==HCOL_NONE && bg==HCOL_NONE && align==ALIGN_UNSET && bold<0 && italic<0 && !hidden && !fscale) continue;
 
         uint32_t p = s0;
         while (p < s1 && *nr < CSS_MAX) {
@@ -385,7 +483,7 @@ static void parse_css(css_rule *rules, int *nr, const char *src, uint32_t len) {
                 css_rule *r = &rules[(*nr)++];
                 cpy(r->sel, sel, sizeof(r->sel));
                 r->kind = kind; r->color = color; r->bg = bg; r->align = align;
-                r->bold = bold; r->italic = italic; r->hidden = hidden;
+                r->bold = bold; r->italic = italic; r->hidden = hidden; r->fscale = fscale;
             }
             p = q + 1;
         }
@@ -396,7 +494,8 @@ static void parse_css(css_rule *rules, int *nr, const char *src, uint32_t len) {
  * in tag < class < id specificity order */
 static void css_match(const css_rule *rules, int n, const char *tag, const char *cls,
                       const char *id, uint32_t *color, uint8_t *align,
-                      int8_t *bold, int8_t *italic, uint8_t *hidden, uint32_t *bg) {
+                      int8_t *bold, int8_t *italic, uint8_t *hidden, uint32_t *bg,
+                      uint8_t *fscale) {
     static const uint8_t order[4] = { 3, 0, 1, 2 };
     for (int pass = 0; pass < 4; pass++) {
         uint8_t want = order[pass];
@@ -413,6 +512,7 @@ static void css_match(const css_rule *rules, int n, const char *tag, const char 
             if (rules[k].bold   >= 0)         *bold   = rules[k].bold;
             if (rules[k].italic >= 0)         *italic = rules[k].italic;
             if (rules[k].hidden)              *hidden = 1;
+            if (rules[k].fscale && fscale)    *fscale = rules[k].fscale;
         }
     }
 }
@@ -426,7 +526,7 @@ static uint8_t tag_align(const char *tag) {
     }
     if (get_attr(tag, "style", val, sizeof(val))) {
         uint32_t c = HCOL_NONE, bg = HCOL_NONE; uint8_t al = ALIGN_UNSET; int8_t b=-1,it=-1; uint8_t h=0;
-        css_decl_apply(val, (uint32_t)strlen(val), &c, &al, &b, &it, &h, &bg);
+        css_decl_apply(val, (uint32_t)strlen(val), &c, &al, &b, &it, &h, &bg, 0);
         return al;
     }
     return ALIGN_UNSET;
@@ -441,12 +541,14 @@ static html_doc *doc_alloc(uint32_t len) {
     d->hrefs_cap = (int)(len / 40 + 32); if (d->hrefs_cap > 4000) d->hrefs_cap = 4000;
     d->imgs_cap  = (int)(len / 80 + 16); if (d->imgs_cap > 1024) d->imgs_cap = 1024;
     d->scripts_cap = 16;
+    d->csslinks_cap = 32;
     d->arena = (char *)kmalloc(d->arena_cap);
     d->runs  = (html_run *)kmalloc((uint32_t)d->runs_cap * sizeof(html_run));
     d->hrefs = (char **)kmalloc((uint32_t)d->hrefs_cap * sizeof(char *));
     d->imgs  = (char **)kmalloc((uint32_t)d->imgs_cap * sizeof(char *));
     d->scripts = (char **)kmalloc((uint32_t)d->scripts_cap * sizeof(char *));
-    if (!d->arena || !d->runs || !d->hrefs || !d->imgs || !d->scripts) { html_free(d); return 0; }
+    d->csslinks = (char **)kmalloc((uint32_t)d->csslinks_cap * sizeof(char *));
+    if (!d->arena || !d->runs || !d->hrefs || !d->imgs || !d->scripts || !d->csslinks) { html_free(d); return 0; }
     return d;
 }
 
@@ -458,7 +560,7 @@ static int is_void_tag(const char *name) {
            strcmp(name,"wbr")==0 || strcmp(name,"source")==0 || strcmp(name,"embed")==0;
 }
 
-html_doc *html_parse(const char *src, uint32_t len) {
+static html_doc *html_parse_impl(const char *src, uint32_t len, const char *xcss, uint32_t xcsslen) {
     html_doc *d = doc_alloc(len);
     if (!d) return 0;
 
@@ -475,9 +577,10 @@ html_doc *html_parse(const char *src, uint32_t len) {
     /* <style> rules collected up front, applied per opening tag */
     css_rule *rules = (css_rule *)kmalloc(sizeof(css_rule) * CSS_MAX);
     int nrules = 0;
+    if (rules && xcss && xcsslen) parse_css(rules, &nrules, xcss, xcsslen);
 
     /* format stack: open colour/align/css tags push a frame, popped on close */
-    struct { char name[12]; uint32_t color; uint32_t bg; uint8_t align; int8_t bold, italic; uint8_t hidden; } fst[FSTACK_MAX];
+    struct { char name[12]; uint32_t color; uint32_t bg; uint8_t align; int8_t bold, italic; uint8_t hidden; uint8_t fscale; } fst[FSTACK_MAX];
     int fdepth = 0;
 
     /* id stack: tracks the innermost element id so runs can be tagged for
@@ -492,6 +595,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
     #define CUR_BOLD   (fdepth && fst[fdepth-1].bold   > 0)
     #define CUR_ITALIC (fdepth && fst[fdepth-1].italic > 0)
     #define CUR_HIDDEN (fdepth ? fst[fdepth-1].hidden : 0)
+    #define CUR_FSCALE (fdepth ? fst[fdepth-1].fscale : 0)
     #define CUR_INDENT ((uint8_t)((list_depth + bq_depth) > 12 ? 12 : (list_depth + bq_depth)))
 
     #define EFF_STYLE() (pre ? HSTYLE_PRE : heading == 1 ? HSTYLE_H1 : heading == 2 ? HSTYLE_H2 \
@@ -499,7 +603,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                         : (italic || CUR_ITALIC) ? HSTYLE_ITALIC : (bold || CUR_BOLD) ? HSTYLE_BOLD : HSTYLE_NORMAL)
 
     #define FLUSH() do { if (seglen) { push_full(d, seg, seglen, style, link, (uint8_t)pending_brk, \
-                                CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG, 0); seglen = 0; pending_brk = 0; } } while (0)
+                                CUR_COLOR, CUR_ALIGN, CUR_INDENT, CUR_BG, CUR_FSCALE); seglen = 0; pending_brk = 0; } } while (0)
 
     for (uint32_t i = 0; i < len; ) {
         char c = src[i];
@@ -540,12 +644,12 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 char cls[96]; cls[0] = 0; get_attr(tag, "class", cls, sizeof(cls));
                 char idv[64]; idv[0] = 0; get_attr(tag, "id",    idv, sizeof(idv));
                 uint32_t col = HCOL_NONE, bgc = HCOL_NONE; uint8_t al = ALIGN_UNSET;
-                int8_t cb = -1, ci = -1; uint8_t hid = 0;
-                if (rules) css_match(rules, nrules, name, cls, idv, &col, &al, &cb, &ci, &hid, &bgc);
+                int8_t cb = -1, ci = -1; uint8_t hid = 0, fsz = 0;
+                if (rules) css_match(rules, nrules, name, cls, idv, &col, &al, &cb, &ci, &hid, &bgc, &fsz);
                 /* inline style / presentational attrs override the rule set */
                 char sv[160];
                 if (get_attr(tag, "style", sv, sizeof(sv)))
-                    css_decl_apply(sv, (uint32_t)strlen(sv), &col, &al, &cb, &ci, &hid, &bgc);
+                    css_decl_apply(sv, (uint32_t)strlen(sv), &col, &al, &cb, &ci, &hid, &bgc, &fsz);
                 { uint32_t ic = tag_color(tag); if (ic != HCOL_NONE) col = ic; }
                 { char bgv[40]; if (get_attr(tag, "bgcolor", bgv, sizeof(bgv))) { uint32_t bc = parse_color_token(bgv); if (bc) bgc = bc; } }
                 if (strcmp(name,"body")==0 || strcmp(name,"html")==0) {     /* page-level defaults */
@@ -554,7 +658,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                 }
                 { uint8_t ia = tag_align(tag); if (ia != ALIGN_UNSET) al = ia; }
                 if (strcmp(name,"center")==0 && al == ALIGN_UNSET) al = HALIGN_CENTER;
-                int has = (col!=HCOL_NONE) || (bgc!=HCOL_NONE) || (al!=ALIGN_UNSET) || (cb>=0) || (ci>=0) || hid;
+                int has = (col!=HCOL_NONE) || (bgc!=HCOL_NONE) || (al!=ALIGN_UNSET) || (cb>=0) || (ci>=0) || hid || fsz;
                 int is_fmt = has || strcmp(name,"center")==0 || strcmp(name,"font")==0 || strcmp(name,"span")==0;
                 if (is_fmt && fdepth < FSTACK_MAX) {
                     FLUSH();                       /* preceding text is the parent's */
@@ -564,6 +668,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                     fst[fdepth].bold   = (cb >= 0) ? cb : (fdepth ? fst[fdepth-1].bold   : -1);
                     fst[fdepth].italic = (ci >= 0) ? ci : (fdepth ? fst[fdepth-1].italic : -1);
                     fst[fdepth].hidden = hid ? 1 : (uint8_t)CUR_HIDDEN;
+                    fst[fdepth].fscale = fsz ? fsz : (uint8_t)CUR_FSCALE;
                     uint32_t k = 0; while (name[k] && k < 11) { fst[fdepth].name[k] = name[k]; k++; } fst[fdepth].name[k] = 0;
                     fdepth++; fchanged = 1;
                 }
@@ -605,6 +710,20 @@ html_doc *html_parse(const char *src, uint32_t len) {
                     }
                     parse_css(rules, &nrules, src + s0, i - s0);
                     while (i < len && src[i] != '>') i++; if (i < len) i++;
+                }
+                continue;
+            }
+            if (strcmp(name, "link") == 0) {
+                /* collect <link rel="stylesheet" href="..."> for external CSS */
+                char rel[32]; rel[0] = 0; get_attr(tag, "rel", rel, sizeof(rel));
+                int is_css = 0;
+                for (char *p = rel; *p; p++)            /* "stylesheet" substring, case-insensitive */
+                    if (lc(p[0])=='s'&&lc(p[1])=='t'&&lc(p[2])=='y'&&lc(p[3])=='l'&&lc(p[4])=='e') { is_css = 1; break; }
+                if (is_css && d->ncsslinks < d->csslinks_cap) {
+                    char href[256]; href[0] = 0; get_attr(tag, "href", href, sizeof(href));
+                    if (href[0]) { decode_url_entities(href);
+                        char *h = arena_push(d, href, (uint32_t)strlen(href));
+                        if (h) d->csslinks[d->ncsslinks++] = h; }
                 }
                 continue;
             }
@@ -731,7 +850,7 @@ html_doc *html_parse(const char *src, uint32_t len) {
                         r->text = at ? at : s; r->style = HSTYLE_NORMAL; r->link = link;
                         r->brk = (uint8_t)pending_brk; r->kind = HRUN_IMG; r->align = CUR_ALIGN;
                         r->indent = CUR_INDENT; r->color = CUR_COLOR; r->bg = CUR_BG; r->img = d->nimgs;
-                        r->iw = iw; r->ih = ih; r->pix = 0; r->name = 0;
+                        r->iw = iw; r->ih = ih; r->pix = 0; r->name = 0; r->fscale = 0;
                         d->nimgs++; pending_brk = 0;
                     }
                 }
@@ -839,6 +958,13 @@ html_doc *html_parse(const char *src, uint32_t len) {
     return d;
 }
 
+html_doc *html_parse(const char *src, uint32_t len) {
+    return html_parse_impl(src, len, 0, 0);
+}
+html_doc *html_parse_ext(const char *src, uint32_t len, const char *css, uint32_t csslen) {
+    return html_parse_impl(src, len, css, csslen);
+}
+
 html_doc *html_parse_text(const char *src, uint32_t len) {
     html_doc *d = doc_alloc(len);
     if (!d) return 0;
@@ -863,5 +989,6 @@ void html_free(html_doc *d) {
     if (d->hrefs) kfree(d->hrefs);
     if (d->imgs)  kfree(d->imgs);
     if (d->scripts) { for (int i = 0; i < d->nscripts; i++) if (d->scripts[i]) kfree(d->scripts[i]); kfree(d->scripts); }
+    if (d->csslinks) kfree(d->csslinks);   /* entries are arena ptrs, freed with arena */
     kfree(d);
 }

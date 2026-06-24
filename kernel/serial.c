@@ -16,4 +16,5 @@ void serial_init(void) {
 void serial_putc(char c) {
     while (!(inb(COM1 + 5) & 0x20)) { }
     outb(COM1, (uint8_t)c);
+    outb(0xE9, (uint8_t)c);
 }

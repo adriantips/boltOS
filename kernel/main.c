@@ -25,6 +25,9 @@
 #include "mouse.h"
 #include "fs.h"
 #include "ata.h"
+#include "blk.h"
+#include "nvme.h"
+#include "xhci.h"
 #include "sysreg.h"
 #include "sched.h"
 #include "shell.h"
@@ -97,7 +100,7 @@ void kmain(struct bootinfo *bi) {
 
     pmm_init(bi);
     vmm_init();   kprintf("[ok] VMM online (kernel PML4 @0x%lx)\n", vmm_kernel_pml4());
-    kheap_init(); kprintf("[ok] kernel heap online (16 MiB @ 16 MiB)\n");
+    kheap_init(); kprintf("[ok] kernel heap online (96 MiB @ 16 MiB)\n");
 
     /* VMM self-test: map a fresh user page in a scratch address space and read
      * the translation back, then tear it down. */
@@ -120,6 +123,8 @@ void kmain(struct bootinfo *bi) {
     kprintf("[ok] interrupts enabled\n");
 
     ata_init();      /* probe ATA disks (HDD/SSD) before the FS attaches */
+    nvme_init();     /* probe NVMe; registers its namespace into the block layer */
+    xhci_init();     /* probe xHCI USB controller, enumerate attached devices */
     fs_init();       kprintf("[ok] ramfs mounted (/)\n");
     fs_persist_init();/* back the tree with a real disk + load saved image */
     vfs_init();      kprintf("[ok] VFS (ramfs + /dev + /proc)\n");

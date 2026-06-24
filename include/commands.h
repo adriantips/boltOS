@@ -57,7 +57,8 @@ int cmd_monitor(int, char **); int cmd_winrun(int, char **); int cmd_compile(int
 int cmd_netinfo(int, char **);int cmd_ping(int, char **);   int cmd_trace(int, char **);
 int cmd_ports(int, char **);  int cmd_download(int, char **);int cmd_upload(int, char **);
 int cmd_wifi(int, char **);   int cmd_firewall(int, char **);int cmd_share(int, char **);
-int cmd_scan(int, char **);   int cmd_browse(int, char **);
+int cmd_scan(int, char **);   int cmd_browse(int, char **); int cmd_domq(int, char **);
+int cmd_domlayout(int, char **);
 
 /* ---- handlers: Bonus / Unique ------------------------------------------- */
 int cmd_focus(int, char **);  int cmd_snapshot(int, char **);int cmd_timeline(int, char **);

@@ -13,6 +13,7 @@
 #include "string.h"
 #include "kheap.h"
 #include "fs.h"
+#include "http.h"
 
 static void cli_log(void *ud, const char *m) { (void)ud; kprintf("%s\n", m); }
 static js_dom_node cli_byid(void *ud, const char *id) { (void)ud; (void)id; return 0; }
@@ -22,9 +23,20 @@ static int  cli_getinner(void *ud, js_dom_node n, char *o, uint32_t c) { (void)u
 static void cli_settext(void *ud, js_dom_node n, const char *t) { (void)ud; (void)n; (void)t; }
 static void cli_write(void *ud, const char *h) { (void)ud; kprintf("%s", h); }
 static void cli_title(void *ud, const char *t) { (void)ud; (void)t; }
+/* fetch(): one-shot HTTP GET so shell scripts can do fetch().then(...) too */
+static int cli_fetch(void *ud, const char *url, char *out, uint32_t cap, int *status) {
+    (void)ud; if(cap)out[0]=0; int code=0; char loc[256];
+    int n = http_get(url, out, cap, &code, loc, sizeof loc);
+    if(status)*status=code;
+    return n;
+}
 
 static js_host cli_host = {
-    0, cli_byid, cli_bytag, cli_setinner, cli_getinner, cli_settext, cli_write, cli_title, cli_log
+    0, cli_byid, cli_bytag, cli_setinner, cli_getinner, cli_settext, cli_write, cli_title, cli_log,
+    0, 0, 0, 0, 0,    /* query/createElement/append/set+get attr: no DOM in the shell */
+    0, 0, 0,          /* localStorage */
+    0, 0,             /* document.cookie */
+    cli_fetch         /* fetch() */
 };
 
 static int run_src(const char *src, uint32_t len) {

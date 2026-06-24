@@ -174,6 +174,87 @@ static void limbs_to_be(uint8_t out[32], const uint32_t in[8]) {
     }
 }
 
+/* --------------------------- mod-n arithmetic -------------------------- */
+/* The group order n is prime; used for ECDSA verification. Reduction is the
+ * same obviously-correct binary long division as f_mul, but modulo N. */
+static void n_reduce(uint32_t r[8], const uint32_t prod[16]) {
+    uint32_t rem[8]; for (int i = 0; i < 8; i++) rem[i] = 0;
+    for (int bit = 511; bit >= 0; bit--) {
+        uint32_t carry = (prod[bit >> 5] >> (bit & 31)) & 1;
+        for (int i = 0; i < 8; i++) { uint32_t nc = rem[i] >> 31; rem[i] = (rem[i] << 1) | carry; carry = nc; }
+        if (carry || bn_cmp(rem, N) >= 0) bn_sub(rem, rem, N);
+    }
+    for (int i = 0; i < 8; i++) r[i] = rem[i];
+}
+static void n_mul(uint32_t *r, const uint32_t *a, const uint32_t *b) {
+    uint32_t prod[16]; for (int i = 0; i < 16; i++) prod[i] = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 8; j++) {
+            uint64_t t = (uint64_t)a[i] * b[j] + prod[i + j] + carry;
+            prod[i + j] = (uint32_t)t; carry = t >> 32;
+        }
+        prod[i + 8] += (uint32_t)carry;
+    }
+    n_reduce(r, prod);
+}
+static void n_mod(uint32_t r[8], const uint32_t a[8]) {       /* a already < 2^256 */
+    uint32_t prod[16]; for (int i = 0; i < 16; i++) prod[i] = (i < 8) ? a[i] : 0;
+    n_reduce(r, prod);
+}
+/* r = a^-1 mod n via Fermat (a^(n-2)) */
+static void n_inv(uint32_t *r, const uint32_t *a) {
+    uint32_t e[8]; bn_sub(e, N, (const uint32_t[8]){2,0,0,0,0,0,0,0});
+    uint32_t res[8]; f_set(res, 1);
+    uint32_t base[8]; for (int i = 0; i < 8; i++) base[i] = a[i];
+    for (int bit = 0; bit < 256; bit++) {
+        if ((e[bit >> 5] >> (bit & 31)) & 1) n_mul(res, res, base);
+        n_mul(base, base, base);
+    }
+    for (int i = 0; i < 8; i++) r[i] = res[i];
+}
+
+/* ECDSA verify over P-256. pub = 0x04||X||Y (65 bytes); hash is the message
+ * digest (leftmost 32 bytes used); r,s are 32-byte big-endian. Returns 0 if the
+ * signature is valid, -1 otherwise. */
+int p256_ecdsa_verify(const uint8_t *hash, uint32_t hlen,
+                      const uint8_t pub[65], const uint8_t r[32], const uint8_t s[32]) {
+    if (pub[0] != 0x04) return -1;
+    uint32_t rr[8], ss[8];
+    be_to_limbs(rr, r); be_to_limbs(ss, s);
+    if (bn_is_zero(rr) || bn_is_zero(ss) || bn_cmp(rr, N) >= 0 || bn_cmp(ss, N) >= 0) return -1;
+
+    /* z = leftmost min(hlen,32) bytes of the hash, big-endian, reduced mod n */
+    uint8_t zb[32]; for (int i = 0; i < 32; i++) zb[i] = 0;
+    uint32_t n = hlen < 32 ? hlen : 32;
+    memcpy(zb, hash, n);                  /* take the leftmost bytes */
+    uint32_t z[8]; be_to_limbs(z, zb); n_mod(z, z);
+
+    uint32_t w[8]; n_inv(w, ss);
+    uint32_t u1[8], u2[8]; n_mul(u1, z, w); n_mul(u2, rr, w);
+
+    uint8_t u1b[32], u2b[32]; limbs_to_be(u1b, u1); limbs_to_be(u2b, u2);
+    uint32_t qx[8], qy[8]; be_to_limbs(qx, pub + 1); be_to_limbs(qy, pub + 33);
+
+    /* P = u1*G + u2*Q */
+    uint32_t p1x[8], p1y[8], p2x[8], p2y[8];
+    int inf1 = scalar_mul(p1x, p1y, u1b, GX, GY);   /* 0 ok, -1 = infinity */
+    int inf2 = scalar_mul(p2x, p2y, u2b, qx, qy);
+    uint32_t Rx[8];
+    if (inf1 != 0 && inf2 != 0) return -1;
+    else if (inf1 != 0) { for (int i = 0; i < 8; i++) Rx[i] = p2x[i]; }
+    else if (inf2 != 0) { for (int i = 0; i < 8; i++) Rx[i] = p1x[i]; }
+    else {
+        jpt J; f_cpy(J.X, p1x); f_cpy(J.Y, p1y); f_set(J.Z, 1);
+        jpt R; j_add_affine(&R, &J, p2x, p2y);
+        if (j_is_inf(&R)) return -1;
+        uint32_t zi[8], zi2[8]; f_inv(zi, R.Z); f_sqr(zi2, zi);
+        f_mul(Rx, R.X, zi2);                          /* affine x */
+    }
+    n_mod(Rx, Rx);                                    /* x mod n */
+    return bn_cmp(Rx, rr) == 0 ? 0 : -1;
+}
+
 /* ------------------------------ public API ----------------------------- */
 /* priv must be a valid scalar in [1, n-1]; the caller supplies randomness and
  * we clamp it into range. pub is the uncompressed point 0x04||X||Y (65 bytes). */

@@ -51,7 +51,7 @@ if errorlevel 1 (
 )
 
 echo [*] Configuring %VMNAME%...
-%VBOX% modifyvm %VMNAME% --memory 512 --cpus 4 --pae on --longmode on --ioapic on --chipset piix3 --firmware bios --hwvirtex on --nestedpaging on --vram 128 --graphicscontroller vboxvga --boot1 disk --boot2 dvd
+%VBOX% modifyvm %VMNAME% --memory 512 --cpus 4 --pae on --longmode on --ioapic on --chipset piix3 --firmware bios --hwvirtex off --nestedpaging off --vram 128 --graphicscontroller vboxvga --boot1 disk --boot2 dvd --triple-fault-reset on
 if errorlevel 1 (
     echo ERROR: Failed to configure VM
     exit /b 1
@@ -69,7 +69,7 @@ set VDI=%ROOT%iso\boltos.vdi
 if exist "%VDI%" del "%VDI%"
 set PADDED=%ROOT%iso\os_padded.img
 copy "%ROOT%iso\os.img" "%PADDED%" >nul
-powershell -Command "$f=[System.IO.File]::Open('%PADDED%', [System.IO.FileMode]::Open); $f.SetLength(1048576); $f.Close()" >nul
+powershell -Command "$f=[System.IO.File]::Open('%PADDED%', [System.IO.FileMode]::Open); $l=$f.Length; if ($l -lt 1048576) { $f.SetLength(1048576) }; $f.Close()" >nul
 %VBOX% convertfromraw "%PADDED%" "%VDI%" --format VDI >nul 2>&1
 del "%PADDED%" 2>nul
 if not exist "%VDI%" (

@@ -4,14 +4,14 @@
 #include "kheap.h"
 #include "string.h"
 #include "pit.h"
-#include "ata.h"
+#include "blk.h"
 #include "kprintf.h"
 
 static fs_node *root_;
 static fs_node *cwd_;
 
 /* persistence state (see bottom of file) */
-static ata_dev *g_disk;        /* backing disk, or 0 for RAM-only */
+static blkdev_t *g_disk;       /* backing disk, or 0 for RAM-only */
 static uint64_t g_base;        /* first LBA of the BoltFS partition (0 = whole disk) */
 static uint64_t g_cap;         /* usable sectors from g_base (partition length) */
 static int      g_autosave;    /* flush on every mutation once mounted */
@@ -82,6 +82,38 @@ void fs_init(void) {
             "console.log('script finished; fact(6)=' + fact(6));"
             "</script>"
             "</body></html>";
+        fs_write(f, js, (uint32_t)strlen(js));
+    }
+
+    /* BoltJS async demo: Promises + JSON.parse + Promise.all + new Promise.
+     * Run it from the shell with:  js /home/promise.js
+     * (timers/fetch need the browser's pump; this file is pump-free on purpose
+     * so it verifies the microtask queue deterministically.) */
+    f = fs_create("/home/promise.js", 0);
+    if (f) {
+        const char *js =
+            "console.log('sync-start');\n"
+            "Promise.resolve(10).then(function(v){ console.log('then1='+v); return v+5; })"
+            "                   .then(function(v){ console.log('then2='+v); });\n"
+            "Promise.reject('boom').catch(function(e){ console.log('caught='+e); });\n"
+            "var d=JSON.parse('{\"n\":42,\"s\":\"hi\",\"a\":[1,2,3],\"b\":true}');\n"
+            "console.log('json='+d.n+','+d.s+','+d.a[1]+','+d.b);\n"
+            "Promise.all([Promise.resolve(1),Promise.resolve(2),3])"
+            "       .then(function(a){ console.log('all='+a[0]+a[1]+a[2]); });\n"
+            "new Promise(function(res,rej){ res('made'); }).then(function(v){ console.log('ctor='+v); });\n"
+            "console.log('sync-end');\n";
+        fs_write(f, js, (uint32_t)strlen(js));
+    }
+
+    /* fetch() over the real network:  js /home/fetch.js  */
+    f = fs_create("/home/fetch.js", 0);
+    if (f) {
+        const char *js =
+            "console.log('fetch-start');\n"
+            "fetch('http://example.com/')"
+            "  .then(function(r){ console.log('status='+r.status+' ok='+r.ok); return r.text(); })"
+            "  .then(function(t){ console.log('bodylen='+t.length); });\n"
+            "console.log('fetch-issued');\n";
         fs_write(f, js, (uint32_t)strlen(js));
     }
 }
@@ -356,24 +388,24 @@ int fs_sync(void) {
     uint32_t cnt = 0; uint64_t blob = 0;
     measure(root_, &cnt, &blob);
 
-    uint64_t sectors = 1 + (blob + ATA_SECTOR - 1) / ATA_SECTOR;
+    uint64_t sectors = 1 + (blob + BLK_SECTOR - 1) / BLK_SECTOR;
     if (sectors > g_cap) {
         kprintf("fs_sync: image (%lu sectors) exceeds partition (%lu)\n",
                 (unsigned long)sectors, (unsigned long)g_cap);
         return -1;
     }
 
-    uint64_t bufsz = sectors * ATA_SECTOR;
+    uint64_t bufsz = sectors * BLK_SECTOR;
     uint8_t *buf = (uint8_t *)kmalloc(bufsz);
     if (!buf) return -1;
     memset(buf, 0, bufsz);
 
-    uint8_t *p = buf + ATA_SECTOR;          /* blob starts after the superblock */
+    uint8_t *p = buf + BLK_SECTOR;          /* blob starts after the superblock */
     g_emit_idx = 0;
     emit(root_, BFS_NOPAR, &p);
 
     uint32_t sum = 0;
-    for (uint64_t i = 0; i < blob; i++) sum += buf[ATA_SECTOR + i];
+    for (uint64_t i = 0; i < blob; i++) sum += buf[BLK_SECTOR + i];
 
     struct bfs_super sb;
     memset(&sb, 0, sizeof sb);
@@ -384,7 +416,7 @@ int fs_sync(void) {
     sb.checksum   = sum;
     memcpy(buf, &sb, sizeof sb);
 
-    int rc = ata_write(g_disk, g_base, (uint32_t)sectors, buf);
+    int rc = blk_write(g_disk, g_base, (uint32_t)sectors, buf);
     kfree(buf);
     return rc;
 }
@@ -402,20 +434,20 @@ static void fs_clear(void) {
 static int fs_load_image(void) {
     if (!g_disk) return -1;
 
-    uint8_t sec0[ATA_SECTOR];
-    if (ata_read(g_disk, g_base, 1, sec0) != 0) return -1;
+    uint8_t sec0[BLK_SECTOR];
+    if (blk_read(g_disk, g_base, 1, sec0) != 0) return -1;
     struct bfs_super *sb = (struct bfs_super *)sec0;
     if (memcmp(sb->magic, BFS_MAGIC, 8) != 0) return -1;
     if (sb->version != 1 || sb->node_count == 0) return -1;
 
     uint64_t blob = sb->blob_bytes;
     uint32_t cnt  = sb->node_count;
-    uint64_t sectors = (blob + ATA_SECTOR - 1) / ATA_SECTOR;
+    uint64_t sectors = (blob + BLK_SECTOR - 1) / BLK_SECTOR;
     if (1 + sectors > g_cap || blob == 0) return -1;
 
-    uint8_t *buf = (uint8_t *)kmalloc(sectors * ATA_SECTOR);
+    uint8_t *buf = (uint8_t *)kmalloc(sectors * BLK_SECTOR);
     if (!buf) return -1;
-    if (ata_read(g_disk, g_base + 1, (uint32_t)sectors, buf) != 0) { kfree(buf); return -1; }
+    if (blk_read(g_disk, g_base + 1, (uint32_t)sectors, buf) != 0) { kfree(buf); return -1; }
 
     uint32_t sum = 0;
     for (uint64_t i = 0; i < blob; i++) sum += buf[i];
@@ -469,13 +501,13 @@ static int fs_load_image(void) {
  * partition, else the first present partition; if the disk has no valid MBR it
  * writes one with a single BoltFS partition aligned at 1 MiB. Sets g_base/g_cap. */
 static void fs_attach_partition(void) {
-    ata_part parts[4];
-    int n = ata_read_mbr(g_disk, parts);
+    blk_part parts[4];
+    int n = blk_read_mbr(g_disk, parts);
     int idx = -1;
 
     if (n > 0) {
         for (int i = 0; i < 4; i++)                  /* prefer a BoltFS partition */
-            if (parts[i].present && parts[i].type == ATA_PART_BOLTFS) { idx = i; break; }
+            if (parts[i].present && parts[i].type == BLK_PART_BOLTFS) { idx = i; break; }
         if (idx < 0)
             for (int i = 0; i < 4; i++)              /* else first present one    */
                 if (parts[i].present) { idx = i; break; }
@@ -484,8 +516,8 @@ static void fs_attach_partition(void) {
     if (idx < 0) {                                   /* no usable table -> create */
         uint64_t start = 2048;                       /* 1 MiB alignment           */
         if (start >= g_disk->sectors) start = 1;     /* tiny disk fallback        */
-        if (ata_write_mbr_single(g_disk, ATA_PART_BOLTFS, start) == 0 &&
-            ata_read_mbr(g_disk, parts) > 0) {
+        if (blk_write_mbr_single(g_disk, BLK_PART_BOLTFS, start) == 0 &&
+            blk_read_mbr(g_disk, parts) > 0) {
             idx = 0;
             kprintf("[ok] fs: wrote MBR, BoltFS partition @ LBA %lu\n",
                     (unsigned long)start);
@@ -503,7 +535,7 @@ static void fs_attach_partition(void) {
 }
 
 void fs_persist_init(void) {
-    g_disk = ata_fs_disk();
+    g_disk = blk_fs_disk();
     if (!g_disk) {
         kprintf("[--] fs: no data disk found; RAM-only (volatile)\n");
         return;
@@ -513,11 +545,11 @@ void fs_persist_init(void) {
 
     if (fs_load_image() == 0) {
         kprintf("[ok] fs: loaded image from %s '%s' part@LBA%lu (%d nodes)\n",
-                ata_media(g_disk), g_disk->model[0] ? g_disk->model : "disk",
+                blk_media(g_disk), g_disk->model[0] ? g_disk->model : "disk",
                 (unsigned long)g_base, fs_count_nodes());
     } else {
         kprintf("[ok] fs: formatting %s '%s' part@LBA%lu with seed tree\n",
-                ata_media(g_disk), g_disk->model[0] ? g_disk->model : "disk",
+                blk_media(g_disk), g_disk->model[0] ? g_disk->model : "disk",
                 (unsigned long)g_base);
     }
 
@@ -526,5 +558,5 @@ void fs_persist_init(void) {
 }
 
 int fs_persist_active(void) { return g_disk != 0; }
-const char *fs_persist_media(void) { return g_disk ? ata_media(g_disk) : ""; }
+const char *fs_persist_media(void) { return g_disk ? blk_media(g_disk) : ""; }
 const char *fs_persist_model(void) { return g_disk ? g_disk->model : ""; }

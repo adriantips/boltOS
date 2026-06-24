@@ -3,11 +3,13 @@
 #include "pmm.h"
 #include "mm.h"
 
-/* A simple first-fit free-list heap over a fixed 16 MiB window starting at
- * physical 16 MiB (identity-mapped, reserved from the PMM). Good enough to
- * back the rest of the kernel; a slab allocator can replace it later. */
+/* A simple first-fit free-list heap over a fixed window starting at physical
+ * 16 MiB (identity-mapped, reserved from the PMM). Good enough to back the rest
+ * of the kernel; a slab allocator can replace it later. Sized at 96 MiB so the
+ * DOOM port has room for its ~6 MiB zone, the 640x400 framebuffer and WAD lump
+ * cache on top of the desktop's compositor buffers. */
 #define KHEAP_START 0x1000000ull   /* 16 MiB */
-#define KHEAP_SIZE  0x1000000ull   /* 16 MiB */
+#define KHEAP_SIZE  0x6000000ull   /* 96 MiB */
 
 typedef struct block {
     uint64_t       size;           /* payload size, excluding header */

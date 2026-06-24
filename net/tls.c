@@ -37,6 +37,8 @@
 #define HS_CKE           16
 #define HS_FINISHED      20
 #define HS_NEW_TICKET    4
+#define HS_ENC_EXT       8     /* TLS 1.3 EncryptedExtensions    */
+#define HS_CERT_VERIFY   15    /* TLS 1.3 CertificateVerify      */
 
 #define INBUF   18432
 #define RECBUF  16700
@@ -52,6 +54,13 @@ struct tls_conn {
     int      tx_secure, rx_secure;
     uint8_t  key_len;            /* 16 (AES-128) or 32 (AES-256)             */
     uint8_t  sha384;             /* 1 if the suite's PRF/transcript is SHA384 */
+
+    /* --- TLS 1.3 ---------------------------------------------------------- */
+    uint8_t  tls13;              /* 1 if the negotiated version is TLS 1.3    */
+    uint8_t  c_iv[12], s_iv[12]; /* 1.3 per-direction static record IVs       */
+    uint8_t  hs_c_secret[48], hs_s_secret[48];  /* handshake traffic secrets  */
+    uint8_t  ms13[48];           /* 1.3 master secret                         */
+    uint8_t  legacy_sid[32];     /* random session id echoed for 1.3 compat   */
 
     uint8_t  client_random[32], server_random[32];
     uint8_t  master[48];
@@ -85,6 +94,13 @@ static void rng_bytes(uint8_t *p, uint32_t n) {
 /* ----------------------------- helpers ---------------------------------- */
 static void put16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v & 0xff; }
 static void put_seq(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8*i)); }
+
+/* TLS 1.3 record nonce = 12-byte static IV XOR the 8-byte sequence number
+ * (right-aligned, big-endian). */
+static void nonce13(uint8_t out[12], const uint8_t iv[12], uint64_t seq) {
+    memcpy(out, iv, 12);
+    for (int i = 0; i < 8; i++) out[11 - i] ^= (uint8_t)(seq >> (8 * i));
+}
 
 /* TLS 1.2 PRF. P_SHA256 for the AES-128 suites, P_SHA384 for AES-256-GCM-
  * SHA384. `h384` selects the hash; the HMAC block size H is 32 or 48. */
@@ -123,6 +139,55 @@ static uint32_t transcript_digest(struct tls_conn *c, uint8_t out[48]) {
     sha256_ctx s = c->hs_hash; sha256_final(&s, out); return 32;
 }
 
+/* ----------------------------- TLS 1.3 HKDF ----------------------------- */
+/* RFC 5869 + RFC 8446 §7.1. The PRF hash is SHA-256 (h384=0) or SHA-384. */
+static void hash_of(int h384, const uint8_t *msg, uint32_t mlen, uint8_t *out) {
+    if (h384) { sha512_ctx s; sha384_init(&s); sha512_update(&s, msg, mlen); sha384_final(&s, out); }
+    else      { sha256_ctx s; sha256_init(&s); sha256_update(&s, msg, mlen); sha256_final(&s, out); }
+}
+static void hkdf_extract(int h384, const uint8_t *salt, uint32_t slen,
+                         const uint8_t *ikm, uint32_t ilen, uint8_t *out) {
+    hmac_h(h384, salt, slen, ikm, ilen, out);          /* PRK, H bytes */
+}
+static void hkdf_expand(int h384, const uint8_t *prk,
+                        const uint8_t *info, uint32_t ilen, uint8_t *out, uint32_t L) {
+    uint32_t H = h384 ? 48 : 32;
+    uint8_t t[48]; uint32_t tl = 0, done = 0; uint8_t ctr = 1;
+    while (done < L) {
+        uint8_t buf[48 + 300 + 1]; uint32_t n = 0;
+        memcpy(buf, t, tl); n = tl;
+        memcpy(buf + n, info, ilen); n += ilen;
+        buf[n++] = ctr;
+        hmac_h(h384, prk, H, buf, n, t); tl = H;
+        uint32_t take = L - done; if (take > H) take = H;
+        memcpy(out + done, t, take); done += take; ctr++;
+    }
+}
+/* HKDF-Expand-Label(secret, label, context, length) */
+static void expand_label(int h384, const uint8_t *secret, const char *label,
+                         const uint8_t *ctx, uint32_t clen, uint8_t *out, uint32_t L) {
+    uint8_t info[2 + 1 + 6 + 32 + 1 + 48]; uint32_t p = 0;
+    uint32_t ll = (uint32_t)strlen(label);
+    info[p++] = (uint8_t)(L >> 8); info[p++] = (uint8_t)L;
+    info[p++] = (uint8_t)(6 + ll);                     /* "tls13 " + label */
+    memcpy(info + p, "tls13 ", 6); p += 6;
+    memcpy(info + p, label, ll); p += ll;
+    info[p++] = (uint8_t)clen;
+    if (clen) { memcpy(info + p, ctx, clen); p += clen; }
+    hkdf_expand(h384, secret, info, p, out, L);
+}
+/* Derive-Secret(secret, label, transcript-hash) -> H bytes */
+static void derive_secret(int h384, const uint8_t *secret, const char *label,
+                          const uint8_t *thash, uint32_t hl, uint8_t *out) {
+    expand_label(h384, secret, label, thash, hl, out, h384 ? 48 : 32);
+}
+/* Expand a traffic secret into its AEAD key + IV. */
+static void traffic_keyiv(int h384, const uint8_t *secret, uint32_t keylen,
+                          uint8_t *key, uint8_t iv[12]) {
+    expand_label(h384, secret, "key", 0, 0, key, keylen);
+    expand_label(h384, secret, "iv",  0, 0, iv, 12);
+}
+
 /* ------------------------ raw TCP input buffering ----------------------- */
 static int in_fill(struct tls_conn *c, uint32_t need, uint32_t timeout) {
     while (c->in_len < need) {
@@ -151,6 +216,26 @@ static int record_read(struct tls_conn *c, uint8_t *type, uint8_t *out,
     if (r <= 0) return -1;                     /* closed mid-record = error */
 
     uint8_t *p = c->in + 5;
+    if (c->tls13 && c->rx_secure && t == REC_APP) {
+        /* 1.3: AEAD over the whole fragment; AAD = the 5-byte outer header. */
+        if (len < 16) return -1;
+        uint32_t ctlen = len - 16;
+        uint8_t nonce[12]; nonce13(nonce, c->s_iv, c->rseq);
+        uint8_t aad[5]; memcpy(aad, c->in, 5);
+        int bad = c->key_len == 32
+            ? aes256_gcm_open(c->sw_key, nonce, aad, 5, p, ctlen, p + ctlen, out)
+            : aes_gcm_open(c->sw_key, nonce, aad, 5, p, ctlen, p + ctlen, out);
+        if (bad != 0) { DBG("tls: bad GCM tag (1.3)\n"); return -1; }
+        c->rseq++;
+        /* strip zero padding; the last non-zero byte is the real content type */
+        uint32_t L = ctlen;
+        while (L > 0 && out[L - 1] == 0) L--;
+        if (L == 0) return -1;
+        *type = out[L - 1];
+        *outlen = L - 1;
+        in_consume(c, 5 + len);
+        return 1;
+    }
     if (c->rx_secure && (t == REC_HS || t == REC_APP || t == REC_ALERT)) {
         if (len < 8 + 16) return -1;
         uint32_t ctlen = len - 8 - 16;
@@ -182,6 +267,21 @@ static int record_send_plain(struct tls_conn *c, uint8_t type, uint8_t minor,
 /* Send an encrypted record (AES-GCM, explicit nonce = write sequence number). */
 static int record_send_enc(struct tls_conn *c, uint8_t type,
                            const uint8_t *data, uint32_t len) {
+    if (c->tls13) {
+        /* inner plaintext = data || real content type; outer type = app data */
+        uint8_t *p = c->out + 5;
+        memcpy(p, data, len);
+        p[len] = type;                          /* TLSInnerPlaintext.type */
+        uint32_t inner = len + 1;
+        uint32_t rlen = inner + 16;
+        uint8_t nonce[12]; nonce13(nonce, c->c_iv, c->wseq);
+        uint8_t aad[5] = { REC_APP, 3, 3, (uint8_t)(rlen >> 8), (uint8_t)rlen };
+        if (c->key_len == 32) aes256_gcm_seal(c->cw_key, nonce, aad, 5, p, inner, p, p + inner);
+        else                  aes_gcm_seal(c->cw_key, nonce, aad, 5, p, inner, p, p + inner);
+        c->out[0] = REC_APP; c->out[1] = 3; c->out[2] = 3; put16(c->out + 3, (uint16_t)rlen);
+        c->wseq++;
+        return tcp_send(c->tcp, c->out, 5 + rlen);
+    }
     uint8_t *p = c->out + 5;
     put_seq(p, c->wseq);                       /* explicit nonce */
     uint8_t nonce[12]; memcpy(nonce, c->cw_iv, 4); memcpy(nonce + 4, p, 8);
@@ -231,10 +331,13 @@ static int hs_next(struct tls_conn *c, uint8_t *mtype, uint8_t **body,
 /* --------------------------- ClientHello -------------------------------- */
 static uint32_t build_client_hello(struct tls_conn *c, const char *sni, uint8_t *buf) {
     uint32_t p = 0;
-    buf[p++] = 3; buf[p++] = 3;                         /* client_version 1.2 */
+    buf[p++] = 3; buf[p++] = 3;                         /* legacy_version 1.2 */
     memcpy(buf + p, c->client_random, 32); p += 32;
-    buf[p++] = 0;                                       /* session_id len = 0 */
-    put16(buf + p, 8); p += 2;                          /* cipher suites: 4    */
+    buf[p++] = 32;                                      /* legacy_session_id (1.3 compat) */
+    memcpy(buf + p, c->legacy_sid, 32); p += 32;
+    put16(buf + p, 12); p += 2;                         /* cipher suites: 6    */
+    put16(buf + p, 0x1301); p += 2;                     /* TLS_AES_128_GCM_SHA256 (1.3)  */
+    put16(buf + p, 0x1302); p += 2;                     /* TLS_AES_256_GCM_SHA384 (1.3)  */
     put16(buf + p, 0xC02B); p += 2;                     /* ECDHE_ECDSA_AES128_GCM_SHA256 */
     put16(buf + p, 0xC02F); p += 2;                     /* ECDHE_RSA_AES128_GCM_SHA256   */
     put16(buf + p, 0xC02C); p += 2;                     /* ECDHE_ECDSA_AES256_GCM_SHA384 */
@@ -274,8 +377,149 @@ static uint32_t build_client_hello(struct tls_conn *c, const char *sni, uint8_t 
     /* renegotiation_info (empty) */
     put16(buf + p, 0xff01); p += 2; put16(buf + p, 1); p += 2; buf[p++] = 0;
 
+    /* supported_versions: TLS 1.3 then 1.2 */
+    put16(buf + p, 0x002b); p += 2; put16(buf + p, 5); p += 2;
+    buf[p++] = 4;                                       /* list length        */
+    put16(buf + p, 0x0304); p += 2;                     /* TLS 1.3            */
+    put16(buf + p, 0x0303); p += 2;                     /* TLS 1.2            */
+
+    /* key_share: one x25519 entry (our ephemeral public key) */
+    put16(buf + p, 0x0033); p += 2; put16(buf + p, 38); p += 2;
+    put16(buf + p, 36); p += 2;                         /* client_shares len  */
+    put16(buf + p, 0x001d); p += 2;                     /* group x25519       */
+    put16(buf + p, 32); p += 2;                         /* key length         */
+    memcpy(buf + p, c->kx_pub, 32); p += 32;
+
     put16(buf + ext_len_at, (uint16_t)(p - ext0));
     return p;
+}
+
+#include "x509.h"   /* tls_verify_chain + x509_verify_certverify */
+
+/* Complete a TLS 1.3 handshake. On entry the transcript already holds the
+ * ClientHello and ServerHello, the cipher suite is selected (c->key_len /
+ * c->sha384), c->tls13 == 1, and server_pub holds the server's x25519 share.
+ * Reads the encrypted server flight, verifies the server Finished, sends the
+ * client Finished, and installs the application traffic keys. */
+static int tls13_finish(struct tls_conn *c, const char *sni, uint64_t t_end,
+                        const uint8_t server_pub[32]) {
+    int h384 = c->sha384;
+    uint32_t H = h384 ? 48 : 32;
+    uint8_t zeros[48]; memset(zeros, 0, sizeof zeros);
+
+    /* ---- ECDHE shared secret ---- */
+    uint8_t shared[32];
+    x25519(shared, c->kx_priv, server_pub);
+
+    /* ---- key schedule (RFC 8446 §7.1) ---- */
+    uint8_t eh[48]; hash_of(h384, (const uint8_t *)"", 0, eh);   /* Hash("") */
+    uint8_t early[48];   hkdf_extract(h384, zeros, H, zeros, H, early);
+    uint8_t derived[48]; derive_secret(h384, early, "derived", eh, H, derived);
+    uint8_t hs[48];      hkdf_extract(h384, derived, H, shared, 32, hs);
+
+    uint8_t th[48]; uint32_t thl = transcript_digest(c, th);     /* Hash(CH||SH) */
+    derive_secret(h384, hs, "c hs traffic", th, thl, c->hs_c_secret);
+    derive_secret(h384, hs, "s hs traffic", th, thl, c->hs_s_secret);
+
+    uint8_t derived2[48]; derive_secret(h384, hs, "derived", eh, H, derived2);
+    hkdf_extract(h384, derived2, H, zeros, H, c->ms13);
+
+    /* ---- install handshake traffic keys ---- */
+    traffic_keyiv(h384, c->hs_c_secret, c->key_len, c->cw_key, c->c_iv);
+    traffic_keyiv(h384, c->hs_s_secret, c->key_len, c->sw_key, c->s_iv);
+    c->rx_secure = 1; c->rseq = 0;
+    c->tx_secure = 1; c->wseq = 0;
+
+    /* ---- read the encrypted server flight, reassembling handshake msgs ---- */
+    c->hs_len = c->hs_off = 0;
+    int got_fin = 0, cert_ok = 0, cv_ok = 0;
+    uint8_t leaf_spki[1200]; uint32_t leaf_spki_len = 0;
+    while (!got_fin) {
+        /* try to pull a complete handshake message out of the buffer */
+        if (c->hs_len - c->hs_off >= 4) {
+            uint8_t *m = c->hs + c->hs_off;
+            uint32_t ml = ((uint32_t)m[1] << 16) | ((uint32_t)m[2] << 8) | m[3];
+            if (c->hs_len - c->hs_off >= 4 + ml) {
+                uint8_t mt = m[0]; uint8_t *body = m + 4;
+                if (mt == HS_FINISHED) {
+                    uint8_t tf[48]; uint32_t tfl = transcript_digest(c, tf);  /* through CertVerify */
+                    uint8_t fk[48]; expand_label(h384, c->hs_s_secret, "finished", 0, 0, fk, H);
+                    uint8_t exp[48]; hmac_h(h384, fk, H, tf, tfl, exp);
+                    if (ml != H || memcmp(exp, body, H) != 0) {
+                        DBG("tls13: server Finished mismatch\n"); return -1;
+                    }
+                    transcript_add(c, body, ml);
+                    got_fin = 1;
+                } else if (mt == HS_CERTIFICATE) {
+                    /* Validate the chain (hostname/dates/linkage/anchor) and
+                     * stash the leaf SPKI for the CertificateVerify check. */
+                    if (tls_verify_chain(body, ml, sni, leaf_spki, &leaf_spki_len,
+                                         sizeof leaf_spki) == 0) cert_ok = 1;
+                    else { DBG("tls13: cert chain rejected\n"); return -1; }
+                    transcript_add(c, body, ml);
+                } else if (mt == HS_CERT_VERIFY) {
+                    /* signed content = 64*0x20 || context || 0x00 || Hash(CH..Cert) */
+                    if (ml < 4 || !cert_ok) { DBG("tls13: stray CertVerify\n"); return -1; }
+                    uint16_t sigalg = ((uint16_t)body[0] << 8) | body[1];
+                    uint16_t siglen = ((uint16_t)body[2] << 8) | body[3];
+                    if (4u + siglen > ml) return -1;
+                    uint8_t th[48]; uint32_t thl = transcript_digest(c, th);  /* through Certificate */
+                    static const char ctxs[] = "TLS 1.3, server CertificateVerify";
+                    uint8_t content[64 + sizeof ctxs + 48]; uint32_t cl = 0;
+                    memset(content, 0x20, 64); cl = 64;
+                    memcpy(content + cl, ctxs, sizeof ctxs - 1); cl += sizeof ctxs - 1;
+                    content[cl++] = 0x00;
+                    memcpy(content + cl, th, thl); cl += thl;
+                    if (x509_verify_certverify(leaf_spki, leaf_spki_len, sigalg,
+                                               content, cl, body + 4, siglen) != 0) {
+                        DBG("tls13: CertificateVerify failed\n"); return -1;
+                    }
+                    cv_ok = 1;
+                    transcript_add(c, body, ml);
+                } else {
+                    transcript_add(c, body, ml);
+                }
+                c->hs_off += 4 + ml;
+                continue;
+            }
+        }
+        if (c->hs_off) { memmove(c->hs, c->hs + c->hs_off, c->hs_len - c->hs_off);
+                         c->hs_len -= c->hs_off; c->hs_off = 0; }
+        uint64_t now = pit_ticks();
+        if (now >= t_end) { DBG("tls13: flight deadline\n"); return -1; }
+        uint8_t t; uint32_t rl;
+        int r = record_read(c, &t, c->rec, &rl, (uint32_t)(t_end - now));
+        if (r <= 0) { DBG("tls13: flight read=%d\n", r); return -1; }
+        if (t == REC_CCS) continue;                 /* middlebox-compat dummy */
+        if (t == REC_ALERT) { DBG("tls13: alert in flight\n"); return -1; }
+        if (t != REC_HS) continue;
+        if (c->hs_len + rl > HSBUF) return -1;
+        memcpy(c->hs + c->hs_len, c->rec, rl);
+        c->hs_len += rl;
+    }
+    if (!cert_ok || !cv_ok) { DBG("tls13: missing Certificate/CertificateVerify\n"); return -1; }
+
+    /* ---- application traffic secrets (transcript through server Finished) -- */
+    uint8_t ts[48]; uint32_t tsl = transcript_digest(c, ts);
+    uint8_t c_ap[48], s_ap[48];
+    derive_secret(h384, c->ms13, "c ap traffic", ts, tsl, c_ap);
+    derive_secret(h384, c->ms13, "s ap traffic", ts, tsl, s_ap);
+
+    /* ---- client Finished (under client handshake keys), then app keys ---- */
+    uint8_t fk[48]; expand_label(h384, c->hs_c_secret, "finished", 0, 0, fk, H);
+    uint8_t vd[48]; hmac_h(h384, fk, H, ts, tsl, vd);
+    uint8_t fin[4 + 48];
+    fin[0] = HS_FINISHED; fin[1] = 0; put16(fin + 2, (uint16_t)H);
+    memcpy(fin + 4, vd, H);
+    if (record_send_enc(c, REC_HS, fin, 4 + H) < 0) return -1;
+
+    traffic_keyiv(h384, c_ap, c->key_len, c->cw_key, c->c_iv);
+    traffic_keyiv(h384, s_ap, c->key_len, c->sw_key, c->s_iv);
+    c->wseq = 0; c->rseq = 0;
+
+    c->established = 1;
+    DBG("tls13: handshake ok (keylen=%d sha384=%d)\n", c->key_len, c->sha384);
+    return 0;
 }
 
 /* ----------------------------- handshake -------------------------------- */
@@ -285,16 +529,17 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
     sha256_init(&c->hs_hash);
     sha384_init(&c->hs_hash384);
     rng_bytes(c->client_random, 32);
+    rng_bytes(c->legacy_sid, 32);
+
+    /* ephemeral X25519 keypair (its public key goes in the key_share ext) */
+    rng_bytes(c->kx_priv, 32);
+    x25519(c->kx_pub, c->kx_priv, x25519_basepoint);
 
     /* ClientHello */
     uint32_t blen = build_client_hello(c, sni, msg + 4);
     msg[0] = HS_CLIENT_HELLO; msg[1] = 0; put16(msg + 2, (uint16_t)blen);
     transcript_add(c, msg + 4, blen);
     if (record_send_plain(c, REC_HS, 1, msg, 4 + blen) < 0) return -1;
-
-    /* ephemeral X25519 keypair */
-    rng_bytes(c->kx_priv, 32);
-    x25519(c->kx_pub, c->kx_priv, x25519_basepoint);
 
     /* Bound the whole handshake, not just each record read: a server that
      * trickles a large flight (or stalls mid-flight) must not hang the UI. */
@@ -318,12 +563,41 @@ static int do_handshake(struct tls_conn *c, const char *sni, uint32_t timeout) {
             memcpy(c->server_random, b + 2, 32);
             uint32_t o = 34; uint8_t sid = b[o++]; o += sid;
             if (o + 3 > bl) return -1;
-            uint16_t suite = ((uint16_t)b[o] << 8) | b[o+1];
-            if      (suite == 0xC02B || suite == 0xC02F) { c->key_len = 16; c->sha384 = 0; }
-            else if (suite == 0xC02C || suite == 0xC030) { c->key_len = 32; c->sha384 = 1; }
+            uint16_t suite = ((uint16_t)b[o] << 8) | b[o+1]; o += 2;
+            o += 1;                                     /* legacy compression  */
+            if      (suite == 0xC02B || suite == 0xC02F || suite == 0x1301) { c->key_len = 16; c->sha384 = 0; }
+            else if (suite == 0xC02C || suite == 0xC030 || suite == 0x1302) { c->key_len = 32; c->sha384 = 1; }
             else { DBG("tls: bad suite %x\n", suite); return -1; }
-            DBG("tls: suite=%x keylen=%d sha384=%d\n", suite, c->key_len, c->sha384);
+
+            /* scan extensions for supported_versions (0x2b) + key_share (0x33) */
+            uint8_t sv_pub[32]; int have_sv_pub = 0, is13 = 0;
+            if (o + 2 <= bl) {
+                uint32_t et = ((uint32_t)b[o] << 8) | b[o+1]; o += 2;
+                uint32_t eend = o + et; if (eend > bl) eend = bl;
+                while (o + 4 <= eend) {
+                    uint16_t xt = ((uint16_t)b[o]   << 8) | b[o+1];
+                    uint16_t xl = ((uint16_t)b[o+2] << 8) | b[o+3];
+                    o += 4; if (o + xl > eend) break;
+                    if (xt == 0x002b && xl >= 2) {
+                        if ((((uint16_t)b[o] << 8) | b[o+1]) == 0x0304) is13 = 1;
+                    } else if (xt == 0x0033 && xl >= 4) {
+                        uint16_t grp = ((uint16_t)b[o]   << 8) | b[o+1];
+                        uint16_t kl  = ((uint16_t)b[o+2] << 8) | b[o+3];
+                        if (grp == 0x001d && kl == 32 && xl >= 4 + 32) {
+                            memcpy(sv_pub, b + o + 4, 32); have_sv_pub = 1;
+                        }
+                    }
+                    o += xl;
+                }
+            }
+            DBG("tls: suite=%x keylen=%d sha384=%d tls13=%d\n", suite, c->key_len, c->sha384, is13);
             got_sh = 1;
+            if (is13) {
+                if (!have_sv_pub) { DBG("tls13: no x25519 key_share\n"); return -1; }
+                c->tls13 = 1;
+                return tls13_finish(c, sni, t_end, sv_pub);
+            }
+            if (suite == 0x1301 || suite == 0x1302) { DBG("tls: 1.3 suite, no 1.3\n"); return -1; }
             break;
         }
         case HS_CERTIFICATE:

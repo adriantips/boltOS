@@ -6,6 +6,8 @@
 [BITS 64]
 
 extern isr_handler
+extern fpu_save_current
+extern fpu_restore_current
 
 section .text
 
@@ -50,10 +52,18 @@ isr_common:
     push    r15
 
     cld
+    ; Save the interrupted thread's FPU/SSE state into its own fxarea before the
+    ; C handler (which may use XMM). rsp here is 16-aligned, so the call is
+    ; ABI-correct. fpu_* are built -mno-sse and never touch XMM themselves.
+    call    fpu_save_current
     mov     rdi, rsp         ; arg0 = pointer to struct registers
     call    isr_handler
     mov     rsp, rax         ; resume on the frame isr_handler returned
                              ; (the scheduler may have switched stacks)
+    ; Restore the (possibly switched-to) thread's FPU/SSE state. rsp is now the
+    ; resume frame (≡8 mod 16); harmless for a -mno-sse callee, and fxrstor
+    ; takes an explicit 16-aligned operand independent of rsp.
+    call    fpu_restore_current
 
     pop     r15
     pop     r14

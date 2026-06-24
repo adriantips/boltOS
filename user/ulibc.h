@@ -38,9 +38,10 @@ void  exit(int code) __attribute__((noreturn));
 
 /* heap */
 void *malloc(unsigned long n);
+void *calloc(unsigned long nm, unsigned long sz);
+void *realloc(void *p, unsigned long n);
 void  free(void *p);
 
-/* tiny stdio */
-int   putchar(int c);
-int   puts(const char *s);
-int   printf(const char *fmt, ...);
+/* umbrella: pull in the fuller stdio / stdlib surface */
+#include "stdio.h"
+#include "stdlib.h"

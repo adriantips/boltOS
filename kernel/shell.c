@@ -159,6 +159,8 @@ const command_t commands[] = {
     { "ports",    "Network",          "open port viewer",                   cmd_ports },
     { "download", "Network",          "download a file over HTTP",          cmd_download },
     { "browse",   "Network",          "fetch + render a page as text",      cmd_browse },
+    { "domq",     "Network",          "DOM query: domq URL|FILE SELECTOR",  cmd_domq },
+    { "domlayout","Network",          "box-layout tree: domlayout URL|FILE",cmd_domlayout },
     { "upload",   "Network",          "upload a file",                      cmd_upload },
     { "wifi",     "Network",          "Wi-Fi management",                   cmd_wifi },
     { "firewall", "Network",          "firewall controls",                  cmd_firewall },

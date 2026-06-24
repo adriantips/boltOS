@@ -19,7 +19,7 @@ OBJCOPY=$M/ucrt64/bin/objcopy.exe
 
 CFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie
         -mcmodel=kernel
-        -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -mno-80387
+        -mno-red-zone -msse -msse2 -mno-mmx -mno-80387
         -Wall -Wextra -O2 -std=c11 -Iinclude -c)
 
 mkdir -p build iso
@@ -34,14 +34,17 @@ echo "[2/6] kernel asm (boot + isr + syscall)"
 
 echo "[2b/6] user program (user/hello.c) -> static ELF64 -> embed blob"
 UCFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie
-         -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -mno-80387
+         -mno-red-zone -msse -msse2 -mno-mmx -mno-80387
          -Wall -Wextra -O2 -std=c11 -Iuser -Iinclude -c)
 "$NASM" -f elf64 user/crt0.asm -o build/u_crt0.o
-"$CLANG" "${UCFLAGS[@]}" user/ulibc.c  -o build/u_ulibc.o
-"$CLANG" "${UCFLAGS[@]}" user/hello.c  -o build/u_hello.o
-"$CLANG" "${UCFLAGS[@]}" libc/string.c -o build/u_string.o
+"$CLANG" "${UCFLAGS[@]}" user/ulibc.c      -o build/u_ulibc.o
+"$CLANG" "${UCFLAGS[@]}" user/stdlib_ext.c -o build/u_stdlib.o
+"$CLANG" "${UCFLAGS[@]}" user/libm.c       -o build/u_libm.o
+"$CLANG" "${UCFLAGS[@]}" user/hello.c      -o build/u_hello.o
+"$CLANG" "${UCFLAGS[@]}" libc/string.c     -o build/u_string.o
 "$LLD" -m elf_x86_64 -T user/user.ld -no-pie -o build/hello.elf \
-       build/u_crt0.o build/u_hello.o build/u_ulibc.o build/u_string.o
+       build/u_crt0.o build/u_hello.o build/u_ulibc.o build/u_stdlib.o \
+       build/u_libm.o build/u_string.o
 # embed the raw ELF as an object exposing _binary_hello_elf_start/_end
 ( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 hello.elf hello_blob.o )
 
@@ -75,18 +78,18 @@ SRCS=(
     kernel/main.c kernel/serial.c kernel/console.c kernel/shell.c kernel/kprintf.c kernel/font8x8.c
     kernel/gdt.c kernel/idt.c kernel/interrupts.c kernel/pic.c kernel/pit.c
     kernel/hw.c kernel/pci.c kernel/sysreg.c kernel/sched.c kernel/syscall.c
-    kernel/vfs.c kernel/proc.c kernel/elf.c kernel/pe.c
+    kernel/vfs.c kernel/proc.c kernel/elf.c kernel/pe.c kernel/blk.c
     net/netif.c net/driver.c net/eth.c net/arp.c net/ip.c net/icmp.c net/udp.c
-    net/tcp.c net/dns.c net/crypto.c net/tls.c net/p256.c net/http.c
+    net/tcp.c net/dns.c net/crypto.c net/tls.c net/p256.c net/p384.c net/rsa.c net/x509.c net/inflate.c net/http.c
     net/wifi.c net/firmware.c net/firewall.c drivers/e1000.c
     kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c
-    kernel/html.c kernel/image.c
+    kernel/html.c kernel/dom.c kernel/layout.c kernel/image.c
     kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c kernel/app_files.c
-    kernel/app_ide.c kernel/app_calc.c kernel/app_clock.c kernel/app_notes.c kernel/app_calendar.c kernel/app_piano.c kernel/app_paint.c kernel/app_mines.c kernel/app_snake.c kernel/app_2048.c kernel/app_stopwatch.c kernel/app_sysinfo.c kernel/app_life.c kernel/app_ttt.c kernel/app_colorpick.c kernel/app_memory.c kernel/app_matrix.c
+    kernel/app_ide.c kernel/app_calc.c kernel/app_clock.c kernel/app_notes.c kernel/app_calendar.c kernel/app_piano.c kernel/app_paint.c kernel/app_mines.c kernel/app_snake.c kernel/app_2048.c kernel/app_stopwatch.c kernel/app_sysinfo.c kernel/app_life.c kernel/app_ttt.c kernel/app_colorpick.c kernel/app_memory.c kernel/app_matrix.c kernel/app_doom.c
     kernel/settings.c
     kernel/boltpy.c kernel/cmd_python.c kernel/boltcc.c kernel/js.c kernel/cmd_js.c
     fs/ramfs.c
-    drivers/keyboard.c drivers/framebuffer.c drivers/gpu.c drivers/mouse.c drivers/ata.c drivers/pcspk.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
+    drivers/keyboard.c drivers/framebuffer.c drivers/gpu.c drivers/mouse.c drivers/ata.c drivers/nvme.c drivers/xhci.c drivers/pcspk.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
 )
 KOBJS=(build/kboot.o build/isr.o build/sc_entry.o build/hello_blob.o build/winhello_blob.o build/boltrt_blob.o)
 for c in "${SRCS[@]}"; do
@@ -94,6 +97,37 @@ for c in "${SRCS[@]}"; do
     "$CLANG" "${CFLAGS[@]}" "$c" -o "$o"
     KOBJS+=("$o")
 done
+
+echo "[3b/6] DOOM engine (from-scratch doomgeneric port -> kernel objects)"
+# The id Tech 1 engine, built against the in-house libc shim (doom/dg_libc.c) and
+# BoltOS platform layer (doom/doomgeneric_boltos.c). -nostdlibinc keeps clang's
+# freestanding headers but blocks the host's libc headers, so <stdio.h> etc.
+# resolve to doom/libc/*. SSE2 stays on (the engine uses doubles at table build
+# time); -w because vintage code is warning-heavy.
+DOOMCFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie
+            -mcmodel=kernel -mno-red-zone -msse -msse2 -mno-mmx -mno-80387
+            -O2 -w -std=gnu11 -nostdlibinc -Idoom/libc -Idoom -Iinclude
+            -DNORMALUNIX -DLINUX -c)
+DOOM_SRCS=(
+    dummy am_map doomdef doomstat dstrings d_event d_items d_iwad d_loop d_main d_mode d_net
+    f_finale f_wipe g_game hu_lib hu_stuff info i_cdmus i_endoom i_joystick i_scale i_sound
+    i_system i_timer memio m_argv m_bbox m_cheat m_config m_controls m_fixed m_menu m_misc
+    m_random p_ceilng p_doors p_enemy p_floor p_inter p_lights p_map p_maputl p_mobj p_plats
+    p_pspr p_saveg p_setup p_sight p_spec p_switch p_telept p_tick p_user r_bsp r_data r_draw
+    r_main r_plane r_segs r_sky r_things sha1 sounds statdump st_lib st_stuff s_sound tables
+    v_video wi_stuff w_checksum w_file w_main w_wad z_zone w_file_stdc i_input i_video
+    doomgeneric doomgeneric_boltos dg_libc
+)
+for d in "${DOOM_SRCS[@]}"; do
+    "$CLANG" "${DOOMCFLAGS[@]}" "doom/$d.c" -o "build/doom_$d.o"
+    KOBJS+=("build/doom_$d.o")
+done
+
+echo "[3c/6] embed shareware DOOM IWAD (doom1.wad -> blob)"
+[ -f doom/doom1.wad ] || { echo "ERROR: doom/doom1.wad missing (shareware IWAD)"; exit 1; }
+cp doom/doom1.wad build/doom1.wad
+( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 doom1.wad doom1_wad.o )
+KOBJS+=(build/doom1_wad.o)
 
 echo "[4/6] link kernel -> flat binary"
 "$LLD" -m elf_x86_64 -T linker.ld --oformat binary -o build/kernel.bin "${KOBJS[@]}"
@@ -124,7 +158,7 @@ echo "OK -> $IMG ($(stat -c %s "$IMG") bytes)"
 # HDD, the other as an SSD (rotation_rate flag in run.sh) - the ATA driver tells
 # them apart from the IDENTIFY page. 64 MiB each.
 DATA_MB=64
-for d in iso/disk-hdd.img iso/disk-ssd.img; do
+for d in iso/disk-hdd.img iso/disk-ssd.img iso/disk-nvme.img; do
     if [ ! -f "$d" ]; then
         dd if=/dev/zero of="$d" bs=1M count="$DATA_MB" status=none
         echo "created $d (${DATA_MB} MiB)"

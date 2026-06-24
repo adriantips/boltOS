@@ -16,3 +16,9 @@
 void keyboard_init(void);
 int  kbd_trygetc(void);   /* next char, or -1 if the buffer is empty (non-blocking) */
 char kbd_getc(void);      /* block (hlt) until a key is available, then return it */
+
+/* Raw scancode tap for clients needing real key up/down (DOOM). When enabled,
+ * every make/break is queued; kbd_raw_get() returns the next event or -1.
+ * Encoding: bits0-6 scancode, 0x100 = release, 0x200 = extended (0xE0). */
+void kbd_raw_enable(int on);
+int  kbd_raw_get(void);

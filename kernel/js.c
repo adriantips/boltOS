@@ -62,7 +62,8 @@ typedef struct Prop { char *key; JVal val; struct Prop *next; } Prop;
 
 /* object kinds; HTAG marks a host singleton (console/Math/document/JSON) */
 enum { K_OBJ, K_ARR, K_FUN, K_NATIVE };
-enum { H_NONE, H_CONSOLE, H_MATH, H_DOCUMENT, H_JSON, H_WINDOW };
+enum { H_NONE, H_CONSOLE, H_MATH, H_DOCUMENT, H_JSON, H_WINDOW, H_LOCALSTORAGE,
+       H_PROMISE, H_RESPONSE };
 
 typedef JVal (*NativeFn)(Interp *, JVal thisv, JVal *args, int nargs);
 
@@ -138,6 +139,15 @@ struct Interp {
     int      flow;            /* 0 normal, 1 return, 2 break, 3 continue */
     JVal     retval;
     int      steps;           /* execution budget guard */
+    uint64_t now_ms;          /* current time, set by js_vm_pump (for timers) */
+    /* persistent-VM registries (timers + event listeners) */
+    struct { JObj *fn; uint64_t due; uint32_t interval; int active; } timers[32];
+    int      ntimers;
+    struct { js_dom_node target; char type[20]; JObj *fn; int active; } listeners[64];
+    int      nlisteners;
+    /* promise microtask FIFO (drained after eval/pump/dispatch) */
+    struct { JObj *onF, *onR, *rp; int state; JVal val; } microq[128];
+    int      mq_head, mq_count;
 };
 
 static void seterr(Interp *I, const char *m) {
@@ -698,8 +708,15 @@ static void assign_to(Interp *I, Node *target, JVal v, JEnv *env) {
                     else I->host->set_text(I->host->ud,o->dom,val_to_str(I,v));
                     return;
                 }
+                if (I->host->set_attr) {                  /* el.id / className / href / src / value */
+                    if (strcmp(target->str,"id")==0)        { I->host->set_attr(I->host->ud,o->dom,"id",val_to_str(I,v)); return; }
+                    if (strcmp(target->str,"className")==0)  { I->host->set_attr(I->host->ud,o->dom,"class",val_to_str(I,v)); return; }
+                    if (strcmp(target->str,"href")==0||strcmp(target->str,"src")==0||strcmp(target->str,"value")==0)
+                        { I->host->set_attr(I->host->ud,o->dom,target->str,val_to_str(I,v)); return; }
+                }
             }
             if (o->htag==H_DOCUMENT && strcmp(target->str,"title")==0) { if(I->host)I->host->set_title(I->host->ud,val_to_str(I,v)); return; }
+            if (o->htag==H_DOCUMENT && strcmp(target->str,"cookie")==0) { if(I->host&&I->host->cookie_set)I->host->cookie_set(I->host->ud,val_to_str(I,v)); return; }
             obj_set(I,o,target->str,v);
         }
         return;
@@ -794,7 +811,7 @@ static JVal eval(Interp *I, Node *n, JEnv *env) {
         JVal args[32]; int ac=n->nlist>32?32:n->nlist;
         for(int i=0;i<ac;i++) args[i]=eval(I,n->list[i],env);
         JObj *o=new_obj(I,K_OBJ); if(!o)return jundef();
-        if (fn.t==T_OBJ && fn.u.obj->kind==K_FUN) { JVal r=call_fn(I,fn.u.obj,jobj(o),args,ac); if(r.t==T_OBJ)return r; }
+        if (fn.t==T_OBJ && (fn.u.obj->kind==K_FUN||fn.u.obj->kind==K_NATIVE)) { JVal r=call_fn(I,fn.u.obj,jobj(o),args,ac); if(r.t==T_OBJ)return r; }
         return jobj(o);
     }
     case N_UNARY: {
@@ -967,10 +984,97 @@ int js_run(const char *src, uint32_t len, js_host *host, char *err, uint32_t err
         I->flow=0;
         if (I->a.oom){ seterr(I,"out of memory"); break; }
     }
+    js_drain_micro(I);                 /* run fetch()/Promise reactions */
 
     int rc = I->errflag? -1: 0;
     if (err && errcap) { uint32_t i=0; for(;I->err[i]&&i<errcap-1;i++)err[i]=I->err[i]; err[i]=0; }
     arena_free(&I->a);
     kfree(I);
     return rc;
+}
+
+/* ===========================================================================
+ *  Persistent VM: keep the interpreter (heap + global env + registered timers
+ *  and event listeners) alive across calls so handlers can fire later.
+ * ===========================================================================*/
+struct js_vm { Interp I; };
+
+js_vm *js_vm_create(js_host *host) {
+    js_vm *vm = (js_vm*)kmalloc(sizeof(js_vm));
+    if (!vm) return 0;
+    memset(vm, 0, sizeof(*vm));
+    vm->I.host = host;
+    vm->I.global = new_env(&vm->I, 0);
+    js_install_globals(&vm->I);
+    return vm;
+}
+
+int js_vm_eval(js_vm *vm, const char *src, uint32_t len, char *err, uint32_t errcap) {
+    if (!vm) return -1;
+    Interp *I = &vm->I;
+    I->src = src; I->slen = len; I->pos = 0; I->has_peek = 0;
+    I->errflag = 0; I->flow = 0; I->retval = jundef();
+    while (peek(I)->k != TK_EOF && !I->errflag) {
+        Node *s = parse_stmt(I); if (!s) break;
+        eval(I, s, I->global); I->flow = 0;
+        if (I->a.oom) { seterr(I, "out of memory"); break; }
+    }
+    js_drain_micro(I);                 /* run fetch()/Promise reactions */
+    int rc = I->errflag ? -1 : 0;
+    if (err && errcap) { uint32_t i=0; for(;I->err[i]&&i<errcap-1;i++)err[i]=I->err[i]; err[i]=0; }
+    return rc;
+}
+
+int js_vm_pump(js_vm *vm, uint64_t now_ms) {
+    if (!vm) return 0;
+    Interp *I = &vm->I; I->now_ms = now_ms;
+    int fired = 0;
+    for (int i = 0; i < I->ntimers; i++) {
+        if (!I->timers[i].active || I->timers[i].due > now_ms) continue;
+        JObj *fn = I->timers[i].fn;
+        if (I->timers[i].interval) I->timers[i].due = now_ms + I->timers[i].interval;
+        else I->timers[i].active = 0;
+        I->errflag = 0; I->flow = 0;
+        call_fn(I, fn, jundef(), 0, 0);
+        fired++;
+        if (I->a.oom) break;
+    }
+    js_drain_micro(I);                 /* timers may have scheduled promise work */
+    return fired;
+}
+
+int js_vm_dispatch(js_vm *vm, js_dom_node target, const char *type) {
+    if (!vm) return 0;
+    Interp *I = &vm->I; int n = 0;
+    for (int i = 0; i < I->nlisteners; i++) {
+        if (!I->listeners[i].active) continue;
+        if (strcmp(I->listeners[i].type, type) != 0) continue;
+        if (I->listeners[i].target != JS_TARGET_DOC && I->listeners[i].target != target) continue;
+        /* event arg: { type, target } */
+        JObj *ev = new_obj(I, K_OBJ);
+        if (ev) { obj_set(I, ev, "type", jstr(arena_str(&I->a, type, strlen(type))));
+                  if (target) obj_set(I, ev, "target", wrap_dom(I, target)); }
+        JVal arg = ev ? jobj(ev) : jundef();
+        JVal thisv = target ? wrap_dom(I, target) : jundef();
+        I->errflag = 0; I->flow = 0;
+        call_fn(I, I->listeners[i].fn, thisv, &arg, 1);
+        n++;
+        if (I->a.oom) break;
+    }
+    js_drain_micro(I);                 /* handlers may have called fetch()/then */
+    return n;
+}
+
+int js_vm_has_work(js_vm *vm) {
+    if (!vm) return 0;
+    Interp *I = &vm->I;
+    if (I->mq_count) return 1;
+    for (int i = 0; i < I->ntimers; i++) if (I->timers[i].active) return 1;
+    return I->nlisteners > 0;
+}
+
+void js_vm_destroy(js_vm *vm) {
+    if (!vm) return;
+    arena_free(&vm->I.a);
+    kfree(vm);
 }

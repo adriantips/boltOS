@@ -32,7 +32,7 @@ static int g_font = FONT_ARIAL;
 #define TITLE_H    32
 #define TASKBAR_H  48
 #define RADIUS     9
-#define MAX_WIN    24
+#define MAX_WIN    32
 #define DI_W       80              /* desktop icon cell width  */
 #define DI_H       86              /* desktop icon cell height */
 #define MAX_PW     3840            /* largest panel we allocate backbuffers for */
@@ -381,6 +381,15 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         g_text(x + 10 * s, y + 3 * s, ">", c, s);
         g_fill(x + 7 * s, y + 3 * s, s, 8 * s, c);       /* the slash (vertical hint) */
         g_fill(x + 8 * s, y + 3 * s, s, 8 * s, COL_ACCENT);
+        break;
+    case ICON_DOOM:                              /* a snarling demon face */
+        g_round(x, y, 16 * s, 16 * s, 4 * s, 0x3A0A08, 255);
+        g_round(x + s, y + s, 14 * s, 13 * s, 3 * s, 0x8A1A12, 255);
+        g_fill(x + 3 * s,  y + 5 * s, 3 * s, 3 * s, c);          /* eyes */
+        g_fill(x + 10 * s, y + 5 * s, 3 * s, 3 * s, c);
+        g_fill(x + 6 * s,  y + 3 * s, 4 * s, 2 * s, 0x3A0A08);   /* angry brow */
+        for (int t = 0; t < 5; t++)                             /* teeth */
+            g_fill(x + (3 + t * 2) * s, y + 11 * s, s, 2 * s, 0xE8D2B0);
         break;
     case ICON_TASKMGR:
         g_fill(x + 1 * s, y + 7 * s, 2 * s, 5 * s, c);
@@ -1264,6 +1273,7 @@ void gui_run(void) {
     colorpick_app_init();
     memory_app_init();
     matrix_app_init();
+    doom_app_init();
     settings_app_init();
     /* Every app gets a launcher icon on the desktop; double-click opens it. The
      * taskbar starts empty and only fills with apps as they are opened (or that
@@ -1282,6 +1292,8 @@ void gui_run(void) {
         if (mouse_poll_event()) handle_mouse();
         { int dz = mouse_wheel(); if (dz) handle_wheel(dz); }
         int ci; while ((ci = kbd_trygetc()) >= 0) handle_key((char)ci);
+
+        doom_pump();        /* DOOM self-throttles to ~35 fps and only when focused */
 
         uint64_t now = pit_ticks();
         if (now - tick_pit >= 150) {                 /* ~6.6 Hz: app ticks, animation, sampling

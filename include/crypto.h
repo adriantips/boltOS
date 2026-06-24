@@ -77,3 +77,6 @@ extern const uint8_t x25519_basepoint[32];
 void p256_pub_from_priv(const uint8_t priv[32], uint8_t pub[65]);  /* pub = 0x04||X||Y */
 void p256_clamp_priv(uint8_t priv[32]);                            /* reduce into [1,n-1] */
 int  p256_ecdh(uint8_t out[32], const uint8_t priv[32], const uint8_t peer_pub[65]);
+/* ECDSA verify: pub = 0x04||X||Y, r/s 32-byte big-endian. 0 = valid. */
+int  p256_ecdsa_verify(const uint8_t *hash, uint32_t hlen,
+                       const uint8_t pub[65], const uint8_t r[32], const uint8_t s[32]);

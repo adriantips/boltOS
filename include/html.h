@@ -51,6 +51,7 @@ typedef struct {
     uint32_t  page_bg;          /* <body>/<html> background: HCOL_NONE or 0x1RRGGBB */
     uint32_t  page_fg;          /* <body>/<html> text colour: HCOL_NONE or 0x1RRGGBB */
     char    **scripts; int nscripts, scripts_cap;  /* captured <script> bodies (kmalloc'd) */
+    char    **csslinks; int ncsslinks, csslinks_cap; /* <link rel=stylesheet href> (arena ptrs) */
     /* private storage */
     char     *arena;  uint32_t arena_len, arena_cap;
     int       runs_cap, hrefs_cap, imgs_cap;
@@ -59,6 +60,10 @@ typedef struct {
 
 /* Parse len bytes of HTML into a freshly allocated doc, or NULL on OOM. */
 html_doc *html_parse(const char *src, uint32_t len);
+/* Like html_parse, but pre-seeds the CSS rule set with `css` (concatenated
+ * external stylesheets fetched via <link rel=stylesheet>) so author styles
+ * from .css files apply, not just inline <style> blocks. */
+html_doc *html_parse_ext(const char *src, uint32_t len, const char *css, uint32_t csslen);
 /* Wrap raw text (no markup) into a doc: each newline becomes a line break. */
 html_doc *html_parse_text(const char *src, uint32_t len);
 void      html_free(html_doc *d);

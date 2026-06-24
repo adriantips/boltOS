@@ -1,4 +1,5 @@
 #include "ulibc.h"
+#include "math.h"
 
 /* BoltOS native ring-3 demo. Exercises every new subsystem:
  *   - loaded from /bin/hello by the ELF64 loader
@@ -34,6 +35,14 @@ int main(int argc, char **argv) {
         if (n > 0) { info[n] = 0; printf("--- /proc/meminfo ---\n%s", info); }
         close(fd);
     }
+
+    /* hardware float / libm proof: these run on real SSE registers now, and
+     * the values survive timer preemption thanks to FXSAVE in the scheduler. */
+    double s2 = sqrt(2.0), pi = 4.0 * atan(1.0);
+    printf("libm: sqrt(2)=%.6f  pi=%.6f  sin(pi/6)=%.4f  pow(2,10)=%.1f\n",
+           s2, pi, sin(pi / 6.0), pow(2.0, 10.0));
+    char fb[64]; snprintf(fb, sizeof fb, "snprintf %d/%s/%.2f", 42, "ok", 3.14159);
+    printf("%s\n", fb);
 
     printf("hello: done, exiting 0\n");
     return 0;

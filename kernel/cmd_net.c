@@ -5,6 +5,8 @@
 #include "netif.h"
 #include "http.h"
 #include "html.h"
+#include "dom.h"
+#include "layout.h"
 #include "wifi.h"
 #include "fs.h"
 #include "kheap.h"
@@ -205,6 +207,110 @@ int cmd_browse(int argc, char **argv) {
                : html_parse_text((const char *)n->data, n->size);
     browse_print(d);
     html_free(d);
+    return 0;
+}
+
+/* domq URL|FILE SELECTOR -- parse a page into the BoltDOM tree and run a CSS
+ * selector against it, printing each match's tag, id/class and text. Exercises
+ * the real DOM tree + selector engine (querySelectorAll) deterministically. */
+int cmd_domq(int argc, char **argv) {
+    if (argc < 3) { kprintf("usage: domq URL|FILE SELECTOR\n"); return 1; }
+    const char *url = argv[1];
+    char selbuf[160]; selbuf[0] = 0;            /* join argv[2..] so "a > b" survives word-split */
+    for (int k = 2; k < argc; k++) { if (k > 2) strcat(selbuf, " "); strcat(selbuf, argv[k]); }
+    const char *sel = selbuf;
+    char *buf = 0; const char *data = 0; uint32_t dlen = 0;
+    int http = (strncmp(url,"http://",7)==0) || (strncmp(url,"https://",8)==0);
+    if (!http && url[0] != '/' && strncmp(url,"file:",5) != 0) {
+        const char *slash = strchr(url,'/'), *dot = strchr(url,'.');
+        if (dot && (!slash || dot < slash)) http = 1;
+    }
+    if (http) {
+        if (!netif_default()) { kprintf("domq: no network\n"); return 1; }
+        uint32_t cap = 256*1024; buf = (char *)kmalloc(cap);
+        if (!buf) { kprintf("domq: out of memory\n"); return 1; }
+        char full[300];
+        if (strncmp(url,"http://",7)!=0 && strncmp(url,"https://",8)!=0) { full[0]=0; strcat(full,"http://"); strcat(full,url); url=full; }
+        int code=0; char loc[256];
+        int blen = http_get(url, buf, cap, &code, loc, sizeof(loc));
+        if (blen < 0) { http_err(code); kfree(buf); return 1; }
+        kprintf("HTTP %d, %d bytes\n", code, blen);
+        data = buf; dlen = (uint32_t)blen;
+    } else {
+        const char *p = url; if (strncmp(p,"file:",5)==0) p += 5;
+        fs_node *n = fs_lookup(p);
+        if (!n || n->is_dir) { kprintf("domq: not found: %s\n", p); return 1; }
+        data = (const char *)n->data; dlen = n->size;
+    }
+    dom_document *doc = dom_parse(data, dlen);
+    if (!doc) { kprintf("domq: parse failed\n"); if (buf) kfree(buf); return 1; }
+    dom_node *out[64];
+    int n = dom_query_all(doc->root, sel, out, 64);
+    kprintf("%d match(es) for '%s':\n", n, sel);
+    char txt[160];
+    for (int i = 0; i < n; i++) {
+        const char *id = dom_attr_get(out[i], "id");
+        const char *cl = dom_attr_get(out[i], "class");
+        dom_inner_text(out[i], txt, sizeof(txt));
+        kprintf("  <%s%s%s%s%s> %s\n", out[i]->tag,
+                id ? " #" : "", id ? id : "",
+                cl ? " ." : "", cl ? cl : "", txt);
+    }
+    dom_free(doc);
+    if (buf) kfree(buf);
+    return 0;
+}
+
+/* recursively print the layout box tree with computed geometry + key styles */
+static void print_box(layout_box *b, int depth) {
+    if (!b) return;
+    char ind[24]; int n = depth*2 < 22 ? depth*2 : 22; for (int i=0;i<n;i++) ind[i]=' '; ind[n]=0;
+    if (b->is_text) {
+        char t[40]; int k=0; for (const char*p=b->text; *p && k<38; p++) t[k++]= (*p=='\n'?' ':*p); t[k]=0;
+        kprintf("%s#text [x%d y%d w%d h%d] \"%s\"\n", ind, b->x, b->y, b->w, b->h, t);
+    } else {
+        const char *tag = b->node ? b->node->tag : "?";
+        static const char *dn[] = {"inline","block","inline-block","list-item","flex","grid","none"};
+        kprintf("%s<%s> %s [x%d y%d w%d h%d] m%d,%d,%d,%d p%d fs%d col=%x bg=%x\n",
+                ind, tag, dn[b->st.display], b->x, b->y, b->w, b->h,
+                b->st.margin[0],b->st.margin[1],b->st.margin[2],b->st.margin[3],
+                b->st.padding[0], b->st.fscale, b->st.color & 0xFFFFFF, b->st.bg & 0xFFFFFF);
+    }
+    for (layout_box *c=b->first_child; c; c=c->next) print_box(c, depth+1);
+}
+
+/* domlayout URL|FILE [css] -- parse to DOM, run the cascade + box layout engine
+ * at 760px viewport, and print the computed box tree. */
+int cmd_domlayout(int argc, char **argv) {
+    if (argc < 2) { kprintf("usage: domlayout URL|FILE\n"); return 1; }
+    const char *url = argv[1];
+    char *buf = 0; const char *data = 0; uint32_t dlen = 0;
+    int http = (strncmp(url,"http://",7)==0)||(strncmp(url,"https://",8)==0);
+    if (!http && url[0]!='/' && strncmp(url,"file:",5)!=0) { const char *sl=strchr(url,'/'),*dt=strchr(url,'.'); if(dt&&(!sl||dt<sl))http=1; }
+    if (http) {
+        if (!netif_default()) { kprintf("domlayout: no network\n"); return 1; }
+        uint32_t cap=256*1024; buf=(char*)kmalloc(cap); if(!buf){kprintf("oom\n");return 1;}
+        char full[300]; if(strncmp(url,"http://",7)&&strncmp(url,"https://",8)){full[0]=0;strcat(full,"http://");strcat(full,url);url=full;}
+        int code=0; char loc[256]; int blen=http_get(url,buf,cap,&code,loc,sizeof loc);
+        if(blen<0){http_err(code);kfree(buf);return 1;} kprintf("HTTP %d, %d bytes\n",code,blen);
+        data=buf; dlen=(uint32_t)blen;
+    } else {
+        const char *p=url; if(strncmp(p,"file:",5)==0)p+=5; fs_node*nf=fs_lookup(p);
+        if(!nf||nf->is_dir){kprintf("domlayout: not found: %s\n",p);return 1;} data=(const char*)nf->data; dlen=nf->size;
+    }
+    /* pull inline <style> blocks out for the cascade (external <link> skipped here) */
+    char *css=(char*)kmalloc(64*1024); uint32_t clen=0;
+    if(css){ for(uint32_t i=0;i+7<dlen;i++){ if((data[i]=='<')&&(data[i+1]=='s'||data[i+1]=='S')){
+            if(strncmp(data+i,"<style",6)==0||strncmp(data+i,"<STYLE",6)==0){ uint32_t j=i+6; while(j<dlen&&data[j]!='>')j++; j++;
+                uint32_t s0=j; while(j+7<dlen&&!(data[j]=='<'&&(data[j+1]=='/')&&(data[j+2]=='s'||data[j+2]=='S')))j++;
+                uint32_t n=j-s0; if(clen+n<64*1024-1){memcpy(css+clen,data+s0,n);clen+=n;css[clen++]='\n';} i=j; } } } css[clen]=0; }
+    dom_document *doc=dom_parse(data,dlen);
+    if(!doc){kprintf("domlayout: dom parse failed\n");if(css)kfree(css);if(buf)kfree(buf);return 1;}
+    layout_tree *lt=layout_build(doc,css,clen,760);
+    if(!lt){kprintf("domlayout: layout failed\n");dom_free(doc);if(css)kfree(css);if(buf)kfree(buf);return 1;}
+    kprintf("viewport 760px, doc height %d px:\n", lt->doc_h);
+    print_box(lt->root, 0);
+    layout_free(lt); dom_free(doc); if(css)kfree(css); if(buf)kfree(buf);
     return 0;
 }
 

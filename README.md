@@ -5,14 +5,19 @@ GRUB, no Multiboot, no external libraries. Custom MBR boot chain, own kernel.
 
 > Status: **active development.** Custom boot chain (stage1 → stage2 → long mode)
 > into a 64-bit C kernel. Features include a framebuffer compositor and windowed
-> **GUI desktop with 20+ apps**, a preemptive **round-robin scheduler** with
-> processes and **ring-3 userland** (ELF64 loader + syscalls), physical and
-> virtual memory management, a **persistent filesystem on real ATA disks
-> (HDD/SSD)** behind a VFS, hardware interrupts, keyboard and mouse drivers, an
-> interactive shell, a full **IPv4/TCP/UDP/TLS network stack** on an e1000 NIC, a
-> **multi-language IDE** with from-scratch **C / C++ / C# compilers** and a
-> **Python interpreter**, a **GPU / display-adapter driver**, support for running
-> real **Windows PE32+ executables**, **PC-speaker audio**, and an image decoder.
+> **GUI desktop with 20+ apps** (including a playable port of **DOOM**), a
+> preemptive **round-robin scheduler** with processes and **ring-3 userland**
+> (ELF64 loader + syscalls), physical and virtual memory management, a
+> **persistent filesystem on real ATA / NVMe disks (HDD/SSD)** behind a VFS and a
+> generic block layer, hardware interrupts, keyboard and mouse drivers, an
+> **xHCI USB** host-controller driver, an interactive shell, a full
+> **IPv4/TCP/UDP/TLS 1.2+1.3 network stack** (with X.509 certificate verification)
+> on an e1000 NIC, a **standards-ish web browser** with a real DOM tree, CSS
+> cascade, box/flex/grid layout engine and a from-scratch **JavaScript
+> interpreter**, a **multi-language IDE** with from-scratch **C / C++ / C#
+> compilers** and a **Python interpreter**, a **GPU / display-adapter driver**,
+> support for running real **Windows PE32+ executables**, **PC-speaker audio**,
+> and an image decoder.
 
 ## Desktop & apps
 
@@ -27,7 +32,8 @@ Bundled apps:
 
 - **Terminal** — the full interactive shell in a window
 - **File Explorer** — browse/open the persistent filesystem
-- **Browser** — HTML renderer over the kernel's own HTTP/HTTPS stack
+- **Browser** — a layout-engine web browser (DOM + CSS cascade + box/flex/grid +
+  JavaScript) over the kernel's own HTTP/HTTPS stack
 - **Code** — a multi-language IDE (C / C++ / C# / Python) with syntax
   highlighting, line numbers, a Run button and an output console
 - **Task Manager** — live process / CPU / memory view
@@ -35,8 +41,8 @@ Bundled apps:
 - **Calculator**, **Clock**, **Stopwatch**, **Calendar**, **Notes** (saved to FS)
 - **Paint**, **Color Picker**, **Piano** (PC-speaker, zoomable multi-octave)
 - **System Info**, **Matrix** rain
-- Games: **Minesweeper**, **Snake**, **2048**, **Tic-Tac-Toe**, **Memory match**,
-  **Conway's Game of Life**
+- Games: **DOOM** (real doomgeneric port, playable E1M1), **Minesweeper**,
+  **Snake**, **2048**, **Tic-Tac-Toe**, **Memory match**, **Conway's Game of Life**
 
 > No hardware floating point in the kernel — everything is fixed-point / integer
 > math (FPU/SSE state isn't saved across the scheduler).
@@ -51,7 +57,11 @@ traps into the kernel via `syscall` (`kernel/syscall.asm` + `syscall.c`) for I/O
 A preemptive **round-robin scheduler** (`kernel/sched.c`) with per-process
 state (`kernel/proc.c`) time-slices processes off the PIT.
 
-## Storage (HDD / SSD) + VFS
+## Storage (HDD / SSD / NVMe) + VFS
+
+Storage sits behind a **generic block layer** (`kernel/blk.c` + `include/blk.h`):
+a small registry of `blkdev_t` transports plus shared MBR-partition helpers, so
+the filesystem doesn't care whether a disk is ATA or NVMe.
 
 An **ATA/IDE PIO block driver** (`drivers/ata.c`) probes the legacy ATA register
 file on both channels (ports `0x1F0/0x3F6` and `0x170/0x376`), runs `IDENTIFY` on
@@ -60,33 +70,77 @@ both spinning **HDDs** and **SSDs**; the two are told apart from IDENTIFY word 2
 (nominal media rotation rate: `1` = non-rotating = SSD). ATAPI/CD-ROM slots are
 detected and skipped.
 
+An **NVMe driver** (`drivers/nvme.c`) brings up a controller over PCI/MMIO: it
+sets up the admin queue pair, runs `IDENTIFY`, creates one I/O queue pair, and
+registers namespace 1 with the block layer. It is polled — completions are read
+off the CQ phase bit — which fits BoltOS's synchronous, one-command-at-a-time I/O.
+
 The filesystem (**BoltFS**, `fs/ramfs.c`) is reached through a **VFS layer**
 (`kernel/vfs.c`). It is no longer RAM-only: `fs_persist_init()` attaches the first
-non-boot ATA disk, **loads a saved image on boot** (or formats the seed tree if
-none), and autosaves the whole tree on every mutation, so files survive reboots.
-The on-disk format is a superblock plus a serialised pre-order node list.
-`diskinfo` lists detected disks + media type; `sync` forces a flush. QEMU exposes
-two data disks (`run.sh`): one as an HDD (`rotation_rate=7200`), one as an SSD
-(`rotation_rate=1`).
+non-boot disk (preferring NVMe, then SSD, then HDD), **loads a saved image on
+boot** (or formats the seed tree if none), and autosaves the whole tree on every
+mutation, so files survive reboots. The on-disk format is a superblock plus a
+serialised pre-order node list. `diskinfo` lists detected disks + media type;
+`sync` forces a flush. QEMU exposes data disks (`run.sh`) across both transports.
 
 ## Web browser & network stack
 
-A windowed **Browser** renders basic HTML — headings, paragraphs, lists, links,
-bold, preformatted text, and **inline images**. It loads:
+The windowed **Browser** is no longer an HTML flattener — it is a small but real
+rendering engine. A page is parsed into a **DOM tree** (`kernel/dom.c`): a proper
+tokenizer + tree builder with implicit-close rules, void/self-close/raw-text
+handling, and a **selector engine** (type/`.class`/`#id`/universal, compound
+selectors, descendant and child combinators, selector lists) backing
+`querySelector` / `querySelectorAll` plus DOM mutations.
 
-- **`http://` and `https://` pages** over the kernel's own stack
-  (DNS → TCP → TLS → HTTP/1.0). HTTPS uses an in-kernel TLS 1.2 client
-  (ECDHE-X25519 + AES-128-GCM + SHA-256, `net/tls.c` + `net/crypto.c`). The
-  server certificate is **not** verified — it resists passive eavesdropping,
-  not an active MITM — and TLS 1.3-only / gzipped / chunked sites won't render.
+On top of the tree sits a **CSS cascade + layout engine** (`kernel/layout.c`):
+
+- **Cascade** — `#hex` / `rgb()` / `rgba()` / `hsl()` / `hsla()` / named /
+  `transparent` colors, selector **specificity** (a,b,c) + source order,
+  property **inheritance**, intrinsic tag defaults, and inline `style=""`.
+- **Layout** — the box model (margin / padding / border / width → border-box),
+  **block** + **inline** flow with text word-wrap on the bitmap-font grid,
+  **flexbox** (row/column, `flex-grow`, `gap`, `justify-content`, `align-items`)
+  and **CSS grid** (px + `fr` tracks, `repeat()`, gaps, row wrapping).
+
+This box tree is what the Browser actually paints — backgrounds, borders, wrapped
+text, images, inputs and hit-tested links — relaid out on width change
+(responsive). A flat run-list path is kept as a fallback for plain text and a few
+scrape targets.
+
+A from-scratch **JavaScript interpreter** (`kernel/js.c`, "BoltJS") runs page
+scripts: lexer → recursive-descent (precedence-climbing) parser → AST walker.
+Numbers are int64 (no FPU). It is wired to the **real DOM**:
+`document.querySelector`, `createElement`, `appendChild`, `setAttribute` /
+`getAttribute`, element `id` / `className` / `href` / `value`, `document.cookie`,
+and `localStorage` / `sessionStorage`; mutations trigger reflow. A **persistent VM**
+lives for the page's lifetime, so it also has an **event loop**:
+`addEventListener` with click dispatch, `setTimeout` / `setInterval` /
+`requestAnimationFrame` (driven off the PIT tick), and **`fetch()` returning real
+Promises** (`.then` / `.catch` / `.finally`, `Promise.resolve` / `reject` / `all`,
+`new Promise`) drained through a microtask queue, plus `JSON.parse` / `stringify`.
+The `js` shell command runs code inline (`js -c "…"`) or a script from the
+filesystem (`js FILE.js`).
+
+Pages load over the kernel's own stack (DNS → TCP → TLS → HTTP/1.1):
+
+- **`http://` and `https://`** with cookies, redirects, keep-alive, and **gzip /
+  deflate** content-encoding (`net/inflate.c`). HTTPS uses an in-kernel
+  **TLS 1.2 *and* 1.3 client** (`net/tls.c` + `net/crypto.c`): ECDHE over
+  **X25519 / secp256r1 (P-256)**, **AES-128-GCM-SHA256** and
+  **AES-256-GCM-SHA384**. The server **certificate chain is now verified**
+  (`net/x509.c` + `net/rsa.c` + `net/p256.c` / `net/p384.c`): RSA PKCS#1 v1.5 /
+  PSS and ECDSA P-256 signatures, hostname and validity dates, against a small
+  runtime trust-anchor store — so it resists an active MITM, not just passive
+  eavesdropping.
 - **local HTML files** from the filesystem (e.g. the bundled `/web/index.html`).
 
 Click links to navigate, type a URL in the address bar, `<` goes back, and the
 scrollbar / Space / `b` / `j` / `k` scroll. The data path rides the **e1000 NIC**
 driver (`drivers/e1000.c`) over QEMU/VirtualBox NAT, with a from-scratch stack:
-ARP, IPv4, ICMP, UDP, TCP, DNS, HTTP (`net/*.c`). Wi-Fi association is scaffolded
-in the kernel but still needs a radio driver — see the `wifi` command. The shell
-also has `browse URL` (render a page as text) and `download URL` (save to the FS).
+ARP, IPv4, ICMP, UDP, TCP, DNS, HTTP, a **firewall** (`net/firewall.c`), and TLS
+(`net/*.c`). Wi-Fi association is scaffolded in the kernel but still needs a radio
+driver — see the `wifi` command. The shell also has `browse URL` (render a page as
+text) and `download URL` (save to the FS).
 
 ## IDE & compilers (BoltCC + BoltPy)
 
@@ -137,6 +191,25 @@ run it from the shell with `winrun` (no args = the embedded demo, or
 `winrun /path/to/app.exe`). The image is position-independent (RIP-relative), so
 no base relocations are needed once imports are bound.
 
+## DOOM
+
+BoltOS runs **real DOOM**. The **doomgeneric** port lives under `doom/`, built
+against a tiny in-house freestanding libc shim (`doom/dg_libc.c`) and a BoltOS
+platform layer (`doom/doomgeneric_boltos.c`); the shareware WAD is embedded in the
+kernel image as a blob. The **DOOM** desktop app (`kernel/app_doom.c`) pumps the
+engine, routes keyboard input, and blits the engine's 640×400 framebuffer into its
+window — E1M1 is playable. As everywhere else there is no FPU, so the port is
+driven with integer math only.
+
+## USB (xHCI)
+
+An **xHCI USB host-controller driver** (`drivers/xhci.c`) brings up the controller
+(DCBAA, command ring, single-segment event ring, scratchpad buffers) and, for each
+connected root-hub port, resets it, issues **Enable Slot** / **Address Device**,
+and walks EP0 control transfers to read the device and configuration descriptors.
+Enumerated devices are reported at boot. The driver is polled, matching the rest of
+the kernel's synchronous I/O model.
+
 ## Boot flow (from scratch)
 
 ```
@@ -184,13 +257,14 @@ build VirtualBox-friendly images.
 
 ```
 boot/           Custom MBR bootloader (stage1, stage2)
-drivers/        Hardware drivers (framebuffer, GPU/display, keyboard, mouse, ATA HDD/SSD, e1000, PC speaker)
-fs/             Filesystem (BoltFS: in-RAM tree, persisted to an ATA disk)
+doom/           Vendored doomgeneric port + in-house libc shim + BoltOS platform layer
+drivers/        Hardware drivers (framebuffer, GPU/display, keyboard, mouse, ATA HDD/SSD, NVMe, xHCI USB, e1000, PC speaker)
+fs/             Filesystem (BoltFS: in-RAM tree, persisted via the block layer)
 include/        Kernel and system headers
-kernel/         Core kernel: scheduler, processes, syscalls, ELF + PE loaders, GUI + apps, shell, BoltCC compilers, Python
+kernel/         Core kernel: scheduler, processes, syscalls, ELF + PE loaders, block layer, GUI + apps, shell, browser engine (DOM/layout), BoltCC compilers, Python + JS
 libc/           Freestanding C library subset
 mm/             Memory management (PMM, heap, virtual memory, DMA)
-net/            Network stack (ARP, IP, ICMP, UDP, TCP, DNS, HTTP, TLS, crypto, e1000 glue, Wi-Fi)
+net/            Network stack (ARP, IP, ICMP, UDP, TCP, DNS, HTTP, TLS 1.2/1.3, crypto, RSA, X.509, inflate, firewall, e1000 glue, Wi-Fi)
 user/           Ring-3 userland program (crt0, ulibc) -> static ELF64
 linker.ld       Flat-binary kernel layout @ 0x100000
 build.sh        Full build script → raw disk image + bootable ISO
@@ -199,13 +273,15 @@ run.sh          QEMU launcher
 
 ## Project Stats
 
-- **Total Lines of Code:** ~20,870
-  - **C:** ~18,250 lines
-  - **Assembly:** 708 lines
-  - **Headers:** ~1,655 lines
-  - **Shell Scripts:** 160 lines
+First-party code (excludes the vendored `doom/` doomgeneric port):
+
+- **Total Lines of Code:** ~30,000
+  - **C:** ~26,770 lines
+  - **Headers:** ~2,495 lines
+  - **Assembly:** 729 lines
+  - **Shell Scripts:** ~160 lines
   - **Linker Scripts:** 62 lines
-  - **Python (build tools):** 46 lines
+  - **Python (build tools):** ~46 lines
 
 ## Available Shell Commands
 
@@ -217,89 +293,48 @@ The interactive OS shell supports a wide range of commands:
 - **Process Management:** `ps`, `kill`, `top`, `freeze`, `resume`, `services`, `service`, `jobs`, `priority`, `monitor`
 - **System (cont.):** `winrun` (run a Windows PE32+ `.exe` via the in-kernel loader)
 - **Networking:** `netinfo`, `ping`, `trace`, `ports`, `download`, `browse`, `upload`, `wifi`, `firewall`, `share`, `scan`
-- **Language:** `python` (BoltPy interpreter / REPL); the **Code** app compiles C / C++ / C#
+- **Language:** `python` (BoltPy interpreter / REPL), `js` (BoltJS interpreter, `js -c "…"` or `js FILE.js`); the **Code** app compiles C / C++ / C#
 - **Bonus / Unique:** `focus`, `snapshot`, `timeline`, `vault`, `doctor`, `assistant`, `sandbox`, `workspace`, `panic`, `story`
 - **Core:** `help`, `echo`, `clear`, `mem`
 
 ## Full File Tree
 
 ```text
-+-- .gitignore
 +-- README.md
-+-- boot
-|   +-- stage1.asm
-|   \-- stage2.asm
-+-- build.sh
-+-- run.sh
-+-- build-and-run-vbox.bat
-+-- rebuild-all.ps1
-+-- rebuild-vdi.ps1
-+-- mkhpfs.py
-+-- tree.py
++-- BROWSER_UPGRADE.md     Browser engine upgrade plan + status log
++-- build.sh  run.sh       Build (-> disk image + ISO) and QEMU launcher
++-- build-and-run-vbox.bat  rebuild-all.ps1  rebuild-vdi.ps1   VirtualBox image helpers
++-- shot.py  testnet.py    GUI screendump + network test harnesses (over QEMU QMP)
 +-- linker.ld
-+-- drivers
-|   +-- ata.c
-|   +-- e1000.c
-|   +-- framebuffer.c
-|   +-- gpu.c
-|   +-- keyboard.c
-|   +-- mouse.c
-|   \-- pcspk.c
-+-- fs
-|   \-- ramfs.c
-+-- include
-|   +-- ata.h            +-- gdt.h            +-- net.h
-|   +-- boltcc.h         +-- gpu.h            +-- pe.h
-|   +-- boltpy.h         +-- gui.h            +-- netif.h
-|   +-- boot.h           +-- html.h           +-- pic.h
-|   +-- commands.h       +-- http.h           +-- pit.h
-|   +-- console.h        +-- hw.h             +-- pmm.h
-|   +-- crypto.h         +-- image.h          +-- proc.h
-|   +-- dma.h            +-- interrupts.h     +-- sched.h
-|   +-- driver.h         +-- io.h             +-- serial.h
-|   +-- elf.h            +-- keyboard.h       +-- settings.h
-|   +-- firmware.h       +-- kheap.h          +-- shell.h
-|   +-- framebuffer.h    +-- kprintf.h        +-- string.h
-|   +-- fs.h             +-- mm.h             +-- syscall.h
-|   +-- ...              +-- mmio.h           +-- sysreg.h
-|   +-- mouse.h          +-- tls.h            +-- vfs.h
-|   +-- vmm.h            \-- wifi.h
-+-- kernel
-|   +-- app_2048.c       +-- app_terminal.c   +-- gui.c
-|   +-- app_browser.c    +-- app_ttt.c        +-- hw.c
-|   +-- app_calc.c       +-- boltpy.c         +-- idt.c
-|   +-- app_calendar.c   +-- boot.asm         +-- image.c
-|   +-- app_clock.c      +-- cmd_extra.c      +-- interrupts.c
-|   +-- app_colorpick.c  +-- cmd_fs.c         +-- isr.asm
-|   +-- app_files.c      +-- cmd_net.c        +-- kprintf.c
-|   +-- app_life.c       +-- cmd_proc.c       +-- main.c
-|   +-- app_matrix.c     +-- cmd_python.c     +-- pci.c
-|   +-- app_memory.c     +-- cmd_sys.c        +-- pic.c
-|   +-- app_mines.c      +-- console.c        +-- pit.c
-|   +-- app_notes.c      +-- elf.c            +-- proc.c
-|   +-- app_paint.c      +-- font8x8.c        +-- sched.c
-|   +-- app_piano.c      +-- gdt.c            +-- serial.c
-|   +-- app_ide.c        +-- settings.c       +-- shell.c
-|   +-- app_settings.c   +-- syscall.asm      +-- sysreg.c
-|   +-- app_snake.c      +-- syscall.c        +-- user.asm
-|   +-- app_stopwatch.c  +-- app_sysinfo.c    +-- boltcc.c
-|   \-- pe.c
-+-- libc
++-- boot/
+|   +-- stage1.asm  stage2.asm
++-- doom/                  Vendored doomgeneric port (+ dg_libc.c, doomgeneric_boltos.c)
++-- drivers/
+|   +-- ata.c    e1000.c   framebuffer.c  gpu.c   keyboard.c
+|   +-- mouse.c  nvme.c     pcspk.c        xhci.c
++-- fs/
+|   \-- ramfs.c            BoltFS (in-RAM tree, persisted via the block layer)
++-- include/               58 kernel/system headers (blk, dom, layout, js, nvme, xhci, rsa, x509, ...)
++-- kernel/
+|   +-- main.c   boot.asm  shell.c        console.c   gui.c       hw.c
+|   +-- sched.c  proc.c    syscall.c/.asm  elf.c       pe.c        idt.c
+|   +-- interrupts.c  isr.asm  pic.c  pit.c  pci.c  serial.c  settings.c  vfs.c
+|   +-- blk.c             Generic block layer (ATA/NVMe registry + MBR helpers)
+|   +-- dom.c   layout.c  html.c          Browser engine: DOM tree, CSS cascade, box/flex/grid layout
+|   +-- js.c    cmd_js.c  boltcc.c  boltpy.c   JavaScript, C/C++/C#, Python
+|   +-- image.c  font8x8.c  kprintf.c  gdt.c  sysreg.c  user.asm
+|   +-- cmd_extra.c  cmd_fs.c  cmd_net.c  cmd_proc.c  cmd_python.c  cmd_sys.c
+|   \-- app_*.c           23 desktop apps (browser, files, ide, taskmgr, doom, paint, games, ...)
++-- libc/
 |   \-- string.c
-+-- mm
-|   +-- dma.c
-|   +-- kheap.c
-|   +-- pmm.c
-|   \-- vmm.c
-+-- net
-|   +-- arp.c    +-- driver.c   +-- firmware.c  +-- icmp.c   +-- netif.c  +-- tls.c
-|   +-- crypto.c +-- dns.c      +-- eth.c       +-- ip.c     +-- tcp.c    +-- udp.c
-|   \-- http.c   \-- wifi.c
-\-- user
-    +-- crt0.asm
-    +-- hello.c
-    +-- winhello.c
-    +-- ulibc.c
-    +-- ulibc.h
++-- mm/
+|   +-- dma.c  kheap.c  pmm.c  vmm.c
++-- net/
+|   +-- arp.c   eth.c    ip.c    icmp.c  udp.c   tcp.c   dns.c   netif.c
+|   +-- http.c  inflate.c  firewall.c  driver.c  firmware.c  wifi.c
+|   +-- tls.c   crypto.c  rsa.c   x509.c  p256.c  p384.c     TLS 1.2/1.3 + cert verification
+\-- user/
+    +-- crt0.asm  hello.c  winhello.c     Ring-3 ELF64 + a real PE32+ demo
+    +-- ulibc.c/.h  boltrt.c  libm.c  stdlib_ext.c  stdio.h  stdlib.h  math.h  ctype.h
     \-- user.ld
 ```

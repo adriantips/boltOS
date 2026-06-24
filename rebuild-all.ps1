@@ -15,10 +15,10 @@ bash $d/build.sh
 & $vb closemedium disk $vdi 2>$null
 Remove-Item $vdi -Force -ErrorAction SilentlyContinue
 
-# Step 4: Pad os.img to 1 MB (VDI minimum) and convert
+# Step 4: Pad os.img to at least 1 MB (VDI minimum) and convert
 Copy-Item $img $pad
-$f = [System.IO.File]::OpenWrite($pad)
-$f.SetLength(1048576)
+$f = New-Object System.IO.FileStream($pad, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite)
+if ($f.Length -lt 1048576) { $f.SetLength(1048576) }
 $f.Close()
 & $vb convertfromraw $pad $vdi --format VDI
 Remove-Item $pad

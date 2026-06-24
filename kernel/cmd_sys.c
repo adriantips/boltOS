@@ -2,6 +2,7 @@
 #include "commands.h"
 #include "hw.h"
 #include "fs.h"
+#include "blk.h"
 #include "pmm.h"
 #include "kheap.h"
 #include "pit.h"
@@ -144,14 +145,13 @@ int cmd_diskinfo(int argc, char **argv) {
     }
     if (!found) kprintf("ctrl   : (no PCI storage controller reported)\n");
 
-    int dn = ata_count();
-    kprintf("ATA disks: %d\n", dn);
+    int dn = blk_count();
+    kprintf("block devices: %d\n", dn);
     for (int i = 0; i < dn; i++) {
-        ata_dev *d = ata_get(i);
-        char sz[12]; sh_human(d->sectors * ATA_SECTOR, sz);
-        kprintf("  [%d] %s  %s  %s  %s%s\n", i, ata_media(d), sz,
-                d->lba48 ? "lba48" : "lba28",
-                (d->io_base == 0x1F0 && d->slave == 0) ? "boot " : "",
+        blkdev_t *d = blk_get(i);
+        char sz[12]; sh_human(d->sectors * d->sector_size, sz);
+        kprintf("  [%d] %-8s %s  %s  %s%s\n", i, d->name, blk_media(d), sz,
+                d->is_boot ? "boot " : "",
                 d->model[0] ? d->model : "(disk)");
     }
 

@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "framebuffer.h"
 #include "pit.h"
+#include "io.h"
 
 extern const unsigned char font8x8_basic[128][8];
 
@@ -116,6 +117,16 @@ void console_clear(void) {
     cur_last = pit_ticks();
 }
 
+/* Ping the Bochs VBE DISPI enable register to force VirtualBox (under NEM) to
+ * re-examine the framebuffer content. Also on plain QEMU this is a harmless
+ * no-op that re-asserts the same state. */
+static void vbe_ping(void) {
+    outw(0x01CE, 4);               /* DI_ENABLE */
+    outw(0x01CF, 0);               /* disable   */
+    outw(0x01CE, 4);
+    outw(0x01CF, 0x41);           /* enable + LFB */
+}
+
 void console_init(void) {
     if (!fb_present()) { on_fb = 0; return; }
     on_fb = 1;
@@ -129,6 +140,7 @@ void console_init(void) {
     fb_rect(0, H - 52, W, 52, 0x0D0D0F);     /* taskbar */
     fb_rect(0, H - 52, W, 1,  0x2E2E38);
     draw_bolt(30, H - 44, 0x5E6EFF);          /* bolt logo */
+    vbe_ping();                                /* flush to VirtualBox display */
 
     bottom = H - 60;
     cols = (W - 2 * MARGIN) / CELL; if (cols > MAXCOLS) cols = MAXCOLS;

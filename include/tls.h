@@ -2,12 +2,16 @@
 #include <stdint.h>
 
 /* ===========================================================================
- *  Minimal TLS 1.2 client over the BoltOS TCP stack. One cipher family:
- *  ECDHE (X25519) + AES-128-GCM + SHA-256, matching what virtually every public
- *  HTTPS server still offers for TLS 1.2. The server certificate is parsed past
- *  but NOT verified -- there is no clock or trust store -- so this protects
- *  against passive eavesdropping only, not active MITM. Good enough to fetch a
- *  page; do not type secrets into it. Blocking and poll-driven, like tcp_*.
+ *  TLS client over the BoltOS TCP stack. Negotiates TLS 1.3 (X25519 key share,
+ *  TLS_AES_128/256_GCM_SHA256/384) and falls back to TLS 1.2 (ECDHE X25519 /
+ *  P-256 + AES-GCM) when the server lacks 1.3.
+ *
+ *  On the 1.3 path the server's X.509 chain is validated (net/x509.c): hostname
+ *  against the leaf SAN, validity dates against the RTC, the full cryptographic
+ *  chain linkage (RSA PKCS#1v1.5 / PSS and ECDSA P-256/P-384), and the
+ *  CertificateVerify signature. Trust anchoring is enforced when roots are
+ *  installed (x509_add_root); with an empty store the anchor is left unverified
+ *  rather than blocking connectivity. Blocking and poll-driven, like tcp_*.
  * ===========================================================================*/
 
 struct tls_conn;

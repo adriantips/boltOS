@@ -22,6 +22,17 @@ _start:
     lea     rsp, [rel stack_top]    ; real kernel stack (higher-half)
     mov     rbx, rdi                ; preserve bootinfo pointer (phys, identity-mapped)
 
+    ; --- enable hardware FPU/SSE before any SSE-emitting C runs ---
+    ; CR0: clear EM (bit2, no x87 emulation), set MP (bit1, monitor coproc)
+    mov     rax, cr0
+    and     ax, 0xFFFB              ; ~EM
+    or      ax, 0x0002             ; MP
+    mov     cr0, rax
+    ; CR4: set OSFXSR (bit9, enable FXSAVE/SSE) + OSXMMEXCPT (bit10, #XM faults)
+    mov     rax, cr4
+    or      rax, (1 << 9) | (1 << 10)
+    mov     cr4, rax
+
     ; zero .bss
     lea     rdi, [rel __bss_start]
     lea     rcx, [rel __bss_end]
@@ -41,5 +52,5 @@ _start:
 section .bss
 align 16
 stack_bottom:
-    resb 65536                      ; 64 KiB kernel stack
+    resb 524288                     ; 512 KiB kernel stack (DOOM recursion + compositor)
 stack_top:

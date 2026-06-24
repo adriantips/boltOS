@@ -21,6 +21,8 @@ exec "$QEMU" \
     -device ide-hd,drive=hdd,bus=ide.1,unit=0,rotation_rate=7200 \
     -drive id=ssd,file="$ROOT/iso/disk-ssd.img",format=raw,if=none \
     -device ide-hd,drive=ssd,bus=ide.1,unit=1,rotation_rate=1 \
+    -drive id=nvm,file="$ROOT/iso/disk-nvme.img",format=raw,if=none \
+    -device nvme,drive=nvm,serial=BOLTNVME01 \
     -boot order=c \
     -m 2G \
     -rtc base=utc \
@@ -29,6 +31,9 @@ exec "$QEMU" \
     -machine pcspk-audiodev=snd0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
+    -device usb-mouse,bus=xhci.0 \
     -serial stdio \
     -no-reboot -no-shutdown \
     "$@"

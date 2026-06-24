@@ -27,3 +27,7 @@ int  http_conn_can_reuse(struct http_conn *c, const char *url);
 int  http_fetch(struct http_conn *c, const char *url, char *out, uint32_t cap,
                 int *status, char *location, uint32_t loc_cap);
 void http_close_conn(struct http_conn *c);
+
+/* Cookie jar access for document.cookie. get -> "k=v; k2=v2" for host. */
+int  http_cookie_get(const char *host, char *out, uint32_t cap);
+void http_cookie_set(const char *host, const char *kv);
