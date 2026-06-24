@@ -17,9 +17,10 @@ CLANG=$M/ucrt64/bin/clang.exe
 LLD=$M/ucrt64/bin/ld.lld.exe
 OBJCOPY=$M/ucrt64/bin/objcopy.exe
 
-CFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie
+CFLAGS=(--target=x86_64-elf -ffreestanding -fno-pic -fno-pie
         -mcmodel=kernel
         -mno-red-zone -msse -msse2 -mno-mmx -mno-80387
+        -fstack-protector-strong -mstack-protector-guard=global
         -Wall -Wextra -O2 -std=c11 -Iinclude -c)
 
 mkdir -p build iso
@@ -27,10 +28,13 @@ mkdir -p build iso
 echo "[1/6] stage1.asm"
 "$NASM" -f bin boot/stage1.asm -o build/stage1.bin
 
-echo "[2/6] kernel asm (boot + isr + syscall)"
+echo "[2/6] kernel asm (boot + isr + syscall + AP trampoline)"
 "$NASM" -f elf64 kernel/boot.asm    -o build/kboot.o
 "$NASM" -f elf64 kernel/isr.asm     -o build/isr.o
 "$NASM" -f elf64 kernel/syscall.asm -o build/sc_entry.o
+# SMP application-processor trampoline: flat 16/32/64-bit blob copied to 0x8000
+"$NASM" -f bin kernel/ap_boot.asm -o build/ap_boot.bin
+( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 ap_boot.bin ap_boot_blob.o )
 
 echo "[2b/6] user program (user/hello.c) -> static ELF64 -> embed blob"
 UCFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie
@@ -77,21 +81,22 @@ echo "[3/6] kernel C sources"
 SRCS=(
     kernel/main.c kernel/serial.c kernel/console.c kernel/shell.c kernel/kprintf.c kernel/font8x8.c
     kernel/gdt.c kernel/idt.c kernel/interrupts.c kernel/pic.c kernel/pit.c
+    kernel/acpi.c kernel/apic.c kernel/hpet.c kernel/smp.c
     kernel/hw.c kernel/pci.c kernel/sysreg.c kernel/sched.c kernel/syscall.c
     kernel/vfs.c kernel/proc.c kernel/elf.c kernel/pe.c kernel/blk.c
     net/netif.c net/driver.c net/eth.c net/arp.c net/ip.c net/icmp.c net/udp.c
     net/tcp.c net/dns.c net/crypto.c net/tls.c net/p256.c net/p384.c net/rsa.c net/x509.c net/inflate.c net/http.c
-    net/wifi.c net/firmware.c net/firewall.c drivers/e1000.c
-    kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c
-    kernel/html.c kernel/dom.c kernel/layout.c kernel/image.c
+    net/wifi.c net/firmware.c net/firewall.c net/dhcp.c drivers/e1000.c
+    kernel/cmd_fs.c kernel/cmd_sys.c kernel/cmd_proc.c kernel/cmd_net.c kernel/cmd_extra.c kernel/cmd_hw.c
+    kernel/html.c kernel/dom.c kernel/layout.c kernel/image.c kernel/ttf.c
     kernel/gui.c kernel/app_terminal.c kernel/app_taskmgr.c kernel/app_settings.c kernel/app_browser.c kernel/app_files.c
     kernel/app_ide.c kernel/app_calc.c kernel/app_clock.c kernel/app_notes.c kernel/app_calendar.c kernel/app_piano.c kernel/app_paint.c kernel/app_mines.c kernel/app_snake.c kernel/app_2048.c kernel/app_stopwatch.c kernel/app_sysinfo.c kernel/app_life.c kernel/app_ttt.c kernel/app_colorpick.c kernel/app_memory.c kernel/app_matrix.c kernel/app_doom.c
-    kernel/settings.c
+    kernel/settings.c kernel/clipboard.c kernel/stackguard.c kernel/users.c kernel/pkg.c
     kernel/boltpy.c kernel/cmd_python.c kernel/boltcc.c kernel/js.c kernel/cmd_js.c
-    fs/ramfs.c
-    drivers/keyboard.c drivers/framebuffer.c drivers/gpu.c drivers/mouse.c drivers/ata.c drivers/nvme.c drivers/xhci.c drivers/pcspk.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
+    fs/ramfs.c fs/fat32.c fs/ext2.c
+    drivers/keyboard.c drivers/framebuffer.c drivers/gpu.c drivers/mouse.c drivers/ata.c drivers/ahci.c drivers/nvme.c drivers/xhci.c drivers/pcspk.c drivers/ac97.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
 )
-KOBJS=(build/kboot.o build/isr.o build/sc_entry.o build/hello_blob.o build/winhello_blob.o build/boltrt_blob.o)
+KOBJS=(build/kboot.o build/isr.o build/sc_entry.o build/ap_boot_blob.o build/hello_blob.o build/winhello_blob.o build/boltrt_blob.o)
 for c in "${SRCS[@]}"; do
     o="build/$(basename "${c%.c}").o"
     "$CLANG" "${CFLAGS[@]}" "$c" -o "$o"
@@ -129,8 +134,25 @@ cp doom/doom1.wad build/doom1.wad
 ( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 doom1.wad doom1_wad.o )
 KOBJS+=(build/doom1_wad.o)
 
+echo "[3d/6] embed a TrueType font (font.ttf -> blob)"
+# A monospace TrueType face for the scalable/anti-aliased text renderer. Copied
+# from the host's Lucida Console if present; the kernel falls back to its 8x16
+# bitmap face when no glyf-based TTF is embedded.
+if [ ! -f assets/font.ttf ]; then
+    mkdir -p assets
+    for c in /c/Windows/Fonts/lucon.ttf /c/Windows/Fonts/cour.ttf /mnt/c/Windows/Fonts/lucon.ttf; do
+        [ -f "$c" ] && { cp "$c" assets/font.ttf; break; }
+    done
+fi
+[ -f assets/font.ttf ] || { echo "WARN: no font.ttf; embedding an empty blob"; : > assets/font.ttf; }
+cp assets/font.ttf build/font.ttf
+( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 font.ttf font_ttf.o )
+KOBJS+=(build/font_ttf.o)
+
 echo "[4/6] link kernel -> flat binary"
 "$LLD" -m elf_x86_64 -T linker.ld --oformat binary -o build/kernel.bin "${KOBJS[@]}"
+# Also emit an ELF with symbols (same objects/order) for debugging/addr2line.
+"$LLD" -m elf_x86_64 -T linker.ld -o build/kernel.elf "${KOBJS[@]}" 2>/dev/null || true
 
 KSIZE=$(stat -c %s build/kernel.bin)
 KSECT=$(( (KSIZE + 511) / 512 ))
@@ -164,6 +186,29 @@ for d in iso/disk-hdd.img iso/disk-ssd.img iso/disk-nvme.img; do
         echo "created $d (${DATA_MB} MiB)"
     fi
 done
+# Blank SATA disk that BoltOS formats as FAT32 on first boot (mounted via AHCI).
+if [ ! -f iso/disk-fat.img ]; then
+    dd if=/dev/zero of=iso/disk-fat.img bs=1M count="$DATA_MB" status=none
+    echo "created iso/disk-fat.img (${DATA_MB} MiB, FAT32 at first boot)"
+fi
+# A real ext2 volume (Linux-formatted) so BoltOS's ext2 driver has something to
+# read. Built with mke2fs -d (populate without mounting) via WSL when present;
+# otherwise a blank image is left and the driver simply finds no ext2 here.
+if [ ! -f iso/disk-ext2.img ]; then
+    # translate the repo's /c/... (msys) path to WSL's /mnt/c/... for mke2fs
+    WSL_IMG="$(echo "$ROOT/iso/disk-ext2.img" | sed -E 's#^/([a-zA-Z])/#/mnt/\1/#')"
+    if command -v wsl.exe >/dev/null 2>&1 && \
+       wsl.exe -e bash -c "command -v mke2fs >/dev/null && S=/tmp/boltext2 && rm -rf \$S && mkdir -p \$S/docs && \
+         printf 'Hello from a real ext2 filesystem!\nBoltOS read this with its own ext2 driver.\n' > \$S/README.txt && \
+         printf 'line one\nline two\nline three\n' > \$S/docs/notes.txt && \
+         printf 'BoltOS ext2 test\n' > \$S/HELLO && \
+         mke2fs -q -t ext2 -b 1024 -d \$S -F '$WSL_IMG' 4096" >/dev/null 2>&1; then
+        echo "created iso/disk-ext2.img (real ext2 via mke2fs)"
+    else
+        dd if=/dev/zero of=iso/disk-ext2.img bs=1M count=4 status=none
+        echo "created iso/disk-ext2.img (blank; install WSL+e2fsprogs for a real ext2)"
+    fi
+fi
 
 echo "[7/7] build bootable ISO"
 P=/c/Users/adria/AppData/Local/Programs/Python/Python311/python.exe
@@ -173,3 +218,21 @@ PYTHON=$P
 ISOPATH=iso/boltos.iso
 "$PYTHON" mkhpfs.py "$IMG" "$ISOPATH" "BoltOS"
 echo "OK -> $ISOPATH ($(stat -c %s "$ISOPATH") bytes)"
+
+echo "[8/8] UEFI loader (BOOTX64.EFI) + ESP staging"
+# A genuine UEFI application (PE32+) that loads the kernel on CSM-less firmware.
+# MS ABI (which UEFI uses); no red zone; SSE off so it runs before the kernel
+# turns the FPU on. Linked by lld-link as an EFI Application.
+UEFI_CFLAGS=(--target=x86_64-unknown-windows -ffreestanding -fno-stack-protector
+             -fshort-wchar -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -mno-80387
+             -Wall -O2 -c)
+"$CLANG" "${UEFI_CFLAGS[@]}" boot/uefi_boot.c -o build/uefi_boot.o
+"$M/ucrt64/bin/lld-link.exe" -subsystem:efi_application -entry:efi_main \
+    -out:build/BOOTX64.EFI build/uefi_boot.o
+# Stage an EFI System Partition tree: firmware auto-runs EFI/BOOT/BOOTX64.EFI,
+# which reads kernel.bin from the same volume. QEMU can serve esp/ as a FAT
+# volume directly (-drive ...,file=fat:rw:esp), so no disk image needed.
+mkdir -p esp/EFI/BOOT
+cp build/BOOTX64.EFI esp/EFI/BOOT/BOOTX64.EFI
+cp build/kernel.bin  esp/kernel.bin
+echo "OK -> esp/ (BOOTX64.EFI $(stat -c %s build/BOOTX64.EFI) bytes + kernel.bin)"

@@ -11,6 +11,8 @@
 #include "string.h"
 #include "pit.h"
 #include "fs.h"
+#include "keyboard.h"
+#include "clipboard.h"
 
 #define TCOLS 220
 #define TROWS 80
@@ -104,6 +106,12 @@ static void term_key(window_t *w, char c) {
         t->len = 0;
     } else if (c == '\b') {
         if (t->len > 0) { t->len--; term_putc(t, '\b'); }
+    } else if ((unsigned char)c == KEY_COPY) {
+        clip_set(t->line, t->len);               /* copy the current input line */
+    } else if ((unsigned char)c == KEY_PASTE) {
+        const char *p = clip_get();              /* paste: replay each char (\n runs it) */
+        for (int i = 0; p[i]; i++)
+            if (p[i] != '\r') term_key(w, p[i]);
     } else if ((unsigned char)c >= 32 && t->len < (int)sizeof(t->line) - 1) {
         t->line[t->len++] = c;
         term_putc(t, c);

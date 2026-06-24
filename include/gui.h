@@ -72,7 +72,8 @@ struct window {
     int      open;                  /* registered + visible                   */
     int      pinned;                /* kept on the taskbar even when closed   */
     int      minimized, maximized;
-    int      rx, ry, rw, rh;        /* saved rect for un-maximise             */
+    int      snapped;               /* edge-snapped (half screen); restores on drag */
+    int      rx, ry, rw, rh;        /* saved rect for un-maximise / un-snap   */
     int      z;                     /* stacking order (higher = nearer front) */
     uint32_t accent;                /* per-app accent / icon colour           */
     int      icon;                  /* taskbar/title icon id (see ICON_*)      */
@@ -102,6 +103,7 @@ int       gui_panel_h(void);                /* physical panel height (fixed)   *
 int       gui_window_focused(window_t *win);
 void      gui_run(void);                    /* enter the desktop; never returns*/
 void      gui_pump(void);                   /* force one composite+blit (re-entrant)*/
+void      gui_logout(void);                 /* return to the sign-in screen */
 
 /* Re-read the live settings: relayout the logical desktop / letterbox, retint
  * the theme and re-render the wallpaper. Called by the Settings app on change. */

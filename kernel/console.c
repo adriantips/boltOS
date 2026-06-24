@@ -25,6 +25,7 @@ static int on_fb = 0;
  * installs a sink so command output can be captured into a terminal window. */
 static void (*sink)(char) = 0;
 void console_set_sink(void (*fn)(char)) { sink = fn; }
+void (*console_get_sink(void))(char) { return sink; }
 void console_detach(void) { on_fb = 0; }
 
 static char grid[MAXROWS][MAXCOLS];

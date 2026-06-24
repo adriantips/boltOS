@@ -6,6 +6,8 @@
 #include "string.h"
 #include "kprintf.h"
 #include "xhci.h"
+#include "keyboard.h"
+#include "mouse.h"
 
 /* ===========================================================================
  *  xHCI USB host controller driver (polled).
@@ -71,6 +73,7 @@
 #define TRB_LINK        6
 #define TRB_ENABLE_SLOT 9
 #define TRB_ADDRESS_DEV 11
+#define TRB_CONFIG_EP   12
 #define TRB_TR_EVENT    32
 #define TRB_CMD_EVENT   33
 #define TRB_PORTSC_EVENT 34
@@ -95,7 +98,7 @@ struct usbdev {
     int      used;
     uint8_t  slot, port, speed;
     uint16_t vendor, product;
-    uint8_t  dev_class, if_class;
+    uint8_t  dev_class, if_class, if_proto;
 };
 
 #define MAX_DEV 8
@@ -275,6 +278,8 @@ static int port_reset(uint32_t p) {
     return 0;
 }
 
+static void hid_setup(struct usbdev *d, struct ring *ep0, const uint8_t *cfg, uint16_t total);
+
 /* Build the input context for Address Device and enumerate one device. */
 static void enumerate_port(uint32_t p) {
     if (!port_reset(p)) return;
@@ -349,7 +354,7 @@ static void enumerate_port(uint32_t p) {
             while (i + 1 < total) {
                 uint8_t blen = cfg[i], btype = cfg[i + 1];
                 if (blen == 0) break;
-                if (btype == 4 && i + 5 < total) { d->if_class = cfg[i + 5]; break; }
+                if (btype == 4 && i + 7 < total) { d->if_class = cfg[i + 5]; d->if_proto = cfg[i + 7]; break; }
                 i += blen;
             }
         }
@@ -364,6 +369,177 @@ static void enumerate_port(uint32_t p) {
     kprintf("[xhci] port %u slot %u: %s %x:%x class %x speed %u\n",
             p + 1, slot, kind, d->vendor, d->product, kc, speed);
     xh.ndev++;
+
+    /* boot-protocol keyboard (proto 1) or mouse (proto 2): drive it */
+    if (kc == 3 && (d->if_proto == 1 || d->if_proto == 2))
+        hid_setup(d, tr, cfg, (uint16_t)sizeof cfg);
+}
+
+/* ===========================================================================
+ *  USB HID boot keyboard. After a HID device is addressed we SET_CONFIGURATION,
+ *  add its interrupt-IN endpoint via Configure Endpoint, switch it to the boot
+ *  protocol, and then poll the endpoint for 8-byte boot reports. Decoded keys
+ *  are fed into the PS/2 keyboard ring (kbd_inject) so the rest of the system
+ *  is transport-agnostic.
+ * ===========================================================================*/
+struct hidkbd {
+    int            used;
+    uint8_t        slot, dci, proto;   /* proto: 1=keyboard, 2=mouse    */
+    struct ring    tr;            /* interrupt-IN transfer ring        */
+    struct dma_buf rpt;           /* boot report buffer (DMA)          */
+    uint8_t        last[8];       /* previous report, for edge detect  */
+};
+static struct hidkbd hidk[MAX_DEV];
+static int nhid;
+
+/* HID usage id -> char, honouring shift/ctrl. 0 == produce nothing. Mirrors the
+ * PS/2 driver's control-byte conventions (KEY_*, KEY_COPY/PASTE/...). */
+static const char hid_unshift[] = "abcdefghijklmnopqrstuvwxyz1234567890\n\x1b\b\t -=[]\\#;'`,./";
+static const char hid_shift[]   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\n\x1b\b\t _+{}|~:\"~<>?";
+static char hid_translate(uint8_t u, int shift, int ctrl) {
+    if (u >= 0x04 && u <= 0x1D) {                 /* letters */
+        char lc = (char)('a' + (u - 0x04));
+        if (ctrl) {
+            switch (lc) { case 'a': return KEY_SELALL; case 'c': return KEY_COPY;
+                          case 'v': return KEY_PASTE;  case 'x': return KEY_CUT;
+                          case 's': return KEY_SAVE;   default: return 0; }
+        }
+        return shift ? (char)('A' + (u - 0x04)) : lc;
+    }
+    if (u >= 0x1E && u <= 0x38) {                  /* digits + symbols (table) */
+        int idx = 26 + (u - 0x1E);
+        return shift ? hid_shift[idx] : hid_unshift[idx];
+    }
+    switch (u) {                                   /* navigation / editing */
+        case 0x4F: return shift ? KEY_SRIGHT : KEY_RIGHT;
+        case 0x50: return shift ? KEY_SLEFT  : KEY_LEFT;
+        case 0x51: return shift ? KEY_SDOWN  : KEY_DOWN;
+        case 0x52: return shift ? KEY_SUP    : KEY_UP;
+        case 0x4A: return shift ? KEY_SHOME  : KEY_HOME;
+        case 0x4D: return shift ? KEY_SEND   : KEY_END;
+        case 0x4B: return KEY_PGUP; case 0x4E: return KEY_PGDN;
+        case 0x4C: return KEY_DEL;
+        default:   return 0;
+    }
+}
+
+/* Configure the device's interrupt-IN endpoint and arm the first transfer. */
+static void hid_setup(struct usbdev *d, struct ring *ep0, const uint8_t *cfg, uint16_t total) {
+    if (nhid >= MAX_DEV) return;
+    /* walk the config descriptor: capture interface number + the interrupt-IN
+     * endpoint's address / max-packet size */
+    uint8_t iface = 0, epaddr = 0; uint16_t mps = 8; int have_ep = 0;
+    for (uint32_t i = 0; i + 1 < total; ) {
+        uint8_t blen = cfg[i], btype = cfg[i + 1];
+        if (blen == 0) break;
+        if (btype == 4) iface = cfg[i + 2];                       /* interface  */
+        else if (btype == 5) {                                    /* endpoint   */
+            uint8_t addr = cfg[i + 2], attr = cfg[i + 3];
+            if ((addr & 0x80) && (attr & 3) == 3) {               /* interrupt IN */
+                epaddr = addr; mps = (uint16_t)cfg[i + 4] | ((uint16_t)cfg[i + 5] << 8);
+                have_ep = 1; break;
+            }
+        }
+        i += blen;
+    }
+    if (!have_ep) return;
+    uint8_t epnum = epaddr & 0x0F;
+    uint8_t dci   = (uint8_t)(epnum * 2 + 1);                     /* IN endpoint DCI */
+
+    /* SET_CONFIGURATION(bConfigurationValue) */
+    if (control_xfer(ep0, d->slot, 0x00, 9, cfg[5], 0, NULL, 0) != 0) return;
+
+    /* transfer ring + report buffer for the interrupt endpoint */
+    struct hidkbd *h = &hidk[nhid];
+    if (ring_init(&h->tr) != 0) return;
+    if (dma_alloc(8, &h->rpt) != 0) return;
+    memset(h->last, 0, 8);
+
+    /* Configure Endpoint: input context = ICC + slot + (dci) endpoint contexts */
+    struct dma_buf inctx;
+    if (dma_alloc(ctxsz() * (dci + 2), &inctx) != 0) return;
+    memset(inctx.virt, 0, ctxsz() * (dci + 2));
+    volatile uint32_t *icc  = (volatile uint32_t *)inctx.virt;
+    volatile uint32_t *sctx = (volatile uint32_t *)((uint8_t *)inctx.virt + ctxsz());
+    volatile uint32_t *ep   = (volatile uint32_t *)((uint8_t *)inctx.virt + ctxsz() * (dci + 1));
+    icc[1] = 1u | (1u << dci);                          /* add slot + this endpoint */
+    sctx[0] = ((uint32_t)d->speed << 20) | ((uint32_t)dci << 27);   /* ctx entries=dci */
+    sctx[1] = ((uint32_t)d->port) << 16;
+    ep[1] = (7u << 3) | (3u << 1) | ((uint32_t)mps << 16);  /* EP type=Interrupt-IN, CErr=3 */
+    ep[2] = (uint32_t)(h->tr.phys) | 1u;                   /* TR dequeue | DCS=1 */
+    ep[3] = (uint32_t)(h->tr.phys >> 32);
+    ep[4] = mps;                                           /* avg TRB len / max ESIT */
+    if (cmd_exec((uint32_t)inctx.phys, (uint32_t)(inctx.phys >> 32), 0,
+                 (TRB_CONFIG_EP << 10) | ((uint32_t)d->slot << 24), NULL) != CC_SUCCESS) {
+        dma_free(&inctx); return;
+    }
+    dma_free(&inctx);
+
+    /* SET_PROTOCOL(boot=0) + SET_IDLE(0) on the interface */
+    control_xfer(ep0, d->slot, 0x21, 0x0B, 0, iface, NULL, 0);
+    control_xfer(ep0, d->slot, 0x21, 0x0A, 0, iface, NULL, 0);
+
+    /* arm the first interrupt transfer */
+    h->used = 1; h->slot = d->slot; h->dci = dci; h->proto = d->if_proto;
+    ring_push(&h->tr, (uint32_t)h->rpt.phys, (uint32_t)(h->rpt.phys >> 32), 8,
+              (TRB_NORMAL << 10) | (1u << 5));             /* IOC */
+    __asm__ volatile("" ::: "memory");
+    xh.db[d->slot] = dci;                                  /* ring the EP doorbell */
+    nhid++;
+    kprintf("[xhci] HID %s armed (slot %u ep DCI %u)\n",
+            d->if_proto == 2 ? "mouse" : "keyboard", d->slot, dci);
+}
+
+/* Non-blocking peek of the event ring; returns 1 and fills *type/*ptr if an
+ * event is pending, else 0. Used by the HID poll so it never spins. */
+static int evt_try(uint32_t *type, uint64_t *ptr) {
+    volatile uint32_t *e = xh.evt.trb + xh.evt_deq * 4;
+    uint32_t d3 = e[3];
+    if ((d3 & 1u) != xh.evt_cycle) return 0;
+    if (type) *type = (d3 >> 10) & 0x3F;
+    if (ptr)  *ptr  = (uint64_t)e[0] | ((uint64_t)e[1] << 32);
+    xh.evt_deq++;
+    if (xh.evt_deq == RING_SZ) { xh.evt_deq = 0; xh.evt_cycle ^= 1; }
+    rt_wr64(IR0_ERDP, (xh.evt.phys + xh.evt_deq * 16) | (1u << 3));
+    return 1;
+}
+
+/* Poll all HID keyboards for new boot reports and inject decoded keys. Called
+ * from the GUI/shell idle loops (polled controller, no IRQs). */
+void xhci_poll(void) {
+    if (!xh.present || nhid == 0) return;
+    uint32_t type; uint64_t ptr;
+    while (evt_try(&type, &ptr)) {
+        if (type != TRB_TR_EVENT) continue;
+        for (int k = 0; k < nhid; k++) {
+            struct hidkbd *h = &hidk[k];
+            if (!h->used) continue;
+            uint8_t *r = (uint8_t *)h->rpt.virt;
+            if (h->proto == 2) {                   /* boot mouse: btn, dx, dy, wheel */
+                int dx = (int)(int8_t)r[1], dy = (int)(int8_t)r[2];
+                int wh = (int)(int8_t)r[3];
+                mouse_inject(dx, dy, r[0], wh);
+            } else {                               /* boot keyboard */
+                int shift = (r[0] & 0x22) != 0;    /* L/R shift */
+                int ctrl  = (r[0] & 0x11) != 0;    /* L/R ctrl  */
+                for (int i = 2; i < 8; i++) {
+                    uint8_t u = r[i];
+                    if (u == 0) continue;
+                    int was = 0;
+                    for (int j = 2; j < 8; j++) if (h->last[j] == u) { was = 1; break; }
+                    if (was) continue;             /* held since last report */
+                    char c = hid_translate(u, shift, ctrl);
+                    if (c) kbd_inject(c);
+                }
+                for (int i = 0; i < 8; i++) h->last[i] = r[i];
+            }
+            /* re-arm the transfer for the next report */
+            ring_push(&h->tr, (uint32_t)h->rpt.phys, (uint32_t)(h->rpt.phys >> 32), 8,
+                      (TRB_NORMAL << 10) | (1u << 5));
+            __asm__ volatile("" ::: "memory");
+            xh.db[h->slot] = h->dci;
+        }
+    }
 }
 
 void xhci_init(void) {

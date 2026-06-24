@@ -10,6 +10,7 @@
 #include "gui.h"
 #include "fs.h"
 #include "keyboard.h"
+#include "clipboard.h"
 #include "pit.h"
 #include "string.h"
 
@@ -24,6 +25,7 @@ typedef struct {
     char buf[BUFCAP];
     int  len;
     int  cur;            /* caret position, 0..len */
+    int  sel;            /* selection anchor, or -1 if no selection           */
     int  top;            /* first visible line (vertical scroll)              */
     int  dirty;          /* unsaved changes                                   */
     int  saved_flash;    /* pit tick until which to show "Saved"              */
@@ -57,6 +59,36 @@ static void nt_delete(void) {
     nt.len--; nt.buf[nt.len] = 0;
     nt.dirty = 1;
 }
+
+/* ---- selection + clipboard --------------------------------------------- */
+static int  sel_active(void) { return nt.sel >= 0 && nt.sel != nt.cur; }
+static int  sel_lo(void)     { return nt.sel < nt.cur ? nt.sel : nt.cur; }
+static int  sel_hi(void)     { return nt.sel < nt.cur ? nt.cur : nt.sel; }
+
+/* Delete the selected span; leaves the caret at its start and clears selection.
+ * Returns 1 if anything was removed. */
+static int sel_erase(void) {
+    if (!sel_active()) { nt.sel = -1; return 0; }
+    int a = sel_lo(), b = sel_hi(), n = b - a;
+    for (int i = a; i + n <= nt.len; i++) nt.buf[i] = nt.buf[i + n];
+    nt.len -= n; nt.cur = a; nt.sel = -1; nt.dirty = 1;
+    return 1;
+}
+static void sel_copy(void) {
+    if (sel_active()) clip_set(nt.buf + sel_lo(), sel_hi() - sel_lo());
+}
+static void nt_paste(void) {
+    sel_erase();
+    const char *p = clip_get();
+    for (int i = 0; p[i]; i++) {
+        char c = p[i];
+        if (c == '\r') continue;                 /* normalise CRLF -> LF */
+        if (c != '\n' && c != '\t' && (unsigned char)c < 32) continue;
+        nt_insert(c);
+    }
+}
+/* Begin/extend a shift-selection: anchor on first extend, then caller moves cur. */
+static void sel_start(void) { if (nt.sel < 0) nt.sel = nt.cur; }
 
 /* column of the caret within its line (chars since the previous '\n') */
 static int caret_col(void) {
@@ -111,24 +143,41 @@ static void nt_save(void) {
     }
 }
 static void nt_new(void) {
-    nt.len = 0; nt.cur = 0; nt.top = 0; nt.buf[0] = 0; nt.dirty = 1;
+    nt.len = 0; nt.cur = 0; nt.sel = -1; nt.top = 0; nt.buf[0] = 0; nt.dirty = 1;
 }
 
 /* ---- input -------------------------------------------------------------- */
 static void notes_key(window_t *w, char c) {
     (void)w;
     switch ((unsigned char)c) {
-    case KEY_LEFT:  if (nt.cur > 0) nt.cur--; break;
-    case KEY_RIGHT: if (nt.cur < nt.len) nt.cur++; break;
-    case KEY_UP:    nt_up();   break;
-    case KEY_DOWN:  nt_down(); break;
-    case KEY_HOME:  nt.cur = line_start(nt.cur); break;
-    case KEY_END:   nt.cur = line_end(nt.cur);   break;
-    case KEY_DEL:   nt_delete(); break;
-    case '\b':      nt_backspace(); break;
+    /* plain navigation: clears any selection */
+    case KEY_LEFT:  nt.sel = -1; if (nt.cur > 0) nt.cur--; break;
+    case KEY_RIGHT: nt.sel = -1; if (nt.cur < nt.len) nt.cur++; break;
+    case KEY_UP:    nt.sel = -1; nt_up();   break;
+    case KEY_DOWN:  nt.sel = -1; nt_down(); break;
+    case KEY_HOME:  nt.sel = -1; nt.cur = line_start(nt.cur); break;
+    case KEY_END:   nt.sel = -1; nt.cur = line_end(nt.cur);   break;
+    /* shift+navigation: extend selection */
+    case KEY_SLEFT:  sel_start(); if (nt.cur > 0) nt.cur--; break;
+    case KEY_SRIGHT: sel_start(); if (nt.cur < nt.len) nt.cur++; break;
+    case KEY_SUP:    sel_start(); nt_up();   break;
+    case KEY_SDOWN:  sel_start(); nt_down(); break;
+    case KEY_SHOME:  sel_start(); nt.cur = line_start(nt.cur); break;
+    case KEY_SEND:   sel_start(); nt.cur = line_end(nt.cur);   break;
+    /* clipboard / editing shortcuts */
+    case KEY_SELALL: nt.sel = 0; nt.cur = nt.len; break;
+    case KEY_COPY:   sel_copy(); break;
+    case KEY_CUT:    sel_copy(); sel_erase(); break;
+    case KEY_PASTE:  nt_paste(); break;
+    case KEY_SAVE:   nt_save();  break;
+    case KEY_DEL:    if (!sel_erase()) nt_delete(); break;
+    case '\b':       if (!sel_erase()) nt_backspace(); break;
     case '\n': case '\t':
     default:
-        if (c == '\n' || c == '\t' || (unsigned char)c >= 32) nt_insert(c);
+        if (c == '\n' || c == '\t' || (unsigned char)c >= 32) {
+            sel_erase();
+            nt_insert(c);
+        }
         break;
     }
 }
@@ -194,6 +243,8 @@ static void notes_draw(window_t *w, int cx, int cy, int cw, int ch) {
     int line = 0, col = 0;
     int caret_px = tx, caret_py = ty;
     int focused = gui_window_focused(w);
+    int slo = sel_active() ? sel_lo() : -1;
+    int shi = sel_active() ? sel_hi() : -1;
 
     for (int i = 0; i <= nt.len; i++) {
         if (i == nt.cur) {
@@ -202,12 +253,31 @@ static void notes_draw(window_t *w, int cx, int cy, int cw, int ch) {
         }
         if (i == nt.len) break;
         char c = nt.buf[i];
-        if (c == '\n') { line++; col = 0; continue; }
-        if (c == '\t') { col = (col + 4) & ~3; continue; }
+        int seld = (i >= slo && i < shi);
+        if (c == '\n') {
+            /* show selection running through the line break as a stub */
+            if (seld && line >= nt.top && line < nt.top + vis_rows) {
+                int px = tx + col * CELLW;
+                if (px < cx + cw - CELLW)
+                    g_fill(px, ty + (line - nt.top) * CELLH, CELLW / 2, CELLH, COL_ACCENT);
+            }
+            line++; col = 0; continue;
+        }
+        if (c == '\t') {
+            int ncol = (col + 4) & ~3;
+            if (seld && line >= nt.top && line < nt.top + vis_rows) {
+                int px = tx + col * CELLW;
+                g_fill(px, ty + (line - nt.top) * CELLH, (ncol - col) * CELLW, CELLH, COL_ACCENT);
+            }
+            col = ncol; continue;
+        }
         if (line >= nt.top && line < nt.top + vis_rows) {
             int px = tx + col * CELLW;
-            if (px < cx + cw - CELLW)
-                g_char(px, ty + (line - nt.top) * CELLH, c, COL_TEXT, 1);
+            if (px < cx + cw - CELLW) {
+                int py = ty + (line - nt.top) * CELLH;
+                if (seld) g_fill(px, py, CELLW, CELLH, COL_ACCENT);
+                g_char(px, py, c, seld ? 0xFFFFFF : COL_TEXT, 1);
+            }
         }
         col++;
     }
@@ -220,6 +290,7 @@ static void notes_draw(window_t *w, int cx, int cy, int cw, int ch) {
 
 void notes_app_init(void) {
     memset(&nt, 0, sizeof(nt));
+    nt.sel = -1;
     nt_load();
     window_t *win = gui_add_window("Notepad", 560, 460, 0xFFB454, ICON_NOTES);
     if (!win) return;

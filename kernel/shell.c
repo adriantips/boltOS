@@ -4,6 +4,7 @@
 #include "kprintf.h"
 #include "console.h"
 #include "keyboard.h"
+#include "xhci.h"
 #include "fs.h"
 #include "pit.h"
 #include "string.h"
@@ -50,7 +51,10 @@ uint64_t sh_uptime_ms(void) {
 int sh_readline(char *buf, int cap) {
     int len = 0;
     for (;;) {
-        char c = kbd_getc();
+        xhci_poll();                          /* pump USB HID keyboard, if any */
+        int ci = kbd_trygetc();
+        if (ci < 0) { __asm__ volatile("hlt"); continue; }
+        char c = (char)ci;
         if (c == '\n') { kputc('\n'); buf[len] = 0; return len; }
         if (c == '\b') { if (len) { len--; kputc('\b'); } continue; }
         if ((unsigned char)c >= 32 && len < cap - 1) { buf[len++] = c; kputc(c); }
@@ -179,6 +183,21 @@ const command_t commands[] = {
     { "panic",    "Bonus",            "halt and secure the system",         cmd_panic },
     { "story",    "Bonus",            "narrative log of events",            cmd_story },
 
+    /* Hardware / Platform */
+    { "fat",      "Hardware",         "FAT32 volume: fat ls|cat|write|mkdir", cmd_fat },
+    { "power",    "Hardware",         "power off / reboot (ACPI)",          cmd_power },
+    { "cpus",     "Hardware",         "list CPUs / SMP status",             cmd_cpus },
+    { "acpiinfo", "Hardware",         "ACPI tables + APIC/HPET",            cmd_acpiinfo },
+    { "play",     "Hardware",         "play a tone: play [Hz] [ms]",        cmd_play },
+    { "dhcp",     "Hardware",         "request a DHCP lease",               cmd_dhcp },
+    { "clip",     "Hardware",         "clipboard: clip show|set|clear",     cmd_clip },
+    { "crash",    "Hardware",         "trigger panic: crash null|div|ud",   cmd_crash },
+    { "whoami",   "System",           "print the current user",             cmd_whoami },
+    { "users",    "System",           "accounts: list|add|passwd|su",       cmd_users },
+    { "logout",   "System",           "return to the sign-in screen",       cmd_logout },
+    { "pkg",      "System",           "packages: list|install|remove|run",  cmd_pkg },
+    { "ext2",     "Hardware",         "read an ext2 volume: ext2 ls|cat",   cmd_ext2 },
+
     /* Core */
     { "help",     "Core",             "show this list",                     cmd_help },
     { "echo",     "Core",             "print text back",                    cmd_echo },
@@ -209,13 +228,101 @@ static int tokenize(char *line, char **argv) {
     return argc;
 }
 
-static void dispatch(char *line) {
-    char *argv[MAXARG];
-    int argc = tokenize(line, argv);
+/* output-capture sink for `>`/`>>` redirection */
+static char  redir_buf[32768];
+static int   redir_len;
+static void  redir_sink(char c) { if (redir_len < (int)sizeof(redir_buf)) redir_buf[redir_len++] = c; }
+
+/* Execute one command given its tokens, honouring a trailing `> file` /
+ * `>> file` redirection. `inject`, if non-null, is spliced in as the command's
+ * last positional argument (before any redirection) -- this is how a pipe feeds
+ * the previous stage's output, captured to a temp file, into the next stage. */
+static void exec_argv(char **argv, int argc, const char *inject) {
     if (!argc) return;
-    const command_t *c = cmd_lookup(argv[0]);
-    if (c) c->fn(argc, argv);
-    else   kprintf("unknown command: %s  (try 'help')\n", argv[0]);
+
+    int redir = 0;            /* 0 none, 1 truncate (>), 2 append (>>) */
+    const char *outfile = 0;
+    int cmdc = argc;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], ">") == 0 || strcmp(argv[i], ">>") == 0) {
+            redir = (argv[i][1] == '>') ? 2 : 1;
+            outfile = (i + 1 < argc) ? argv[i + 1] : 0;
+            cmdc = i;
+            break;
+        }
+    }
+    if (redir && !outfile) { kprintf("syntax: redirection needs a target file\n"); return; }
+
+    /* rebuild the command's own argv, appending the injected pipe input */
+    char *cargv[MAXARG]; int cn = 0;
+    for (int i = 0; i < cmdc && cn < MAXARG; i++) cargv[cn++] = argv[i];
+    if (inject && cn < MAXARG) cargv[cn++] = (char *)inject;
+    if (!cn) return;
+
+    const command_t *c = cmd_lookup(cargv[0]);
+    if (!c) { kprintf("unknown command: %s  (try 'help')\n", cargv[0]); return; }
+
+    if (!redir) { c->fn(cn, cargv); return; }
+
+    void (*prev)(char) = console_get_sink();
+    redir_len = 0;
+    console_set_sink(redir_sink);
+    c->fn(cn, cargv);
+    console_set_sink(prev);
+
+    fs_node *f = fs_lookup(outfile);
+    if (!f) f = fs_create(outfile, 0);
+    if (!f) { kprintf("cannot open %s\n", outfile); return; }
+    if (redir == 2) fs_append(f, redir_buf, (uint32_t)redir_len);
+    else            fs_write (f, redir_buf, (uint32_t)redir_len);
+}
+
+#define PIPE_FILE "/tmp/.pipe"
+
+/* Run a `;`-segment, splitting it into `|`-separated stages. Each non-final
+ * stage's output is captured to PIPE_FILE and handed to the next stage as input;
+ * the final stage prints to the screen (and may itself redirect with `>`). */
+static void run_segment(char *seg) {
+    char *stages[8]; int ns = 0; char *p = seg;
+    while (*p && ns < 8) {
+        stages[ns++] = p;
+        while (*p && *p != '|') p++;
+        if (*p == '|') *p++ = 0;
+    }
+    if (ns <= 1) { char *argv[MAXARG]; exec_argv(argv, tokenize(seg, argv), 0); return; }
+
+    const char *inject = 0;
+    for (int s = 0; s < ns; s++) {
+        char *argv[MAXARG]; int argc = tokenize(stages[s], argv);
+        if (s == ns - 1) { exec_argv(argv, argc, inject); break; }
+
+        /* capture this stage (with any injected input) into the pipe file */
+        char *cargv[MAXARG]; int cn = 0;
+        for (int i = 0; i < argc && cn < MAXARG; i++) cargv[cn++] = argv[i];
+        if (inject && cn < MAXARG) cargv[cn++] = (char *)inject;
+        if (!cn) continue;
+        const command_t *c = cmd_lookup(cargv[0]);
+        if (!c) { kprintf("unknown command: %s  (try 'help')\n", cargv[0]); return; }
+        void (*prev)(char) = console_get_sink();
+        redir_len = 0; console_set_sink(redir_sink);
+        c->fn(cn, cargv);
+        console_set_sink(prev);
+        if (!fs_lookup("/tmp")) fs_create("/tmp", 1);
+        fs_node *f = fs_lookup(PIPE_FILE); if (!f) f = fs_create(PIPE_FILE, 0);
+        if (f) fs_write(f, redir_buf, (uint32_t)redir_len);
+        inject = PIPE_FILE;
+    }
+}
+
+static void dispatch(char *line) {
+    /* split the line into `;`-separated commands and run each in turn */
+    char *p = line;
+    while (*p) {
+        char *seg = p;
+        while (*p && *p != ';') p++;
+        if (*p == ';') *p++ = 0;
+        run_segment(seg);
+    }
 }
 
 static void prompt(void) {
@@ -236,6 +343,7 @@ void shell_run(void) {
     prompt();
 
     for (;;) {
+        xhci_poll();                                 /* pump USB HID keyboard */
         int ci = kbd_trygetc();
         if (ci < 0) {                                /* idle: blink + wait for IRQ */
             console_cursor_tick();

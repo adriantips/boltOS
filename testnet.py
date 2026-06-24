@@ -20,8 +20,12 @@ args = [QEMU,
   "-device","ide-hd,drive=hdd,bus=ide.1,unit=0,rotation_rate=7200",
   "-drive", f"id=nvm,file={ROOT}\\iso\\disk-nvme.img,format=raw,if=none",
   "-device","nvme,drive=nvm,serial=BOLTNVME01",
-  "-m","2G","-rtc","base=utc",
+  "-drive", f"id=ext2,file={ROOT}\\iso\\disk-ext2.img,format=raw,if=none",
+  "-device","ide-hd,drive=ext2,bus=ide.0,unit=1",
+  "-cpu","max","-smp","4","-m","2G","-rtc","base=utc",
   "-netdev","user,id=net0","-device","e1000,netdev=net0",
+  "-device","qemu-xhci,id=xhci",
+  "-device","usb-kbd,bus=xhci.0",
   "-vga","none","-display","none",
   "-serial", f"file:{LOG}",
   "-qmp", f"tcp:127.0.0.1:{PORT},server,nowait",
@@ -40,9 +44,10 @@ def r():
 r(); c({"execute":"qmp_capabilities"}); r()
 time.sleep(BOOT)
 
-QC = {".":"dot","/":"slash","-":"minus"," ":"spc","_":"minus",
+QC = {".":"dot","/":"slash","-":"minus"," ":"spc","_":"minus",";":"semicolon",
       "0":"0","1":"1","2":"2","3":"3","4":"4","5":"5","6":"6","7":"7","8":"8","9":"9"}
-SH = {":":"semicolon","?":"slash","_":"minus","~":"grave_accent"}
+SH = {":":"semicolon","?":"slash","_":"minus","~":"grave_accent",
+      ">":"dot","<":"comma","|":"backslash","&":"7"}
 def key(qc, shift=False):
     ev=[]
     if shift: ev.append({"type":"key","data":{"down":True,"key":{"type":"qcode","data":"shift"}}})

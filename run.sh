@@ -23,12 +23,20 @@ exec "$QEMU" \
     -device ide-hd,drive=ssd,bus=ide.1,unit=1,rotation_rate=1 \
     -drive id=nvm,file="$ROOT/iso/disk-nvme.img",format=raw,if=none \
     -device nvme,drive=nvm,serial=BOLTNVME01 \
+    -device ich9-ahci,id=ahci \
+    -drive id=fat,file="$ROOT/iso/disk-fat.img",format=raw,if=none \
+    -device ide-hd,drive=fat,bus=ahci.0 \
+    -drive id=ext2,file="$ROOT/iso/disk-ext2.img",format=raw,if=none \
+    -device ide-hd,drive=ext2,bus=ide.0,unit=1 \
     -boot order=c \
+    -cpu max \
     -m 2G \
+    -smp 4 \
     -rtc base=utc \
     -vga std -global VGA.vgamem_mb=64 \
     -audiodev dsound,id=snd0 \
     -machine pcspk-audiodev=snd0 \
+    -device AC97,audiodev=snd0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0 \
     -device qemu-xhci,id=xhci \

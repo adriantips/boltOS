@@ -13,7 +13,28 @@
 #define KEY_PGDN  0x0E
 #define KEY_DEL   0x7F
 
+/* Clipboard / editing shortcuts. Emitted by the driver when Ctrl is held with
+ * the matching letter. The values are the classic ASCII control codes and were
+ * chosen to not collide with any KEY_* above. */
+#define KEY_SELALL 0x01   /* Ctrl+A */
+#define KEY_COPY   0x03   /* Ctrl+C */
+#define KEY_PASTE  0x16   /* Ctrl+V */
+#define KEY_CUT    0x18   /* Ctrl+X */
+#define KEY_SAVE   0x19   /* Ctrl+S */
+
+/* Shift+navigation keys, for extending a text selection. Distinct control bytes
+ * so editors can tell "move caret" from "extend selection". */
+#define KEY_SLEFT  0x1C
+#define KEY_SRIGHT 0x1D
+#define KEY_SUP    0x1E
+#define KEY_SDOWN  0x1F
+#define KEY_SHOME  0x06
+#define KEY_SEND   0x15
+
 void keyboard_init(void);
+int  kbd_ctrl_down(void);  /* 1 while either Ctrl key is held */
+int  kbd_shift_down(void); /* 1 while either Shift key is held */
+void kbd_inject(char c);   /* push a decoded char into the ring (USB HID path) */
 int  kbd_trygetc(void);   /* next char, or -1 if the buffer is empty (non-blocking) */
 char kbd_getc(void);      /* block (hlt) until a key is available, then return it */
 

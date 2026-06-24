@@ -40,7 +40,33 @@ static const char shiftmap[128] = {
 static volatile char    rb[RBSZ];
 static volatile uint8_t rhead, rtail;
 static volatile int     shift;
+static volatile int     ctrl;            /* either Ctrl key held */
 static volatile int     extended;        /* last byte was the 0xE0 prefix */
+
+/* Map a navigation key to its selection-extending (Shift+nav) variant. */
+static char shift_nav(char e) {
+    switch ((unsigned char)e) {
+        case KEY_LEFT:  return KEY_SLEFT;
+        case KEY_RIGHT: return KEY_SRIGHT;
+        case KEY_UP:    return KEY_SUP;
+        case KEY_DOWN:  return KEY_SDOWN;
+        case KEY_HOME:  return KEY_SHOME;
+        case KEY_END:   return KEY_SEND;
+        default:        return e;
+    }
+}
+/* Ctrl+letter -> editing shortcut control byte, or 0 to swallow the combo. */
+static char ctrl_shortcut(char c) {
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    switch (c) {
+        case 'a': return KEY_SELALL;
+        case 'c': return KEY_COPY;
+        case 'v': return KEY_PASTE;
+        case 'x': return KEY_CUT;
+        case 's': return KEY_SAVE;
+        default:  return 0;
+    }
+}
 
 static void push(char c) {
     uint8_t n = (uint8_t)(rtail + 1);
@@ -75,17 +101,38 @@ static void on_key(struct registers *r) {
         raw_push((uint16_t)(sc & 0x7F) | ((sc & 0x80) ? 0x100 : 0) | (extended ? 0x200 : 0));
     if (extended) {
         extended = 0;
-        if (!(sc & 0x80)) { char e = ext_map(sc); if (e) push(e); }
+        if (sc == 0x1D) { ctrl = 1; return; }       /* right Ctrl pressed  */
+        if (sc == 0x9D) { ctrl = 0; return; }       /* right Ctrl released */
+        if (!(sc & 0x80)) {
+            char e = ext_map(sc);
+            if (e) push(shift ? shift_nav(e) : e);
+        }
         return;                                     /* swallow the release too */
     }
     switch (sc) {
         case 0x2A: case 0x36: shift = 1; return;    /* L/R shift pressed  */
         case 0xAA: case 0xB6: shift = 0; return;    /* L/R shift released */
+        case 0x1D: ctrl = 1; return;                /* left Ctrl pressed  */
+        case 0x9D: ctrl = 0; return;                /* left Ctrl released */
     }
     if (sc & 0x80) return;                          /* any other key release */
     char c = shift ? shiftmap[sc] : map[sc];
-    if (c) push(c);
+    if (!c) return;
+    if (ctrl) {                                     /* Ctrl+key -> shortcut, else swallow */
+        char s = ctrl_shortcut(c);
+        if (s) push(s);
+        return;
+    }
+    push(c);
 }
+
+int kbd_ctrl_down(void)  { return ctrl;  }
+int kbd_shift_down(void) { return shift; }
+
+/* Inject an already-decoded character into the input ring. Used by the USB HID
+ * keyboard driver, which decodes boot-protocol reports itself and feeds the
+ * same ring the PS/2 path uses, so the shell/GUI are transport-agnostic. */
+void kbd_inject(char c) { push(c); }
 
 int kbd_trygetc(void) {
     if (rhead == rtail) return -1;
@@ -103,6 +150,7 @@ char kbd_getc(void) {
 void keyboard_init(void) {
     rhead = rtail = 0;
     shift = 0;
+    ctrl = 0;
     extended = 0;
     irq_install(1, on_key);
     inb(0x60);                                      /* drain any pending byte */

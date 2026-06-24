@@ -14,6 +14,7 @@
 #include "boltcc.h"
 #include "boltpy.h"
 #include "keyboard.h"
+#include "clipboard.h"
 #include "pit.h"
 #include "string.h"
 #include "kprintf.h"
@@ -567,6 +568,29 @@ static void ide_key(window_t *w, char c) {
     case KEY_END:   { editor_t *e = ED(); e->cur = line_end(e->cur);   break; }
     case KEY_DEL:   ed_delete(); break;
     case '\b':      ed_backspace(); break;
+    case KEY_COPY: {                  /* copy the caret's line to the clipboard */
+        editor_t *e = ED();
+        int ls = line_start(e->cur), le = line_end(e->cur);
+        clip_set(e->buf + ls, le - ls);
+        break;
+    }
+    case KEY_CUT: {                   /* cut the caret's line (incl. trailing \n) */
+        editor_t *e = ED();
+        int ls = line_start(e->cur), le = line_end(e->cur);
+        clip_set(e->buf + ls, le - ls);
+        e->cur = ls;
+        while (e->cur < e->len && e->buf[e->cur] != '\n') ed_delete();
+        if (e->cur < e->len) ed_delete();          /* the newline too */
+        break;
+    }
+    case KEY_PASTE: {                 /* insert clipboard text at the caret */
+        const char *p = clip_get();
+        for (int i = 0; p[i]; i++)
+            if (p[i] != '\r' && (p[i] == '\n' || p[i] == '\t' || (unsigned char)p[i] >= 32))
+                ed_insert(p[i]);
+        break;
+    }
+    case KEY_SAVE:  S.prompt = PR_SAVE; break;   /* Ctrl+S -> save-as dialog */
     case '\n': {
         /* auto-indent: copy the current line's leading whitespace, and add one
          * level if the line ends in an opening brace. Capture both from the

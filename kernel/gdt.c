@@ -65,3 +65,20 @@ void gdt_init(void) {
 }
 
 void tss_set_rsp0(uint64_t top) { tss.rsp0 = top; }
+
+/* Load the shared GDT on an application processor and reload its segment
+ * registers + CS. We deliberately skip LTR: a TSS may only be busy on one CPU,
+ * and idle APs never take a privilege-level change that needs RSP0. */
+void gdt_load_ap(void) {
+    __asm__ volatile("lgdt %0" :: "m"(gp) : "memory");
+    __asm__ volatile(
+        "mov $0x10, %%ax\n"
+        "mov %%ax, %%ds\n mov %%ax, %%es\n mov %%ax, %%ss\n"
+        "mov %%ax, %%fs\n mov %%ax, %%gs\n"
+        "push $0x08\n"
+        "lea 1f(%%rip), %%rax\n"
+        "push %%rax\n"
+        "lretq\n"
+        "1:\n"
+        ::: "rax", "memory");
+}

@@ -59,6 +59,20 @@ static void decode_packet(void) {
     evt = 1;
 }
 
+/* Apply a movement/button update from an external transport (USB HID boot
+ * mouse). Deltas are already sign-extended; USB Y grows downward, matching the
+ * screen, so it is added directly (unlike the PS/2 path which inverts it). */
+void mouse_inject(int dx, int dy, uint8_t buttons, int wheel) {
+    mx += dx; my += dy;
+    if (mx < 0)      mx = 0;
+    if (my < 0)      my = 0;
+    if (mx > sw - 1) mx = sw - 1;
+    if (my > sh - 1) my = sh - 1;
+    btns = buttons & 0x07;
+    wheelacc += wheel;
+    evt = 1;
+}
+
 static void on_irq(struct registers *r) {
     (void)r;
     uint8_t st = inb(PS2_STATUS);

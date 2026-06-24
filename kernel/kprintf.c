@@ -3,44 +3,60 @@
 #include "kprintf.h"
 #include "io.h"
 
-static void print_dec(uint64_t v) {
-    char buf[24]; int i = 0;
-    if (!v) { kputc('0'); return; }
-    while (v) { buf[i++] = (char)('0' + v % 10); v /= 10; }
-    while (i--) kputc(buf[i]);
+/* render an unsigned value into buf (no NUL); returns the digit count */
+static int u_to_dec(char *buf, uint64_t v) {
+    char t[24]; int i = 0;
+    if (!v) { buf[0] = '0'; return 1; }
+    while (v) { t[i++] = (char)('0' + v % 10); v /= 10; }
+    for (int k = 0; k < i; k++) buf[k] = t[i - 1 - k];
+    return i;
 }
-
-static void print_hex(uint64_t v, int pad) {
+static int u_to_hex(char *buf, uint64_t v) {
     static const char *h = "0123456789abcdef";
-    char buf[16];
-    for (int i = 0; i < 16; i++) { buf[i] = h[v & 0xF]; v >>= 4; }
-    int start = 15;
-    if (pad > 0 && pad <= 16) start = pad - 1;
-    else { while (start > 0 && buf[start] == '0') start--; }
-    for (int i = start; i >= 0; i--) kputc(buf[i]);
+    char t[16]; int i = 0;
+    if (!v) { buf[0] = '0'; return 1; }
+    while (v) { t[i++] = h[v & 0xF]; v >>= 4; }
+    for (int k = 0; k < i; k++) buf[k] = t[i - 1 - k];
+    return i;
 }
 
+/* printf with flags/width: supports %[-][0][width][l..]{s,c,d,i,u,x,p,%}.
+ * `-` left-justifies, `0` zero-pads numerics, width is the minimum field
+ * width. Precision is not supported. */
 void kprintf(const char *f, ...) {
     va_list ap; va_start(ap, f);
     for (; *f; f++) {
         if (*f != '%') { kputc(*f); continue; }
         f++;
-        int l = 0;
-        while (*f == 'l') { l++; f++; }
+        int left = 0, zero = 0, width = 0;
+        for (;;) { if (*f == '-') { left = 1; f++; } else if (*f == '0') { zero = 1; f++; } else break; }
+        while (*f >= '0' && *f <= '9') { width = width * 10 + (*f - '0'); f++; }
+        int l = 0; while (*f == 'l') { l++; f++; }
+
+        char tmp[24]; const char *out = tmp; int n = 0, numeric = 0, neg = 0;
         switch (*f) {
-        case 's': { const char *s = va_arg(ap, const char *); if (!s) s = "(null)"; while (*s) kputc(*s++); } break;
-        case 'c':   kputc((char)va_arg(ap, int)); break;
+        case 's': { const char *s = va_arg(ap, const char *); if (!s) s = "(null)"; out = s; while (out[n]) n++; } break;
+        case 'c':   tmp[0] = (char)va_arg(ap, int); n = 1; break;
         case 'd': case 'i': {
             long v = l ? va_arg(ap, long) : va_arg(ap, int);
-            if (v < 0) { kputc('-'); v = -v; }
-            print_dec((uint64_t)v);
+            numeric = 1; if (v < 0) { neg = 1; v = -v; }
+            n = u_to_dec(tmp, (uint64_t)v);
         } break;
-        case 'u': { unsigned long v = l ? va_arg(ap, unsigned long) : va_arg(ap, unsigned); print_dec(v); } break;
-        case 'x': { unsigned long v = l ? va_arg(ap, unsigned long) : va_arg(ap, unsigned); print_hex(v, 0); } break;
-        case 'p': { uint64_t v = (uint64_t)va_arg(ap, void *); kputc('0'); kputc('x'); print_hex(v, 16); } break;
-        case '%': kputc('%'); break;
-        default:  kputc('%'); kputc(*f); break;
+        case 'u': { unsigned long v = l ? va_arg(ap, unsigned long) : va_arg(ap, unsigned); numeric = 1; n = u_to_dec(tmp, v); } break;
+        case 'x': { unsigned long v = l ? va_arg(ap, unsigned long) : va_arg(ap, unsigned); numeric = 1; n = u_to_hex(tmp, v); } break;
+        case 'p': { uint64_t v = (uint64_t)va_arg(ap, void *); char hb[16]; int hn = u_to_hex(hb, v);
+                    kputc('0'); kputc('x'); for (int i = hn; i < 16; i++) kputc('0'); for (int i = 0; i < hn; i++) kputc(hb[i]); } continue;
+        case '%': kputc('%'); continue;
+        default:  kputc('%'); kputc(*f); continue;
         }
+
+        int total = n + neg;
+        int pad = width > total ? width - total : 0;
+        if (neg && zero && !left) { kputc('-'); neg = 0; }     /* sign before zero-pad */
+        if (!left) { char pc = (zero && numeric) ? '0' : ' '; for (int i = 0; i < pad; i++) kputc(pc); }
+        if (neg) kputc('-');
+        for (int i = 0; i < n; i++) kputc(out[i]);
+        if (left) for (int i = 0; i < pad; i++) kputc(' ');
     }
     va_end(ap);
 }

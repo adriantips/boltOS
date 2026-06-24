@@ -28,6 +28,13 @@ uint64_t sh_uptime_ms(void);
 int      sh_readline(char *buf, int cap);      /* blocking line read w/ echo */
 int      sh_yesno(const char *question);       /* prompt, 1=yes 0=no */
 
+/* ---- handlers: Hardware / Platform -------------------------------------- */
+int cmd_fat(int, char **);    int cmd_power(int, char **);  int cmd_cpus(int, char **);
+int cmd_acpiinfo(int, char **);int cmd_play(int, char **);  int cmd_dhcp(int, char **);
+int cmd_clip(int, char **);   int cmd_crash(int, char **);
+int cmd_whoami(int, char **); int cmd_users(int, char **);  int cmd_logout(int, char **);
+int cmd_pkg(int, char **);    int cmd_ext2(int, char **);
+
 /* ---- handlers: File & Directory ----------------------------------------- */
 int cmd_ls(int, char **);     int cmd_tree(int, char **);   int cmd_cd(int, char **);
 int cmd_mkdir(int, char **);  int cmd_rm(int, char **);     int cmd_cp(int, char **);

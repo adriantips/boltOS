@@ -13,6 +13,7 @@
 #include "string.h"
 #include "pit.h"
 #include "mouse.h"
+#include "keyboard.h"     /* KEY_COPY/CUT/PASTE/DEL */
 #include "commands.h"     /* sh_human, sh_utoa */
 
 #define TOOLBAR_H  44
@@ -30,7 +31,7 @@
 #define MAXCRUMB   FS_MAX_DEPTH
 
 /* toolbar / view actions */
-enum { A_BACK = 1, A_FWD, A_UP, A_NEW, A_REN, A_DEL, A_VIEWCLOSE };
+enum { A_BACK = 1, A_FWD, A_UP, A_NEW, A_REN, A_DEL, A_VIEWCLOSE, A_COPY, A_CUT, A_PASTE, A_OPEN };
 
 typedef struct { int x, y, w, h; fs_node *node; } irect;   /* grid item / breadcrumb */
 typedef struct { int x, y, w, h; int action; } brect;      /* toolbar button         */
@@ -55,7 +56,14 @@ typedef struct {
     fs_node *view; int view_scroll, view_h;    /* in-window file viewer */
 
     uint64_t last_click; fs_node *last_node;    /* double-click tracking */
+
+    int      menu_open, menu_x, menu_y;         /* right-click context menu (client-local) */
 } files_t;
+
+/* context-menu rows: label + action id, built per open */
+typedef struct { const char *label; int action; } mrow;
+#define MENU_W 150
+#define MENU_RH 22
 
 static files_t  F;
 static window_t *FW;
@@ -170,6 +178,87 @@ static void delete_sel(files_t *st) {
     st->sel = 0;
 }
 
+/* ---- copy / cut / paste ------------------------------------------------- *
+ * A one-slot file clipboard: remember a node and whether the pending op moves
+ * it (cut) or duplicates it (copy). Paste lands the result in the current dir
+ * under a non-clashing name. */
+static fs_node *fclip;
+static int      fclip_cut;
+
+static void copy_sel(files_t *st) { if (st->sel && st->sel != fs_root()) { fclip = st->sel; fclip_cut = 0; } }
+static void cut_sel (files_t *st) { if (st->sel && st->sel != fs_root()) { fclip = st->sel; fclip_cut = 1; } }
+
+/* true if `anc` is `n` or an ancestor of `n` (guards pasting a dir into itself) */
+static int is_ancestor(fs_node *anc, fs_node *n) {
+    for (fs_node *p = n; p; p = p->parent) if (p == anc) return 1;
+    return 0;
+}
+/* pick a name unique within `dir`, seeded from `base` (adds " copy"/"~N"). */
+static void unique_name(fs_node *dir, const char *base, char *out, int cap) {
+    strncpy(out, base, cap); out[cap - 1] = 0;
+    if (!fs_child(dir, out)) return;
+    char cand[FS_NAME_MAX];
+    cand[0] = 0; kstrlcat(cand, base, sizeof(cand)); kstrlcat(cand, " copy", sizeof(cand));
+    int suf = 1;
+    while (fs_child(dir, cand)) {
+        char num[8]; sh_utoa((uint64_t)++suf, num);
+        cand[0] = 0; kstrlcat(cand, base, sizeof(cand));
+        kstrlcat(cand, " copy ", sizeof(cand)); kstrlcat(cand, num, sizeof(cand));
+    }
+    strncpy(out, cand, cap); out[cap - 1] = 0;
+}
+/* deep-copy `src` into `dir` as `name`; recurses through subdirectories. */
+static fs_node *copy_node_into(fs_node *dir, fs_node *src, const char *name) {
+    char path[FS_PATH_MAX]; fs_abspath(dir, path, sizeof(path));
+    if (path[0] && path[strlen(path) - 1] != '/') kstrlcat(path, "/", sizeof(path));
+    kstrlcat(path, name, sizeof(path));
+    fs_node *dst = fs_create(path, src->is_dir);
+    if (!dst) return 0;
+    if (src->is_dir) {
+        for (fs_node *c = src->child; c; c = c->next)
+            copy_node_into(dst, c, c->name);
+    } else if (src->data && src->size) {
+        fs_write(dst, src->data, src->size);
+    }
+    return dst;
+}
+/* Build the context-menu rows for the current selection. Returns the count. */
+static int build_menu(files_t *st, mrow *out, int max) {
+    int n = 0;
+    if (st->sel) {
+        if (n < max) out[n++] = (mrow){ "Open",   A_OPEN };
+        if (n < max) out[n++] = (mrow){ "Copy",   A_COPY };
+        if (n < max) out[n++] = (mrow){ "Cut",    A_CUT  };
+        if (n < max) out[n++] = (mrow){ "Rename", A_REN  };
+        if (n < max) out[n++] = (mrow){ "Delete", A_DEL  };
+    } else {
+        if (n < max) out[n++] = (mrow){ "New folder", A_NEW };
+    }
+    if (fclip && n < max) out[n++] = (mrow){ "Paste", A_PASTE };
+    return n;
+}
+static fs_node *item_at(files_t *st, int lx, int ly) {
+    for (int i = 0; i < st->nitems; i++) {
+        irect *r = &st->items[i];
+        if (lx >= r->x && lx < r->x + r->w && ly >= r->y && ly < r->y + r->h) return r->node;
+    }
+    return 0;
+}
+
+static void paste_into(files_t *st) {
+    if (!fclip || !st->dir) return;
+    if (fclip_cut && is_ancestor(fclip, st->dir)) return;   /* no move into own subtree */
+    char nm[FS_NAME_MAX];
+    unique_name(st->dir, fclip->name, nm, sizeof(nm));
+    if (fclip_cut) {
+        if (fs_move(fclip, st->dir, nm) == 0) st->sel = fclip;
+        fclip = 0;                                          /* a cut is consumed once */
+    } else {
+        fs_node *n = copy_node_into(st->dir, fclip, nm);
+        if (n) st->sel = n;
+    }
+}
+
 /* ---- drawing primitives ------------------------------------------------- */
 static int hover(int x, int y, int w, int h) {       /* x,y absolute (native panel) */
     int mx = mouse_x(), my = mouse_y();
@@ -213,6 +302,9 @@ static void draw_toolbar(files_t *st, window_t *w, int cx, int cy, int cw) {
     rx -= 56; tbutton(st, cx, cy, rx, by, 56, bh, "Delete", A_DEL, st->sel != 0, acc);
     rx -= 60; tbutton(st, cx, cy, rx, by, 56, bh, "Rename", A_REN, st->sel != 0, acc);
     rx -= 80; tbutton(st, cx, cy, rx, by, 76, bh, "New folder", A_NEW, 1, acc);
+    rx -= 60; tbutton(st, cx, cy, rx, by, 56, bh, "Paste", A_PASTE, fclip != 0, acc);
+    rx -= 48; tbutton(st, cx, cy, rx, by, 44, bh, "Cut",  A_CUT,  st->sel != 0, acc);
+    rx -= 56; tbutton(st, cx, cy, rx, by, 52, bh, "Copy", A_COPY, st->sel != 0, acc);
 
     /* breadcrumb address bar between the two groups */
     int ax = bx, aw = rx - 8 - bx; if (aw < 60) aw = 60;
@@ -421,6 +513,21 @@ static void draw_status(files_t *st, int cx, int cy, int cw, int ch) {
 }
 
 /* ---- top-level draw ----------------------------------------------------- */
+/* context menu, drawn last so it floats above the listing */
+static void draw_menu(files_t *st, int cx, int cy) {
+    if (!st->menu_open) return;
+    mrow rows[8]; int nr = build_menu(st, rows, 8);
+    int mx = cx + st->menu_x, my = cy + st->menu_y, mh = nr * MENU_RH;
+    g_fill(mx - 1, my - 1, MENU_W + 2, mh + 2, 0x000000);   /* drop shadow / border */
+    g_fill(mx, my, MENU_W, mh, COL_PANEL_2);
+    for (int i = 0; i < nr; i++) {
+        int ry = my + i * MENU_RH;
+        if (hover(mx, ry, MENU_W, MENU_RH)) g_fill(mx, ry, MENU_W, MENU_RH, COL_ACCENT);
+        g_text(mx + 12, ry + 6, rows[i].label, COL_TEXT, 1);
+    }
+    g_rect(mx, my, MENU_W, mh, 0x44444F);
+}
+
 static void files_draw(window_t *w, int cx, int cy, int cw, int ch) {
     files_t *st = &F;
     st->cw = cw; st->ch = ch;
@@ -434,6 +541,7 @@ static void files_draw(window_t *w, int cx, int cy, int cw, int ch) {
     if (st->view) draw_viewer(st, w, cx, cy, cw, ch);
     else          draw_listing(st, w, cx, cy, cw, ch);
     draw_status(st, cx, cy, cw, ch);
+    draw_menu(st, cx, cy);
 }
 
 /* ---- input -------------------------------------------------------------- */
@@ -479,6 +587,10 @@ static void files_key(window_t *w, char c) {
     else if (c == 'k') st->scroll -= 32;
     else if (c == ' ') st->scroll += page;
     else if (c == '\b') go_up(st);                   /* Backspace = Up */
+    else if ((unsigned char)c == KEY_COPY)  copy_sel(st);
+    else if ((unsigned char)c == KEY_CUT)   cut_sel(st);
+    else if ((unsigned char)c == KEY_PASTE) paste_into(st);
+    else if ((unsigned char)c == KEY_DEL)   delete_sel(st);
     else if (c == '\n' && st->sel) open_item(st, st->sel);
     clamp_scroll(st);
 }
@@ -490,24 +602,66 @@ static void files_scroll(window_t *w, int delta) {
     else          { st->scroll      += delta * 40; clamp_scroll(st); }
 }
 
+/* right-click: select the item under the cursor (if any) and pop the context
+ * menu there. Right-clicking empty space gives the New-folder/Paste menu. */
+static void files_rclick(window_t *w, int lx, int ly) {
+    (void)w;
+    files_t *st = &F;
+    if (st->renaming || st->view) return;
+    fs_node *n = item_at(st, lx, ly);
+    if (n) st->sel = n; else st->sel = 0;
+    /* keep the menu fully inside the client area */
+    mrow rows[8]; int nr = build_menu(st, rows, 8);
+    int mx = lx, my = ly;
+    if (mx + MENU_W > st->cw) mx = st->cw - MENU_W;
+    if (my + nr * MENU_RH > st->ch) my = st->ch - nr * MENU_RH;
+    if (mx < 0) mx = 0; if (my < 0) my = 0;
+    st->menu_x = mx; st->menu_y = my; st->menu_open = 1;
+}
+
+/* run a toolbar / context-menu action by id */
+static void do_action(files_t *st, int action) {
+    switch (action) {
+    case A_BACK: go_back(st); break;
+    case A_FWD:  go_fwd(st);  break;
+    case A_UP:   go_up(st);   break;
+    case A_NEW:  new_folder(st); break;
+    case A_REN:  begin_rename(st, st->sel); break;
+    case A_DEL:  delete_sel(st); break;
+    case A_COPY: copy_sel(st); break;
+    case A_CUT:  cut_sel(st);  break;
+    case A_PASTE: paste_into(st); break;
+    case A_OPEN: if (st->sel) open_item(st, st->sel); break;
+    case A_VIEWCLOSE: st->view = 0; break;
+    }
+}
+
 static void files_click(window_t *w, int lx, int ly) {
     (void)w;
     files_t *st = &F;
 
     if (st->renaming) { commit_rename(st); return; }   /* clicking away commits */
 
+    /* an open context menu eats the next click: run the hit row, else close */
+    if (st->menu_open) {
+        mrow rows[8]; int nr = build_menu(st, rows, 8);
+        int hit = -1;
+        if (lx >= st->menu_x && lx < st->menu_x + MENU_W) {
+            int rel = ly - st->menu_y;
+            if (rel >= 0 && rel < nr * MENU_RH) hit = rel / MENU_RH;
+        }
+        st->menu_open = 0;
+        if (hit >= 0) {
+            if (rows[hit].action == A_OPEN && st->sel) open_item(st, st->sel);
+            else do_action(st, rows[hit].action);
+        }
+        return;
+    }
+
     for (int i = 0; i < st->nbtn; i++) {
         brect *b = &st->btns[i];
         if (lx < b->x || lx >= b->x + b->w || ly < b->y || ly >= b->y + b->h) continue;
-        switch (b->action) {
-        case A_BACK: go_back(st); break;
-        case A_FWD:  go_fwd(st);  break;
-        case A_UP:   go_up(st);   break;
-        case A_NEW:  new_folder(st); break;
-        case A_REN:  begin_rename(st, st->sel); break;
-        case A_DEL:  delete_sel(st); break;
-        case A_VIEWCLOSE: st->view = 0; break;
-        }
+        do_action(st, b->action);
         return;
     }
     for (int i = 0; i < st->ncrumb; i++) {
@@ -596,6 +750,7 @@ void files_app_init(void) {
     w->draw = files_draw;
     w->key  = files_key;
     w->click = files_click;
+    w->rclick = files_rclick;
     w->scroll = files_scroll;
     w->min_w = 540; w->min_h = 340;
     w->x = 120; w->y = 90;

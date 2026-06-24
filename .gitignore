@@ -1,5 +1,9 @@
 /build/
+/esp/
 *.log
 *.o
 *.bin
 *.img
+*.ppm
+*.fd
+assets/font.ttf

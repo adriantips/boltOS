@@ -34,3 +34,8 @@ void idt_init(void) {
     idtp.base  = (uint64_t)idt;
     __asm__ volatile("lidt %0" :: "m"(idtp) : "memory");
 }
+
+/* Load the already-built IDT on the calling CPU (application processors). */
+void idt_load(void) {
+    __asm__ volatile("lidt %0" :: "m"(idtp) : "memory");
+}

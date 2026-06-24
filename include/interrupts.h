@@ -13,6 +13,7 @@ struct registers {
 typedef void (*irq_handler_t)(struct registers *);
 
 void idt_init(void);
+void idt_load(void);                    /* load the built IDT on an AP */
 void irq_install(int irq, irq_handler_t h);
 
 /* Tick hook: called on every IRQ0 (timer) and may return a different register

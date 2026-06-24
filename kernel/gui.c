@@ -6,6 +6,8 @@
  * ===========================================================================*/
 #include <stdint.h>
 #include "gui.h"
+#include "xhci.h"
+#include "ttf.h"
 #include "settings.h"
 #include "framebuffer.h"
 #include "console.h"
@@ -20,6 +22,7 @@
 #include "shell.h"
 #include "string.h"
 #include "fs.h"
+#include "users.h"
 
 extern const unsigned char font8x8_basic[128][8];   /* 8x8 retro face   */
 extern const unsigned char font_8x16[95][16];        /* 8x16 Arial face  */
@@ -37,6 +40,8 @@ static int g_font = FONT_ARIAL;
 #define DI_H       86              /* desktop icon cell height */
 #define MAX_PW     3840            /* largest panel we allocate backbuffers for */
 #define MAX_PH     2160            /* (4K) -- res changes reuse these buffers   */
+#define RS_BORDER  6               /* window edge resize grab band, in px       */
+enum { RS_L = 1, RS_R = 2, RS_T = 4, RS_B = 8 };   /* resize-edge bitmask       */
 
 static int hires_ok;               /* big backbuffers allocated -> res switch allowed */
 
@@ -157,6 +162,21 @@ void g_text(int x, int y, const char *str, uint32_t color, int s) {
     for (; *str; str++) { g_char(x, y, *str, color, s); x += 8 * s; }
 }
 int g_text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
+
+/* ---- scalable anti-aliased text via the TrueType rasterizer ------------- *
+ * Renders to the backbuffer with per-pixel alpha. y is the text TOP; px is the
+ * cap/em pixel size. Falls back to nothing if no font was embedded. */
+static uint32_t tt_color;
+static void tt_plot(int x, int y, uint8_t cov, void *ctx) { (void)ctx; px_blend(x, y, tt_color, cov); }
+void g_text_tt(int x, int y_top, const char *s, uint32_t color, int px) {
+    if (!ttf_ready()) { g_text(x, y_top, s, color, px >= 24 ? 2 : 1); return; }
+    int asc = (px * 80) / 100;                 /* approx baseline from top */
+    tt_color = color;
+    ttf_draw(s, x, y_top + asc, px, tt_plot, 0);
+}
+int g_text_tt_width(const char *s, int px) {
+    return ttf_ready() ? ttf_text_width(s, px) : (int)strlen(s) * 8;
+}
 
 /* ---- proportional text -------------------------------------------------- *
  * Per-glyph metrics are derived once from the active bitmap font: the ink box
@@ -290,6 +310,9 @@ static int      nwin;
 static int      ztop;
 static int      focus_id = -1;
 static int      drag_id  = -1, drag_dx, drag_dy;
+static int      title_last_id = -1; static uint64_t title_last_tick;  /* title double-click */
+static int      resize_id = -1, resize_edge;    /* window being edge-resized + its edge mask */
+static int      rs_x0, rs_y0, rs_w0, rs_h0, rs_mx, rs_my;  /* rect + mouse at resize start */
 static int      client_drag_id = -1;            /* window receiving held-button drag */
 static uint8_t  prev_btns;
 static int      menu_open;
@@ -753,11 +776,12 @@ static int ctx_menu_hit(int x, int y) {
 #define SM_TH   80
 #define SM_PAD  16
 #define SM_HEAD 56
+#define SM_FOOT 40
 
 static void start_menu_rect(int *ox, int *oy, int *mw, int *mh) {
     int rows = (nwin + SM_COLS - 1) / SM_COLS; if (rows < 1) rows = 1;
     *mw = SM_PAD * 2 + SM_COLS * SM_TW;
-    *mh = SM_HEAD + rows * SM_TH + SM_PAD - 8;
+    *mh = SM_HEAD + rows * SM_TH + SM_PAD - 8 + SM_FOOT;
     int sx, sy; taskbar_layout(&sx, &sy);
     int x = sx; if (x + *mw > W - 8) x = W - 8 - *mw; if (x < 8) x = 8;
     int y = H - TASKBAR_H - *mh - 10; if (y < 8) y = 8;
@@ -766,6 +790,13 @@ static void start_menu_rect(int *ox, int *oy, int *mw, int *mh) {
 static void start_menu_tile(int idx, int ox, int oy, int *tx, int *ty) {
     *tx = ox + SM_PAD + (idx % SM_COLS) * SM_TW;
     *ty = oy + SM_HEAD + (idx / SM_COLS) * SM_TH;
+}
+
+/* sign-out button rect inside the start menu footer */
+static void signout_rect(int x, int y, int mw, int mh, int *bx, int *by, int *bw, int *bh) {
+    *bw = 80; *bh = 24;
+    *bx = x + mw - *bw - 14;
+    *by = y + mh - SM_FOOT + 8;
 }
 
 static void draw_start_menu(void) {
@@ -788,18 +819,125 @@ static void draw_start_menu(void) {
         int lw = g_text_width(lbl, 1);
         g_text(tx + (SM_TW - lw) / 2, ty + 52, lbl, hot ? COL_TEXT : COL_TEXT_DIM, 1);
     }
+
+    /* footer: current user + a sign-out button */
+    int fy = y + mh - SM_FOOT;
+    g_hline(x + 12, fy, mw - 24, 0x2A2A3A);
+    const char *who = users_current();
+    char line[40]; line[0] = 0;
+    kstrlcat(line, "Signed in: ", sizeof(line));
+    kstrlcat(line, who[0] ? who : "guest", sizeof(line));
+    g_text(x + 18, fy + 14, line, COL_TEXT_DIM, 1);
+    int sx, sy, sw, sh; signout_rect(x, y, mw, mh, &sx, &sy, &sw, &sh);
+    int sh_hot = mxp >= sx && mxp < sx + sw && myp >= sy && myp < sy + sh;
+    g_round(sx, sy, sw, sh, 6, sh_hot ? 0xC0392B : 0x3A2A2A, 255);
+    g_text(sx + 10, sy + 6, "Sign out", COL_TEXT, 1);
 }
 
-/* ---- mouse cursor (arrow) ---------------------------------------------- */
+/* ---- window edge resize: hit-testing ----------------------------------- *
+ * Which edges of window w is (x,y) within the grab band of? Returns an RS_*
+ * bitmask (a corner sets two bits). The band straddles each edge by RS_BORDER
+ * px, inside and out, so the very rim grabs like every other OS. Maximised
+ * windows don't resize. */
+static int resize_zone(window_t *w, int x, int y) {
+    if (w->maximized) return 0;
+    int x0 = w->x, y0 = w->y, x1 = w->x + w->w, y1 = w->y + w->h;
+    if (x < x0 - RS_BORDER || x >= x1 + RS_BORDER ||
+        y < y0 - RS_BORDER || y >= y1 + RS_BORDER) return 0;
+    int e = 0;
+    if (iabs(x - x0) <= RS_BORDER) e |= RS_L;
+    if (iabs(x - x1) <= RS_BORDER) e |= RS_R;
+    if (iabs(y - y0) <= RS_BORDER) e |= RS_T;
+    if (iabs(y - y1) <= RS_BORDER) e |= RS_B;
+    return e;
+}
+static int over_caption_btn(window_t *w, int x, int y) {
+    for (int s = 0; s < 3; s++) {
+        int bx, by, bw, bh; caption_btn(w, s, &bx, &by, &bw, &bh);
+        if (x >= bx && x < bx + bw && y >= by && y < by + bh) return 1;
+    }
+    return 0;
+}
+/* Resize edge mask for the cursor at (x,y): the topmost window whose grab band
+ * the point lands in wins. Returns 0 (and sets *out_i to that window, or -1) if
+ * the point is over a window interior / caption button / nothing -- i.e. the
+ * normal arrow cursor applies. */
+static int cursor_resize(int x, int y, int *out_i) {
+    int best = -1, bz = -1;
+    for (int i = 0; i < nwin; i++) {
+        window_t *w = &wins[i];
+        if (!w->open || w->minimized || w->maximized) continue;
+        if (x < w->x - RS_BORDER || x >= w->x + w->w + RS_BORDER ||
+            y < w->y - RS_BORDER || y >= w->y + w->h + RS_BORDER) continue;
+        if (w->z > bz) { bz = w->z; best = i; }
+    }
+    *out_i = best;
+    if (best < 0) return 0;
+    window_t *w = &wins[best];
+    int e = resize_zone(w, x, y);
+    if (e && over_caption_btn(w, x, y)) e = 0;       /* buttons win over the rim */
+    return e;
+}
+
+/* ---- mouse cursor (arrow + resize arrows) ------------------------------ */
 static const char *CURSOR[19] = {
     "X          ", "XX         ", "X.X        ", "X..X       ", "X...X      ",
     "X....X     ", "X.....X    ", "X......X   ", "X.......X  ", "X........X ",
     "X.....XXXXX", "X..X..X    ", "X.X X..X   ", "XX  X..X   ", "X    X..X  ",
     "     X..X  ", "      X..X ", "      X..X ", "       XX  ",
 };
+/* A double-headed resize arrow, drawn centred on the pointer. kind: 1 = <->,
+ * 2 = vertical, 3 = NW-SE diagonal, 4 = NE-SW diagonal. The shape is defined as
+ * a white "ink" predicate; any empty pixel touching ink becomes the black
+ * outline, so it reads on any background like the plain arrow does. */
+static int resize_ink(int kind, int dx, int dy) {
+    switch (kind) {
+    case 1:
+        if (iabs(dx) <= 5 && iabs(dy) <= 1) return 1;
+        if (dx <= -4 && dx >= -7 && iabs(dy) <= dx + 7) return 1;
+        if (dx >=  4 && dx <=  7 && iabs(dy) <= 7 - dx) return 1;
+        return 0;
+    case 2:
+        if (iabs(dy) <= 5 && iabs(dx) <= 1) return 1;
+        if (dy <= -4 && dy >= -7 && iabs(dx) <= dy + 7) return 1;
+        if (dy >=  4 && dy <=  7 && iabs(dx) <= 7 - dy) return 1;
+        return 0;
+    case 3:
+        if (iabs(dx - dy) <= 1 && iabs(dx) <= 6 && iabs(dy) <= 6) return 1;
+        if (dx + dy <= -8 && dx >= -7 && dy >= -7 && dx <= 0 && dy <= 0) return 1;
+        if (dx + dy >=  8 && dx <=  7 && dy <=  7 && dx >= 0 && dy >= 0) return 1;
+        return 0;
+    default:
+        if (iabs(dx + dy) <= 1 && iabs(dx) <= 6 && iabs(dy) <= 6) return 1;
+        if (dy - dx <= -8 && dx >= 0 && dx <= 7 && dy >= -7 && dy <= 0) return 1;
+        if (dy - dx >=  8 && dx >= -7 && dx <= 0 && dy >= 0 && dy <= 7) return 1;
+        return 0;
+    }
+}
+static void draw_resize_cursor(int cx, int cy, int kind) {
+    for (int dy = -8; dy <= 8; dy++)
+        for (int dx = -8; dx <= 8; dx++) {
+            if (resize_ink(kind, dx, dy)) { px(cx + dx, cy + dy, 0xFFFFFF); continue; }
+            int o = 0;
+            for (int ny = -1; ny <= 1 && !o; ny++)
+                for (int nx = -1; nx <= 1; nx++)
+                    if (resize_ink(kind, dx + nx, dy + ny)) { o = 1; break; }
+            if (o) px(cx + dx, cy + dy, 0x000000);
+        }
+}
 static void draw_cursor(void) {
     g_clear_clip();
     int ox = mlx(), oy = mly();
+    int wi, e = (resize_id >= 0) ? resize_edge : cursor_resize(ox, oy, &wi);
+    if (e) {                                   /* over (or dragging) a resize edge */
+        int kind;
+        if ((e & (RS_L | RS_R)) && (e & (RS_T | RS_B)))
+            kind = (((e & RS_L) && (e & RS_T)) || ((e & RS_R) && (e & RS_B))) ? 3 : 4;
+        else if (e & (RS_L | RS_R)) kind = 1;
+        else                        kind = 2;
+        draw_resize_cursor(ox, oy, kind);
+        return;
+    }
     for (int j = 0; j < 19; j++)
         for (int i = 0; CURSOR[j][i]; i++) {
             char c = CURSOR[j][i];
@@ -992,11 +1130,30 @@ static void toggle_window_from_taskbar(int i) {
 }
 
 static void do_maximize(window_t *w) {
-    if (w->maximized) {
-        w->x = w->rx; w->y = w->ry; w->w = w->rw; w->h = w->rh; w->maximized = 0;
+    if (w->maximized || w->snapped) {
+        w->x = w->rx; w->y = w->ry; w->w = w->rw; w->h = w->rh;
+        w->maximized = 0; w->snapped = 0;
     } else {
         w->rx = w->x; w->ry = w->y; w->rw = w->w; w->rh = w->h;
         w->x = 0; w->y = 0; w->w = W; w->h = H - TASKBAR_H; w->maximized = 1;
+    }
+}
+
+/* Aero-snap on drag release: pointer at the top edge maximises; at the left or
+ * right edge fills that half of the screen. The pre-snap rect is saved so the
+ * next drag (or the maximise button) restores it. */
+static void snap_window(window_t *w, int mx, int my) {
+    int avail = H - TASKBAR_H;
+    if (my > 2 && mx > 2 && mx < W - 3) return;        /* not at any edge */
+    if (!w->maximized && !w->snapped) {
+        w->rx = w->x; w->ry = w->y; w->rw = w->w; w->rh = w->h;
+    }
+    if (my <= 2) {                                     /* top -> maximise */
+        w->x = 0; w->y = 0; w->w = W; w->h = avail; w->maximized = 1; w->snapped = 0;
+    } else if (mx <= 2) {                              /* left half */
+        w->x = 0; w->y = 0; w->w = W / 2; w->h = avail; w->maximized = 0; w->snapped = 1;
+    } else {                                           /* right half */
+        w->x = W / 2; w->y = 0; w->w = W - W / 2; w->h = avail; w->maximized = 0; w->snapped = 1;
     }
 }
 
@@ -1029,6 +1186,8 @@ static void on_left_down(int x, int y) {
     if (menu_open) {
         int mxx, myy, mw, mh; start_menu_rect(&mxx, &myy, &mw, &mh);
         if (x >= mxx && x < mxx + mw && y >= myy && y < myy + mh) {
+            int sx, sy, sw, sh; signout_rect(mxx, myy, mw, mh, &sx, &sy, &sw, &sh);
+            if (x >= sx && x < sx + sw && y >= sy && y < sy + sh) { menu_open = 0; gui_logout(); return; }
             for (int i = 0; i < nwin; i++) {
                 int tx, ty; start_menu_tile(i, mxx, myy, &tx, &ty);
                 if (x >= tx && x < tx + SM_TW && y >= ty && y < ty + SM_TH) { gui_open(&wins[i]); menu_open = 0; return; }
@@ -1036,6 +1195,19 @@ static void on_left_down(int x, int y) {
             return;
         }
         menu_open = 0; dirty = 1;                 /* click outside menu closes it */
+    }
+
+    /* window edge -> start an edge/corner resize (topmost window wins) */
+    {
+        int rwin, re = cursor_resize(x, y, &rwin);
+        if (re && rwin >= 0) {
+            gui_focus(&wins[rwin]);
+            resize_id = rwin; resize_edge = re;
+            rs_x0 = wins[rwin].x; rs_y0 = wins[rwin].y;
+            rs_w0 = wins[rwin].w; rs_h0 = wins[rwin].h;
+            rs_mx = x; rs_my = y;
+            return;
+        }
     }
 
     /* windows, front to back */
@@ -1055,7 +1227,22 @@ static void on_left_down(int x, int y) {
                         return;
                     }
                 }
-                if (!w->maximized) { drag_id = i; drag_dx = x - w->x; drag_dy = y - w->y; }
+                /* double-click the title bar toggles maximise */
+                uint64_t now = pit_ticks();
+                if (title_last_id == i && now - title_last_tick < 400) {
+                    do_maximize(w); title_last_id = -1; return;
+                }
+                title_last_id = i; title_last_tick = now;
+                /* drag a maximised/snapped window: restore its size first and
+                 * recenter it under the cursor so it follows naturally */
+                if (w->maximized || w->snapped) {
+                    int gw = w->rw > 0 ? w->rw : w->w;
+                    w->maximized = 0; w->snapped = 0;
+                    w->w = gw; w->h = w->rh > 0 ? w->rh : w->h;
+                    w->x = x - gw / 2; w->y = y - TITLE_H / 2;
+                    clamp_window(w);
+                }
+                drag_id = i; drag_dx = x - w->x; drag_dy = y - w->y;
             } else {                                /* client area */
                 if (w->click) w->click(w, x - w->x, y - (w->y + TITLE_H));
                 if (w->drag) {                       /* begin a held-button drag stream */
@@ -1129,9 +1316,30 @@ static void handle_mouse(void) {
     uint8_t down = b & ~prev_btns;
     uint8_t up   = prev_btns & ~b;
 
-    if (drag_id >= 0) {                              /* dragging a window */
+    if (resize_id >= 0) {                            /* resizing a window by an edge/corner */
+        window_t *w = &wins[resize_id];
+        if (b & MOUSE_LEFT) {
+            int dx = x - rs_mx, dy = y - rs_my;
+            int r_edge = rs_x0 + rs_w0, b_edge = rs_y0 + rs_h0;   /* fixed opposite edges */
+            int nx = rs_x0, ny = rs_y0, nw = rs_w0, nh = rs_h0;
+            if (resize_edge & RS_R) nw = rs_w0 + dx;
+            if (resize_edge & RS_L) nw = rs_w0 - dx;
+            if (resize_edge & RS_B) nh = rs_h0 + dy;
+            if (resize_edge & RS_T) nh = rs_h0 - dy;
+            if (nw < w->min_w) nw = w->min_w;
+            if (nh < w->min_h) nh = w->min_h;
+            if (nw > W)            nw = W;
+            if (nh > H - TITLE_H)  nh = H - TITLE_H;
+            if (resize_edge & RS_L) nx = r_edge - nw;            /* grow left: keep right edge */
+            if (resize_edge & RS_T) ny = b_edge - nh;            /* grow up: keep bottom edge   */
+            if (ny < 0) { ny = 0; if (resize_edge & RS_T) nh = b_edge; }
+            w->x = nx; w->y = ny; w->w = nw; w->h = nh;
+            clamp_window(w);
+        }
+        if (up & MOUSE_LEFT) resize_id = -1;
+    } else if (drag_id >= 0) {                       /* dragging a window */
         if (b & MOUSE_LEFT) { wins[drag_id].x = x - drag_dx; wins[drag_id].y = y - drag_dy; clamp_window(&wins[drag_id]); }
-        if (up & MOUSE_LEFT)  drag_id = -1;
+        if (up & MOUSE_LEFT) { snap_window(&wins[drag_id], x, y); drag_id = -1; }
     } else if (client_drag_id >= 0) {                /* held-button drag inside an app's client area */
         window_t *w = &wins[client_drag_id];
         if ((b & MOUSE_LEFT) && w->drag) w->drag(w, x - w->x, y - (w->y + TITLE_H));
@@ -1218,6 +1426,72 @@ void gui_pump(void) {
 }
 
 /* ===========================================================================
+ *  Login screen. Shown full-screen before the desktop; keyboard-driven. On a
+ *  correct username/password the current user is set and the desktop appears.
+ * ===========================================================================*/
+static int  login_active;
+static char login_user[USER_NAME_MAX];
+static int  login_ulen;
+static char login_pass[40];
+static int  login_plen;
+static int  login_field;          /* 0 = username, 1 = password */
+static int  login_err;
+
+static void login_begin(void) {
+    login_active = 1; login_ulen = login_plen = 0; login_field = 0; login_err = 0;
+    login_user[0] = login_pass[0] = 0;
+}
+void gui_logout(void) { users_logout(); login_begin(); dirty = 1; }
+static void login_submit(void) {
+    login_user[login_ulen] = 0; login_pass[login_plen] = 0;
+    int uid = users_auth(login_user, login_pass);
+    if (uid >= 0) { users_login(uid); login_active = 0; }
+    else { login_err = 1; login_plen = 0; login_pass[0] = 0; login_field = 1; }
+}
+static void login_key(char c) {
+    unsigned char u = (unsigned char)c;
+    if (u == '\t') { login_field ^= 1; login_err = 0; return; }
+    if (u == '\n') { if (login_field == 0 && login_ulen > 0) login_field = 1; else login_submit(); return; }
+    if (u == '\b') {
+        if (login_field == 0) { if (login_ulen) login_user[--login_ulen] = 0; }
+        else                  { if (login_plen) login_pass[--login_plen] = 0; }
+        return;
+    }
+    if (u >= 32 && u < 127) {
+        if (login_field == 0) { if (login_ulen < USER_NAME_MAX - 1) login_user[login_ulen++] = c; }
+        else                  { if (login_plen < 39)               login_pass[login_plen++] = c; }
+    }
+}
+static void draw_login(void) {
+    g_clear_clip();
+    g_fill(0, 0, W, H, 0x0A0E1A);
+    int cw = 380, chh = 256;
+    int cx = (W - cw) / 2, cy = (H - chh) / 2;
+    g_round(cx, cy, cw, chh, 12, 0x161A28, 255);
+    /* TrueType title (scalable, anti-aliased) with a bitmap fallback */
+    g_text_tt(cx + cw/2 - g_text_tt_width("BoltOS", 34)/2, cy + 14, "BoltOS", 0xFFFFFF, 34);
+    g_text_tt(cx + cw/2 - g_text_tt_width("Sign in to continue", 14)/2, cy + 56, "Sign in to continue", 0x8893A8, 14);
+
+    int fx = cx + 30, fw = cw - 60, fh = 30;
+    int uy = cy + 96, py = cy + 152;
+    g_text(fx, uy - 16, "Username", 0x8893A8, 1);
+    g_round(fx, uy, fw, fh, 6, login_field == 0 ? 0x223052 : 0x10131F, 255);
+    g_rect(fx, uy, fw, fh, login_field == 0 ? 0x4FC3F7 : 0x33333F);
+    g_text(fx + 10, uy + 8, login_user, 0xFFFFFF, 1);
+
+    g_text(fx, py - 16, "Password", 0x8893A8, 1);
+    g_round(fx, py, fw, fh, 6, login_field == 1 ? 0x223052 : 0x10131F, 255);
+    g_rect(fx, py, fw, fh, login_field == 1 ? 0x4FC3F7 : 0x33333F);
+    char stars[40]; int i; for (i = 0; i < login_plen && i < 39; i++) stars[i] = '*'; stars[i] = 0;
+    g_text(fx + 10, py + 8, stars, 0xFFFFFF, 1);
+
+    if (login_err)
+        g_text(cx + cw/2 - g_text_width("Incorrect credentials", 1)/2, cy + chh - 32, "Incorrect credentials", 0xFF6B6B, 1);
+    else
+        g_text(fx, cy + chh - 32, "Tab switches field . default: user / bolt", 0x55607A, 1);
+}
+
+/* ===========================================================================
  *  Boot screen + main loop
  * ===========================================================================*/
 void gui_run(void) {
@@ -1286,9 +1560,25 @@ void gui_run(void) {
     uint64_t busy = 0, total = 0;
     prev_btns = 0; drag_id = -1; dirty = 1;
 
+    login_begin();             /* gate the desktop behind a sign-in */
+
     for (;;) {
         uint64_t t0 = rdtsc();
 
+        if (login_active) {                          /* sign-in: keyboard only */
+            xhci_poll();
+            int ci; while ((ci = kbd_trygetc()) >= 0) { login_key((char)ci); dirty = 1; }
+            if (dirty) {
+                draw_login();
+                if (output_is_native()) fb_blit(BB);
+                else fb_blit_scaled(BB, (uint32_t)W, (uint32_t)H,
+                                    (uint32_t)out_x, (uint32_t)out_y, (uint32_t)out_w, (uint32_t)out_h);
+                dirty = 0;
+            }
+            continue;
+        }
+
+        xhci_poll();                                 /* drain USB HID keyboard reports */
         if (mouse_poll_event()) handle_mouse();
         { int dz = mouse_wheel(); if (dz) handle_wheel(dz); }
         int ci; while ((ci = kbd_trygetc()) >= 0) handle_key((char)ci);

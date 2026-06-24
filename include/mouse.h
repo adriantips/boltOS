@@ -14,6 +14,8 @@ void    mouse_set_bounds(int screen_w, int screen_h);   /* re-clamp after a res 
 int     mouse_x(void);
 int     mouse_y(void);
 uint8_t mouse_buttons(void);
+/* Inject a movement/button update from the USB HID boot-mouse path. */
+void    mouse_inject(int dx, int dy, uint8_t buttons, int wheel);
 /* Returns 1 (and clears the flag) if a packet arrived since the last call. */
 int     mouse_poll_event(void);
 /* Accumulated scroll-wheel delta since last call (+ up / - down), then clears.
