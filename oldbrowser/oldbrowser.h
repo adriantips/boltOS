@@ -80,6 +80,7 @@ typedef struct content {
     layout_tree  *box;
     char   *css; uint32_t css_len;
     int     laid_w;
+    void   *nspage;          /* ns_page* -- REAL libdom+libcss render (ns_html.c) */
     /* --- image (content/handlers/image.c) --- */
     image_t *img;
     /* --- error --- */

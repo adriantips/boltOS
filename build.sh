@@ -95,9 +95,26 @@ SRCS=(
     kernel/settings.c kernel/clipboard.c kernel/stackguard.c kernel/users.c kernel/pkg.c
     kernel/boltpy.c kernel/cmd_python.c kernel/boltcc.c kernel/js.c kernel/cmd_js.c
     fs/ramfs.c fs/fat32.c fs/ext2.c
-    drivers/keyboard.c drivers/framebuffer.c drivers/gpu.c drivers/mouse.c drivers/ata.c drivers/ahci.c drivers/nvme.c drivers/xhci.c drivers/pcspk.c drivers/ac97.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c libc/string.c
+    drivers/keyboard.c drivers/framebuffer.c drivers/gpu.c drivers/mouse.c drivers/ata.c drivers/ahci.c drivers/nvme.c drivers/xhci.c drivers/pcspk.c drivers/ac97.c mm/pmm.c mm/vmm.c mm/kheap.c mm/dma.c
+    kernel/cmd_libctest.c
+)
+# The freestanding C library. Built with -fno-math-errno/-fno-trapping-math so the
+# compiler lowers __builtin_sqrt &c. to bare SSE instructions instead of an
+# errno-aware library call -- otherwise `double sqrt(x){return __builtin_sqrt(x);}`
+# tail-calls itself into an infinite loop.
+LIBC_SRCS=(
+    libc/string.c libc/string_ext.c libc/malloc.c libc/printf.c libc/scanf.c
+    libc/stdlib.c libc/support.c libc/math.c libc/stdio_file.c libc/time.c
 )
 KOBJS=(build/kboot.o build/isr.o build/sc_entry.o build/ap_boot_blob.o build/hello_blob.o build/winhello_blob.o build/boltrt_blob.o)
+# libc non-local jump (asm); clang's integrated assembler handles the .S
+"$CLANG" --target=x86_64-elf -mcmodel=kernel -c libc/setjmp.S -o build/setjmp.o
+KOBJS+=(build/setjmp.o)
+for c in "${LIBC_SRCS[@]}"; do
+    o="build/$(basename "${c%.c}").o"
+    "$CLANG" "${CFLAGS[@]}" -fno-math-errno -fno-trapping-math "$c" -o "$o"
+    KOBJS+=("$o")
+done
 for c in "${SRCS[@]}"; do
     o="build/$(basename "${c%.c}").o"
     "$CLANG" "${CFLAGS[@]}" "$c" -o "$o"
@@ -114,6 +131,21 @@ DOOMCFLAGS=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fn
             -mcmodel=kernel -mno-red-zone -msse -msse2 -mno-mmx -mno-80387
             -O2 -w -std=gnu11 -nostdlibinc -Idoom/libc -Idoom -Iinclude
             -DNORMALUNIX -DLINUX -c)
+# DOOM ships its own private libc shim (doom/dg_libc.c). Now that the kernel has
+# a real freestanding libc (libc/*.c) exporting the same standard names, those
+# would collide at the final link. Namespace every symbol dg_libc.c defines to a
+# dg_ prefix (token-level, so DOOM stays self-consistent and keeps its exact
+# arena/WAD-IO behaviour) and leave the global libc names to the real libc.
+# The exact set (computed by intersecting nm of dg_libc.o with the real libc).
+for s in abort abs atan atan2 atof atol calloc ceil cos errno exit exp fabs \
+         fabsf fclose feof ferror fflush fgetc fgets fileno floor fmod fopen \
+         fprintf fputc fputs fread free fseek ftell fwrite getenv labs log \
+         malloc memchr pow printf putchar puts qsort rand realloc remove rename \
+         rewind sin snprintf sprintf sqrt sqrtf srand sscanf stderr stdin stdout \
+         strcasecmp strdup strerror strncasecmp strncat strstr strtod strtol \
+         strtoul system tan vfprintf vprintf vsnprintf vsprintf; do
+    DOOMCFLAGS+=("-D${s}=dg_${s}")
+done
 DOOM_SRCS=(
     dummy am_map doomdef doomstat dstrings d_event d_items d_iwad d_loop d_main d_mode d_net
     f_finale f_wipe g_game hu_lib hu_stuff info i_cdmus i_endoom i_joystick i_scale i_sound
@@ -150,10 +182,154 @@ cp assets/font.ttf build/font.ttf
 ( cd build && "$OBJCOPY" -I binary -O elf64-x86-64 font.ttf font_ttf.o )
 KOBJS+=(build/font_ttf.o)
 
+echo "[3e/6] real NetSurf libraries (upstream source, compiled against the libc)"
+# The genuine NetSurf support stack, vendored under netsurf/ and built against
+# BoltOS's freestanding libc. Each library keeps its real upstream source; only
+# the platform glue (allocators, logging) is supplied by the libc + shims. The
+# include search path and source list grow as libraries are brought up in
+# dependency order: libwapcaplet -> libparserutils -> libhubbub -> libcss -> libdom.
+LIBCSS=vendor/libcss-0.9.2
+LIBDOM=vendor/libdom-0.4.1
+# Public (namespaced) include dirs are safe to share: every header lives under a
+# library prefix (parserutils/..., libcss/..., dom/...) so they never collide.
+# The PRIVATE src/ trees are NOT safe to share -- libparserutils, libhubbub and
+# libcss each ship a "utils/utils.h", so a quoted #include "utils/utils.h"
+# resolves to whichever src/ comes first on -I. The fix: every library is
+# compiled with its OWN src/ prepended, ahead of the shared public set, so each
+# picks up its own internal headers. (This mirrors upstream's per-library build.)
+# NB: libdom's bindings/ dir is deliberately NOT on the include path -- it ships
+# its own <hubbub/errors.h>/<hubbub/parser.h> that would shadow libhubbub's; the
+# binding TU instead reaches them as quoted includes relative to its own dir.
+NS_PUB=(-Iinclude -Inetsurf
+        -Inetsurf/libwapcaplet/include
+        -Inetsurf/libparserutils/include
+        -Inetsurf/libhubbub/include
+        -I$LIBCSS/include
+        -I$LIBDOM/include)
+NSCFLAGS_BASE=(--target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie
+          -mcmodel=kernel -mno-red-zone -msse -msse2 -mno-mmx -mno-80387
+          -fno-math-errno -fno-trapping-math -O2 -w -std=gnu11
+          -DWITHOUT_ICONV_FILTER
+          # Release semantics for the vendored libs: disable asserts (no
+          # __assert_fail dependency) and silence libhubbub's treebuilder debug
+          # hook (treebuilder.c prints each insertion-mode name unless NDEBUG).
+          -DNDEBUG
+          # libcss's stylesheet.h tags struct css_rule with a trailing `_ALIGNED`
+          # macro that 0.9.2 ships undefined -- under old GCC's -fcommon it merged
+          # as a tentative definition, but modern clang (-fno-common) emits a
+          # strong global per TU => "duplicate symbol _ALIGNED" at link. Defining
+          # it empty turns `} _ALIGNED;` back into a pure struct type definition.
+          -D_ALIGNED=)
+# ns_cc <private-inc-dir-or-empty> <src...> : compile each src with the given
+# library-private src/ dir first, then the shared public includes.
+ns_cc() {
+    local priv="$1"; shift
+    local privflag=(); local p
+    for p in $priv; do privflag+=(-I"$p"); done   # $priv may list several dirs
+    for c in "$@"; do
+        local o="build/ns_$(echo "$c" | sed 's#[/.]#_#g').o"
+        "$CLANG" "${NSCFLAGS_BASE[@]}" "${privflag[@]}" "${NS_PUB[@]}" -c "$c" -o "$o"
+        KOBJS+=("$o")
+    done
+}
+
+# libwapcaplet (string interning) -- single TU, no private headers needed.
+ns_cc "" netsurf/libwapcaplet/src/libwapcaplet.c
+
+# libparserutils (buffers, charset codecs, input streams).
+ns_cc netsurf/libparserutils/src \
+    netsurf/libparserutils/src/utils/buffer.c \
+    netsurf/libparserutils/src/utils/errors.c \
+    netsurf/libparserutils/src/utils/stack.c \
+    netsurf/libparserutils/src/utils/vector.c \
+    netsurf/libparserutils/src/charset/aliases.c \
+    netsurf/libparserutils/src/charset/codec.c \
+    netsurf/libparserutils/src/charset/codecs/codec_8859.c \
+    netsurf/libparserutils/src/charset/codecs/codec_ascii.c \
+    netsurf/libparserutils/src/charset/codecs/codec_ext8.c \
+    netsurf/libparserutils/src/charset/codecs/codec_utf16.c \
+    netsurf/libparserutils/src/charset/codecs/codec_utf8.c \
+    netsurf/libparserutils/src/charset/encodings/utf16.c \
+    netsurf/libparserutils/src/charset/encodings/utf8.c \
+    netsurf/libparserutils/src/input/filter.c \
+    netsurf/libparserutils/src/input/inputstream.c
+
+# libhubbub (HTML5 tokeniser + tree builder). Every source except the textually
+# -#included gperf replacement (autogenerated-element-type.c is pulled in by
+# element-type.c, not compiled standalone).
+# NB: source lists are gathered with a single `find` in a command substitution
+# (no pipe into `while read` via process substitution). msys2's fork()/pipe
+# emulation can intermittently truncate such a pipeline, silently dropping source
+# files -> undefined symbols at link. A lone find + word-split (these vendor paths
+# contain no spaces) is deterministic; a count guard catches any truncation.
+HB_SRCS=( $(find netsurf/libhubbub/src -name '*.c' ! -name 'autogenerated-element-type.c') )
+[ "${#HB_SRCS[@]}" -ge 20 ] || { echo "ERROR: libhubbub scan truncated (${#HB_SRCS[@]})"; exit 1; }
+ns_cc netsurf/libhubbub/src "${HB_SRCS[@]}"
+
+# libcss codegen: ~120 "simple" property parsers (css__parse_<prop>) are emitted
+# at build time. A host tool (css_property_parser_gen.c) reads one descriptor
+# line per property from properties.gen and writes autogenerated_<prop>.c into
+# the properties dir. Upstream drives this from its Makefile; we replicate it so
+# the css__parse_* symbols the parser dispatch table references actually exist.
+# (css_property_parser_gen.c is a HOST program -- stdio FILE* -- so it is built
+# with the native compiler and never linked into the kernel.)
+CSSPROPDIR=$LIBCSS/src/parse/properties
+echo "      generating libcss property parsers (autogenerated_*.c)"
+"$CLANG" -O2 -w -o build/gen_parser.exe "$CSSPROPDIR/css_property_parser_gen.c"
+# Read properties.gen DIRECTLY (a plain file redirect -- no pipeline, no process
+# substitution) and extract the property name with pure-shell expansion. Earlier
+# revisions piped grep|sed|sort into `while read`, but msys2's fork()/pipe
+# emulation intermittently truncated that pipeline to a single line, leaving most
+# autogenerated_*.c empty -> a flood of undefined css__parse_* at link. Spawning
+# only gen_parser per line (with stdin closed so it can't drain the loop) makes
+# this deterministic. Each descriptor is one line: "<name>:<descriptor...>".
+gen_n=0
+while IFS= read -r gline || [ -n "$gline" ]; do
+    case "$gline" in \#*|"") continue;; esac      # skip comments / blank lines
+    case "$gline" in *:*) ;; *) continue;; esac   # must be a "name:..." line
+    name="${gline%%:*}"                            # text before the first ':'
+    [ -z "$name" ] && continue
+    build/gen_parser.exe -o "$CSSPROPDIR/autogenerated_${name}.c" "$gline" </dev/null
+    gen_n=$((gen_n + 1))
+done < "$CSSPROPDIR/properties.gen"
+echo "      generated $gen_n property parsers"
+if [ "$gen_n" -lt 100 ]; then
+    echo "ERROR: only $gen_n libcss property parsers generated (expected ~119)"; exit 1
+fi
+
+# libcss (CSS lexer + parser + computed-style selection). The whole src/ tree
+# except css_property_parser_gen.c, which is the HOST generator above -- never
+# compiled into the kernel. The autogenerated_*.c just produced ARE picked up.
+CSS_SRCS=( $(find $LIBCSS/src -name '*.c' ! -name 'css_property_parser_gen.c') )
+[ "${#CSS_SRCS[@]}" -ge 180 ] || { echo "ERROR: libcss scan truncated (${#CSS_SRCS[@]})"; exit 1; }
+ns_cc $LIBCSS/src "${CSS_SRCS[@]}"
+
+# libdom (W3C DOM core/events/html + the hubbub binding that turns a libhubbub
+# parse into a real DOM tree -- this IS NetSurf's genuine HTML->DOM path). The
+# whole src/ tree compiles cleanly; the binding TU is built separately because it
+# lives outside src/ and pulls its private headers ("parser.h"/"utils.h") as
+# quoted includes relative to bindings/hubbub/.
+DOM_SRCS=( $(find $LIBDOM/src -name '*.c') )
+[ "${#DOM_SRCS[@]}" -ge 80 ] || { echo "ERROR: libdom scan truncated (${#DOM_SRCS[@]})"; exit 1; }
+ns_cc $LIBDOM/src "${DOM_SRCS[@]}"
+ns_cc $LIBDOM/src $LIBDOM/bindings/hubbub/parser.c
+
+# BoltOS-side selection glue (real libcss<->libdom handler) + test/driver. Both
+# need private dirs: libhubbub's src/ (the low-level tokeniser test), and the
+# libdom hubbub binding dir (for "parser.h"). The binding dir exposes parser.h
+# directly, NOT a hubbub/ subdir, so it does not shadow libhubbub's headers.
+ns_cc "" oldbrowser/ns_select.c
+ns_cc "$LIBDOM/bindings/hubbub" oldbrowser/ns_html.c
+ns_cc "netsurf/libhubbub/src $LIBDOM/bindings/hubbub" kernel/cmd_nstest.c
+
 echo "[4/6] link kernel -> flat binary"
-"$LLD" -m elf_x86_64 -T linker.ld --oformat binary -o build/kernel.bin "${KOBJS[@]}"
+# The object set (kernel + DOOM + the full NetSurf stack: libwapcaplet,
+# libparserutils, libhubbub, libcss, libdom = ~600 .o) overflows the Windows
+# command-line length limit, so feed the list to lld via a response file (@file).
+printf '%s\n' "${KOBJS[@]}" > build/kobjs.rsp
+"$LLD" -m elf_x86_64 -T linker.ld --oformat binary -o build/kernel.bin @build/kobjs.rsp
 # Also emit an ELF with symbols (same objects/order) for debugging/addr2line.
-"$LLD" -m elf_x86_64 -T linker.ld -o build/kernel.elf "${KOBJS[@]}" 2>/dev/null || true
+"$LLD" -m elf_x86_64 -T linker.ld -o build/kernel.elf @build/kobjs.rsp 2>/dev/null || true
 
 KSIZE=$(stat -c %s build/kernel.bin)
 KSECT=$(( (KSIZE + 511) / 512 ))

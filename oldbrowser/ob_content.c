@@ -14,6 +14,7 @@
  *  mirroring NetSurf's html_redraw / textplain_redraw / image_redraw.
  * ===========================================================================*/
 #include "oldbrowser.h"
+#include "ns_html.h"     /* REAL libdom + libcss render path */
 #include "string.h"
 #include "kheap.h"
 #include "gui.h"
@@ -143,9 +144,16 @@ content *content_create(nsurl *url, const char *data, uint32_t len, int status) 
                if (url) nsurl_get_component(url, NSURL_HOST, c->title, sizeof(c->title)); }
     }
     if (c->type == CONTENT_HTML) {
-        c->dom = dom_parse(c->source, c->source_len);
-        if (!c->dom) { c->type = CONTENT_TEXTPLAIN; }
-        else { css_gather(c); extract_title(c); }
+        /* Real NetSurf core: libdom DOM + libcss cascade/selection + layout.
+         * Built at a provisional width here to recover the <title>; reformat
+         * rebuilds at the true viewport width. */
+        const char *base = c->url ? nsurl_access(c->url) : 0;
+        c->nspage = ns_html_build(c->source, c->source_len, base, 1000,
+                                  c->title, sizeof c->title);
+        c->laid_w = 1000;
+        if (!c->nspage) c->type = CONTENT_TEXTPLAIN;
+        else if (!c->title[0] && c->url)
+            nsurl_get_component(c->url, NSURL_HOST, c->title, sizeof c->title);
     }
     if (c->type == CONTENT_TEXTPLAIN) {
         if (url) nsurl_get_component(url, NSURL_HOST, c->title, sizeof(c->title));
@@ -203,15 +211,14 @@ void content_reformat(content *c, int width) {
     if (!c) return;
     if (width < 80) width = 80;
     if (c->type == CONTENT_HTML) {
-        if (c->box && c->laid_w == width) return;
-        if (c->box) { layout_free(c->box); c->box = 0; }
-        c->box = layout_build(c->dom, c->css, c->css_len, width);
+        if (c->nspage && c->laid_w == width) return;
+        if (c->nspage) { ns_page_free(c->nspage); c->nspage = 0; }
+        const char *base = c->url ? nsurl_access(c->url) : 0;
+        c->nspage = ns_html_build(c->source, c->source_len, base, width,
+                                  c->title, sizeof c->title);
         c->laid_w = width;
-        if (c->box) {
-            imgc_reset(c); g_imgc_owner = c; g_nimgc = 0;
-            assign_images(c, c->box->root);
-            c->width = width; c->height = c->box->doc_h + 8;
-        }
+        c->width = width;
+        c->height = c->nspage ? ns_page_height(c->nspage) + 8 : 0;
     } else if (c->type == CONTENT_TEXTPLAIN) {
         c->width = width;
         c->height = text_height(c, width);
@@ -321,8 +328,8 @@ static int text_height(content *c, int width) {
 void content_redraw(content *c, browser_window *bw, int ox, int oy, int cl, int cr, int clipT, int clipB) {
     (void)bw;
     if (!c) return;
-    if (c->type == CONTENT_HTML && c->box) {
-        paint_box(c, c->box->root, ox, oy, cl, cr, clipT, clipB);
+    if (c->type == CONTENT_HTML && c->nspage) {
+        ns_page_paint(c->nspage, ox, oy, cl, cr, clipT, clipB);
     } else if (c->type == CONTENT_TEXTPLAIN) {
         text_render(c, ox, oy, cl + 4, cr - 4, clipT, clipB, 1);
     } else if (c->type == CONTENT_IMAGE && c->img) {
@@ -346,10 +353,8 @@ static layout_box *box_at(layout_box *b, int x, int y) {
     return hit;
 }
 const char *content_href_at(content *c, int cx, int cy) {
-    if (!c || c->type != CONTENT_HTML || !c->box) return 0;
-    layout_box *b = box_at(c->box->root, cx, cy);
-    if (!b) return 0;
-    return box_link(b);
+    if (!c || c->type != CONTENT_HTML || !c->nspage) return 0;
+    return ns_page_href_at(c->nspage, cx, cy);
 }
 
 const char *content_get_title(content *c) { return c ? c->title : ""; }
@@ -358,6 +363,7 @@ int content_get_height(content *c) { return c ? c->height : 0; }
 void content_destroy(content *c) {
     if (!c) return;
     imgc_reset(c);
+    if (c->nspage) ns_page_free(c->nspage);
     if (c->box) layout_free(c->box);
     if (c->dom) dom_free(c->dom);
     if (c->css) kfree(c->css);

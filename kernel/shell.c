@@ -204,6 +204,8 @@ const command_t commands[] = {
     { "clear",    "Core",             "clear the screen",                   cmd_clear },
     { "python",   "Core",             "BoltPython REPL / run a .py file",    cmd_python },
     { "js",       "Core",             "run JavaScript (BoltJS engine)",     cmd_js },
+    { "libctest", "Core",             "self-test the freestanding C library", cmd_libctest },
+    { "nstest",   "Core",             "self-test the ported NetSurf libraries", cmd_nstest },
 };
 const int commands_count = (int)(sizeof(commands) / sizeof(commands[0]));
 

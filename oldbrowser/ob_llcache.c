@@ -43,14 +43,16 @@ static const char *about_page(const char *which) {
     if (strcmp(which, "credits") == 0)
         return "<html><head><title>About OldBrowser</title></head><body>"
                "<h1>OldBrowser</h1>"
-               "<p>A <b>NetSurf</b> port for BoltOS - a small, fast browser "
-               "built on the NetSurf core architecture (content cache, handler "
-               "pipeline and browser_window state machine), driving BoltOS's own "
-               "DOM tree, CSS cascade and box-model layout engine over the "
-               "kernel's TCP/TLS network stack.</p>"
+               "<p>A <b>NetSurf</b> port for BoltOS. Pages are parsed by the real "
+               "upstream <b>libhubbub</b> + <b>libdom</b> (HTML5 -> DOM) and styled "
+               "by the real <b>libcss</b> (cascade + selection), all compiled into "
+               "the kernel against BoltOS's own libc, over the kernel's TCP/TLS "
+               "network stack.</p>"
                "<h3>Credits</h3>"
-               "<p>NetSurf is (c) The NetSurf Developers, GPLv2. This port "
-               "reimplements its architecture for BoltOS.</p></body></html>";
+               "<p>NetSurf and its libraries are (c) The NetSurf Developers. "
+               "libwapcaplet, libparserutils, libhubbub, libcss and libdom are "
+               "vendored and built unmodified (bar tiny freestanding shims).</p>"
+               "</body></html>";
     /* welcome / home */
     return "<html><head><title>OldBrowser</title></head><body>"
            "<h1>OldBrowser</h1>"
@@ -64,9 +66,10 @@ static const char *about_page(const char *which) {
            "<li><a href=\"http://info.cern.ch/\">info.cern.ch - the first website</a></li>"
            "<li><a href=\"about:credits\">about:credits</a></li>"
            "</ul>"
-           "<p>OldBrowser renders with the same box / flex / grid layout engine "
-           "that powers the BoltOS layout core, so real CSS pages lay out with "
-           "margins, widths and inline flow.</p>"
+           "<p>OldBrowser renders with the genuine NetSurf core: libhubbub + "
+           "libdom build a real DOM, libcss runs the real cascade and selector "
+           "engine, and the computed styles drive block and inline layout - so "
+           "real CSS pages lay out with margins, headings, links and wrapping.</p>"
            "</body></html>";
 }
 
