@@ -6,15 +6,25 @@
 /* The VESA linear framebuffer the bootloader selected. It lives below 4 GiB
  * and is already identity-mapped, so we write straight to it. 32 bpp / xRGB. */
 static volatile uint32_t *fb;
+static uint64_t fb_pa;                  /* physical base of the LFB */
 static uint32_t fw, fh, pitch_px;
+
+/* Set while a ring-3 program (the userland browser) owns the screen: the GUI
+ * compositor checks it and stops touching VRAM so the two never fight over the
+ * panel. Cleared by SYS_FBEND or when that process exits. */
+volatile int g_fb_exclusive;
 
 void fb_init(struct bootinfo *bi) {
     if (!bi->fb_addr || !bi->fb_width || bi->fb_bpp != 32) { fb = 0; return; }
-    fb       = (volatile uint32_t *)P2V((uint64_t)bi->fb_addr);
+    fb_pa    = (uint64_t)bi->fb_addr;
+    fb       = (volatile uint32_t *)P2V(fb_pa);
     fw       = bi->fb_width;
     fh       = bi->fb_height;
     pitch_px = bi->fb_pitch ? bi->fb_pitch / 4 : bi->fb_width;
 }
+
+uint64_t fb_phys(void)     { return fb_pa; }
+uint32_t fb_pitch_px(void) { return pitch_px; }
 
 /* ---- Bochs/QEMU DISPI runtime mode switch ------------------------------- *
  * QEMU's default "std" (Bochs) VGA exposes the DISPI register interface on I/O

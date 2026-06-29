@@ -18,5 +18,12 @@ void audio_tone(uint32_t freq, uint32_t ms);
 /* Play raw 16-bit signed stereo PCM at 48 kHz (frames = L/R pairs). Blocking. */
 void audio_play_pcm(const int16_t *interleaved, uint32_t frames);
 
+/* Non-blocking streaming: start a buffer and return; poll audio_busy() and push
+ * the next chunk once it drains. audio_pcm_ok() = real PCM device available. */
+void audio_play_async(const int16_t *interleaved, uint32_t frames);
+int  audio_busy(void);
+void audio_stop(void);
+int  audio_pcm_ok(void);
+
 void audio_set_volume(int percent);       /* 0..100 master volume */
 int  audio_volume(void);

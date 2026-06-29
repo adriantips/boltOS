@@ -31,7 +31,8 @@
 #define MAXCRUMB   FS_MAX_DEPTH
 
 /* toolbar / view actions */
-enum { A_BACK = 1, A_FWD, A_UP, A_NEW, A_REN, A_DEL, A_VIEWCLOSE, A_COPY, A_CUT, A_PASTE, A_OPEN };
+enum { A_BACK = 1, A_FWD, A_UP, A_NEW, A_REN, A_DEL, A_VIEWCLOSE, A_COPY, A_CUT, A_PASTE, A_OPEN,
+       A_NEWTXT, A_NEWCSV };
 
 typedef struct { int x, y, w, h; fs_node *node; } irect;   /* grid item / breadcrumb */
 typedef struct { int x, y, w, h; int action; } brect;      /* toolbar button         */
@@ -82,8 +83,15 @@ static const struct { const char *path, *label; int icon, section; } NAV[] = {
 
 /* ---- small helpers ------------------------------------------------------ */
 static int  is_printable(uint8_t c) { return (c >= 32 && c < 127) || c == '\n' || c == '\t'; }
+static int  name_ends(const char *name, const char *suf);
 static int  icon_for(fs_node *n) {
     if (n->is_dir) return strcmp(n->name, ".trash") == 0 ? ICON_TRASH : ICON_FOLDER;
+    if (name_ends(n->name, ".png") || name_ends(n->name, ".jpg") || name_ends(n->name, ".jpeg") ||
+        name_ends(n->name, ".gif") || name_ends(n->name, ".bmp") || name_ends(n->name, ".tga"))
+        return ICON_IMAGE;
+    if (name_ends(n->name, ".csv")) return ICON_SHEETS;
+    if (name_ends(n->name, ".txt") || name_ends(n->name, ".md") || name_ends(n->name, ".log"))
+        return ICON_NOTES;
     return ICON_FILE;
 }
 static fs_node *trash_dir(void) {
@@ -122,10 +130,36 @@ static void go_fwd(files_t *st) {
 }
 static void go_up(files_t *st) { if (st->dir && st->dir->parent) go(st, st->dir->parent, 1); }
 
+/* case-insensitive "does name end with suffix" (suffix lower-case) */
+static int name_ends(const char *name, const char *suf) {
+    int ln = (int)strlen(name), ls = (int)strlen(suf);
+    if (ls > ln) return 0;
+    const char *p = name + ln - ls;
+    for (int i = 0; i < ls; i++) {
+        char c = p[i]; if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != suf[i]) return 0;
+    }
+    return 1;
+}
+
 static void open_item(files_t *st, fs_node *n) {
     if (!n) return;
-    if (n->is_dir) go(st, n, 1);
-    else { st->view = n; st->view_scroll = 0; }
+    if (n->is_dir) { go(st, n, 1); return; }
+    /* file associations: hand known document types to their editor app */
+    if (name_ends(n->name, ".csv")) {
+        char p[FS_PATH_MAX]; fs_abspath(n, p, sizeof(p)); sheets_open_path(p); return;
+    }
+    if (name_ends(n->name, ".png") || name_ends(n->name, ".jpg") ||
+        name_ends(n->name, ".jpeg") || name_ends(n->name, ".gif") ||
+        name_ends(n->name, ".bmp") || name_ends(n->name, ".tga")) {
+        char p[FS_PATH_MAX]; fs_abspath(n, p, sizeof(p)); imgview_open_path(p); return;
+    }
+    if (name_ends(n->name, ".txt") || name_ends(n->name, ".md") ||
+        name_ends(n->name, ".log") || name_ends(n->name, ".ini") ||
+        name_ends(n->name, ".cfg") || name_ends(n->name, ".sh")) {
+        char p[FS_PATH_MAX]; fs_abspath(n, p, sizeof(p)); notes_open_path(p); return;
+    }
+    st->view = n; st->view_scroll = 0;            /* everything else: built-in viewer */
 }
 
 /* ---- create / rename / delete ------------------------------------------- */
@@ -154,6 +188,24 @@ static void new_folder(files_t *st) {
     }
     fs_node *n = make_in(st->dir, name, 1);
     if (n) { st->sel = n; begin_rename(st, n); }
+}
+
+/* Create a new document with a unique "<base> [(k)]<ext>" name in the current
+ * folder, then open it via the file association (so .csv lands in Sheets, a
+ * text file in Notepad). */
+static void new_file(files_t *st, const char *base, const char *ext) {
+    if (!st->dir) return;
+    char name[FS_NAME_MAX];
+    name[0] = 0; kstrlcat(name, base, sizeof(name)); kstrlcat(name, ext, sizeof(name));
+    int k = 1;
+    while (fs_child(st->dir, name)) {
+        char num[8]; sh_utoa((uint64_t)++k, num);
+        name[0] = 0; kstrlcat(name, base, sizeof(name));
+        kstrlcat(name, " (", sizeof(name)); kstrlcat(name, num, sizeof(name)); kstrlcat(name, ")", sizeof(name));
+        kstrlcat(name, ext, sizeof(name));
+    }
+    fs_node *n = make_in(st->dir, name, 0);
+    if (n) { st->sel = n; open_item(st, n); }
 }
 
 static void delete_sel(files_t *st) {
@@ -233,6 +285,8 @@ static int build_menu(files_t *st, mrow *out, int max) {
         if (n < max) out[n++] = (mrow){ "Delete", A_DEL  };
     } else {
         if (n < max) out[n++] = (mrow){ "New folder", A_NEW };
+        if (n < max) out[n++] = (mrow){ "New text",   A_NEWTXT };
+        if (n < max) out[n++] = (mrow){ "New sheet",  A_NEWCSV };
     }
     if (fclip && n < max) out[n++] = (mrow){ "Paste", A_PASTE };
     return n;
@@ -626,6 +680,8 @@ static void do_action(files_t *st, int action) {
     case A_FWD:  go_fwd(st);  break;
     case A_UP:   go_up(st);   break;
     case A_NEW:  new_folder(st); break;
+    case A_NEWTXT: new_file(st, "New document", ".txt"); break;
+    case A_NEWCSV: new_file(st, "New sheet", ".csv");    break;
     case A_REN:  begin_rename(st, st->sel); break;
     case A_DEL:  delete_sel(st); break;
     case A_COPY: copy_sel(st); break;
@@ -707,6 +763,35 @@ static void seed_file(const char *p, const char *text) {
     fs_node *f = fs_create(p, 0);
     if (f) fs_write(f, text, (uint32_t)strlen(text));
 }
+/* Generate a small 24-bit BMP gradient so the Pictures folder has real content
+ * for the Photos viewer. BMP is bottom-up BGR with rows padded to 4 bytes. */
+static void seed_sample_bmp(const char *path) {
+    if (fs_lookup(path)) return;
+    enum { IW = 192, IH = 128, ROW = IW * 3, PAD = (4 - (ROW & 3)) & 3, STRIDE = ROW + PAD };
+    static uint8_t bmp[54 + STRIDE * IH];
+    uint32_t fsz = sizeof(bmp);
+    memset(bmp, 0, sizeof(bmp));
+    bmp[0] = 'B'; bmp[1] = 'M';
+    bmp[2] = (uint8_t)fsz; bmp[3] = (uint8_t)(fsz >> 8); bmp[4] = (uint8_t)(fsz >> 16); bmp[5] = (uint8_t)(fsz >> 24);
+    bmp[10] = 54;                                   /* pixel data offset */
+    bmp[14] = 40;                                   /* DIB header size   */
+    bmp[18] = (uint8_t)IW; bmp[19] = (uint8_t)(IW >> 8);
+    bmp[22] = (uint8_t)IH; bmp[23] = (uint8_t)(IH >> 8);
+    bmp[26] = 1;                                    /* planes */
+    bmp[28] = 24;                                   /* bpp    */
+    for (int y = 0; y < IH; y++) {
+        uint8_t *row = bmp + 54 + (IH - 1 - y) * STRIDE;   /* bottom-up */
+        for (int x = 0; x < IW; x++) {
+            uint8_t r = (uint8_t)(x * 255 / (IW - 1));
+            uint8_t g = (uint8_t)(y * 255 / (IH - 1));
+            uint8_t b = (uint8_t)(255 - x * 255 / (IW - 1));
+            row[x * 3 + 0] = b; row[x * 3 + 1] = g; row[x * 3 + 2] = r;
+        }
+    }
+    fs_node *f = fs_create(path, 0);
+    if (f) fs_write(f, bmp, sizeof(bmp));
+}
+
 static void files_seed(void) {
     seed_dir("/home/Desktop");
     seed_dir("/home/Documents");
@@ -728,7 +813,8 @@ static void files_seed(void) {
     seed_file("/home/Downloads/boltos-guide.txt",
               "BoltOS quick guide\n\nType 'help' in the Terminal for the full command list.\n");
     seed_file("/home/Pictures/readme.txt",
-              "Image viewing is not wired up yet - this folder is a placeholder.\n");
+              "Double-click an image (PNG/JPG/GIF/BMP) to open it in Photos.\n");
+    seed_sample_bmp("/home/Pictures/welcome.bmp");
     trash_dir();
 }
 

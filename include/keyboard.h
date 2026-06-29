@@ -12,6 +12,11 @@
 #define KEY_PGUP  0x10
 #define KEY_PGDN  0x0E
 #define KEY_DEL   0x7F
+#define KEY_SHOT  0x17   /* F12: capture a screenshot (handled globally by GUI) */
+#define KEY_ALTTAB  0x0B /* Alt+Tab: cycle to next window (handled by GUI)      */
+#define KEY_ALTTABR 0x0C /* Shift+Alt+Tab: cycle to previous window             */
+#define KEY_ALTF4   0x04 /* Alt+F4: close the focused window (handled by GUI)   */
+#define KEY_WINTAP  0x07 /* Super/Win tapped alone: toggle Start menu (GUI)     */
 
 /* Clipboard / editing shortcuts. Emitted by the driver when Ctrl is held with
  * the matching letter. The values are the classic ASCII control codes and were
@@ -34,6 +39,7 @@
 void keyboard_init(void);
 int  kbd_ctrl_down(void);  /* 1 while either Ctrl key is held */
 int  kbd_shift_down(void); /* 1 while either Shift key is held */
+int  kbd_win_down(void);   /* 1 while either Super/Win key is held */
 void kbd_inject(char c);   /* push a decoded char into the ring (USB HID path) */
 int  kbd_trygetc(void);   /* next char, or -1 if the buffer is empty (non-blocking) */
 char kbd_getc(void);      /* block (hlt) until a key is available, then return it */

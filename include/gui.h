@@ -89,7 +89,7 @@ struct window {
 };
 
 enum { ICON_NONE = 0, ICON_TERMINAL, ICON_TASKMGR, ICON_START, ICON_FILES, ICON_SETTINGS,
-       ICON_BROWSER, ICON_FOLDER, ICON_FILE, ICON_TRASH, ICON_CALC, ICON_CLOCK, ICON_NOTES, ICON_CALENDAR, ICON_PIANO, ICON_PAINT, ICON_MINES, ICON_SNAKE, ICON_2048, ICON_STOPWATCH, ICON_SYSINFO, ICON_LIFE, ICON_TTT, ICON_COLOR, ICON_MEMORY, ICON_MATRIX, ICON_CODE, ICON_DOOM, ICON_OLDBROWSER };
+       ICON_BROWSER, ICON_FOLDER, ICON_FILE, ICON_TRASH, ICON_CALC, ICON_CLOCK, ICON_NOTES, ICON_CALENDAR, ICON_PIANO, ICON_PAINT, ICON_MINES, ICON_SNAKE, ICON_2048, ICON_STOPWATCH, ICON_SYSINFO, ICON_LIFE, ICON_TTT, ICON_COLOR, ICON_MEMORY, ICON_MATRIX, ICON_CODE, ICON_DOOM, ICON_OLDBROWSER, ICON_SHEETS, ICON_IMAGE, ICON_MUSIC, ICON_TASKS, ICON_CONTACTS };
 
 window_t *gui_add_window(const char *title, int w, int h, uint32_t accent, int icon);
 void      gui_open(window_t *win);          /* show + focus + raise           */
@@ -130,6 +130,19 @@ void ide_app_init(void);
 void calc_app_init(void);
 void clock_app_init(void);
 void notes_app_init(void);
+void tasks_app_init(void);
+void contacts_app_init(void);
+void notes_open_path(const char *path);   /* load `path` into Notepad + show it */
+void sheets_app_init(void);
+void sheets_open_path(const char *path);  /* load `path` into Sheets + show it  */
+void imgview_app_init(void);
+void imgview_open_path(const char *path); /* decode + show an image in Photos    */
+void music_app_init(void);
+void gui_set_wallpaper_image(const char *path); /* use an image as the wallpaper  */
+void gui_clear_wallpaper_image(void);           /* revert to the procedural style */
+void gui_toast(const char *msg);                /* transient bottom-right notice  */
+/* Modal text prompt; `cb` gets the entered string on OK/Enter (not on Cancel). */
+void gui_prompt(const char *title, const char *initial, void (*cb)(const char *));
 void calendar_app_init(void);
 void piano_app_init(void);
 void paint_app_init(void);

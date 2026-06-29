@@ -74,3 +74,9 @@ volatile void *pci_map_bar(struct pci_bar *bar);
 /* Command register helpers. */
 void pci_enable_bus_master(const struct pci_dev *d); /* set BM + MEM + IO bits */
 uint8_t pci_interrupt_line(const struct pci_dev *d); /* legacy IRQ from cfg 0x3C */
+
+/* Enable MSI/MSI-X on the device, delivering to the given IDT vector on the
+ * boot CPU. Prefers MSI-X (programs vector-table entry 0), falls back to MSI.
+ * Returns 0 on success, -1 if the device exposes neither capability. Pair with
+ * msi_install(vector, handler) to register the IRQ callback. */
+int pci_msi_enable(const struct pci_dev *d, uint8_t vector);

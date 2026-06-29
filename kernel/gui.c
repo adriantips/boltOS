@@ -12,6 +12,7 @@
 #include "framebuffer.h"
 #include "console.h"
 #include "keyboard.h"
+#include "kprintf.h"
 #include "mouse.h"
 #include "kheap.h"
 #include "pmm.h"
@@ -22,7 +23,11 @@
 #include "shell.h"
 #include "string.h"
 #include "fs.h"
+#include "image.h"
 #include "users.h"
+#include "audio.h"
+#include "netif.h"
+#include "net.h"
 
 extern const unsigned char font8x8_basic[128][8];   /* 8x8 retro face   */
 extern const unsigned char font_8x16[95][16];        /* 8x16 Arial face  */
@@ -54,6 +59,19 @@ static inline uint64_t rdtsc(void) {
 /* ---- backbuffer + clip -------------------------------------------------- */
 static uint32_t *BB;            /* compositor backbuffer (alloc PW*PH, use W*H) */
 static uint32_t *BG;            /* prerendered desktop wallpaper (W*H) or 0 */
+static image_t  *wall_img;      /* user-chosen image wallpaper, or 0 (procedural) */
+static char      wall_img_path[FS_PATH_MAX];
+static int       dirty = 1;     /* a frame needs recompositing                  */
+static char      toast_msg[72];          /* transient bottom-right notification  */
+static uint64_t  toast_until;            /* pit tick the toast disappears at      */
+
+/* Modal text prompt (Save As, rename, ...). One at a time; apps call gui_prompt
+ * with a callback that receives the entered string when the user confirms. */
+static int        prompt_active;
+static char       prompt_title[40];
+static char       prompt_buf[FS_PATH_MAX];
+static int        prompt_len;
+static void     (*prompt_cb)(const char *);
 static int       PW, PH;        /* physical panel size (fixed by the bootloader) */
 static int       W, H;          /* logical desktop size (the resolution setting)  */
 static int       out_x, out_y, out_w, out_h;   /* where the logical desktop lands  */
@@ -275,6 +293,15 @@ static uint32_t add_clamp(uint32_t c, int dr, int dg, int db) {
 /* Render the desktop background per the current wallpaper style + base colour.
  * dst is a packed W*H image (the BG buffer or, as a fallback, BB). */
 static void render_wallpaper(uint32_t *dst) {
+    if (wall_img && wall_img->px && wall_img->w > 0 && wall_img->h > 0) {
+        int iw = wall_img->w, ih = wall_img->h;        /* stretch image to fill */
+        for (int y = 0; y < H; y++) {
+            const uint32_t *srow = &wall_img->px[(y * ih / H) * iw];
+            for (int x = 0; x < W; x++) dst[x] = srow[x * iw / W] & 0x00FFFFFF;
+            dst += W;
+        }
+        return;
+    }
     uint32_t base   = g_settings.wall_color;
     uint32_t bottom = add_clamp(base, 16, 26, 46);     /* gradient foot   */
     uint32_t glow   = add_clamp(base, 34, 52, 92);     /* radial highlight*/
@@ -302,6 +329,43 @@ static void render_wallpaper(uint32_t *dst) {
     }
 }
 
+#define WALL_PREF "/home/.wallpaper"   /* remembers the image path across reboots */
+
+/* Use the image at `path` as the desktop wallpaper (decoded once, then stretched
+ * to fill). Persists the choice so it survives a reboot. */
+void gui_set_wallpaper_image(const char *path) {
+    if (wall_img) { image_free(wall_img); wall_img = 0; }
+    wall_img_path[0] = 0;
+    if (path && path[0]) {
+        fs_node *n = fs_lookup(path);
+        if (n && !n->is_dir && n->data && n->size) {
+            wall_img = image_decode(n->data, n->size);
+            if (wall_img) {
+                strncpy(wall_img_path, path, sizeof(wall_img_path) - 1);
+                wall_img_path[sizeof(wall_img_path) - 1] = 0;
+            }
+        }
+    }
+    fs_node *w = fs_lookup(WALL_PREF);
+    if (!w) w = fs_create(WALL_PREF, 0);
+    if (w) fs_write(w, wall_img_path, (uint32_t)strlen(wall_img_path));
+    if (BG) render_wallpaper(BG);
+    if (wall_img_path[0]) gui_toast("Wallpaper updated");
+    dirty = 1;
+}
+
+void gui_clear_wallpaper_image(void) { gui_set_wallpaper_image(0); }
+
+/* On boot, restore a previously chosen image wallpaper (if any). */
+static void wallpaper_restore(void) {
+    fs_node *n = fs_lookup(WALL_PREF);
+    if (!n || n->is_dir || !n->data || !n->size) return;
+    char path[FS_PATH_MAX];
+    uint32_t len = n->size; if (len > sizeof(path) - 1) len = sizeof(path) - 1;
+    memcpy(path, n->data, len); path[len] = 0;
+    if (path[0]) gui_set_wallpaper_image(path);
+}
+
 /* ===========================================================================
  *  Window registry + stacking
  * ===========================================================================*/
@@ -316,14 +380,18 @@ static int      rs_x0, rs_y0, rs_w0, rs_h0, rs_mx, rs_my;  /* rect + mouse at re
 static int      client_drag_id = -1;            /* window receiving held-button drag */
 static uint8_t  prev_btns;
 static int      menu_open;
+static int      vol_open;                        /* tray volume popup visible */
+static int      net_open;                        /* tray network popup visible */
+static int      clock_open;                       /* tray calendar flyout visible */
 static int      cpu_load;
-static int      dirty = 1;
 
-/* right-click taskbar context menu: targets one window */
-static int      ctx_open, ctx_win, ctx_x, ctx_y;
+/* right-click context menu. ctx_mode 0 = taskbar/window (targets ctx_win,
+ * pops upward); 1 = desktop (app shortcuts, pops downward from the cursor). */
+static int      ctx_open, ctx_win, ctx_x, ctx_y, ctx_mode;
 #define CTX_W   168
 #define CTX_ITEM 30
-#define CTX_N    2
+#define CTX_N    2          /* window menu: Close + Pin */
+#define CTX_DESK_N 3        /* desktop menu: 3 shortcuts */
 
 int  gui_screen_w(void) { return W; }
 int  gui_screen_h(void) { return H; }
@@ -371,6 +439,40 @@ void gui_focus(window_t *win) {
 void gui_open(window_t *win) {
     win->open = 1; win->minimized = 0;
     gui_focus(win);
+}
+
+/* Alt+Tab: cycle focus through open, non-minimised windows in a stable index
+ * order starting from the current focus (dir > 0 forward, < 0 backward). */
+static void gui_cycle_window(int dir) {
+    int list[MAX_WIN], n = 0, cur = -1;
+    for (int i = 0; i < nwin; i++)
+        if (wins[i].open && !wins[i].minimized) { if (i == focus_id) cur = n; list[n++] = i; }
+    if (n == 0) return;
+    int start = cur < 0 ? 0 : cur;
+    int nx = (start + (dir > 0 ? 1 : n - 1)) % n;
+    gui_focus(&wins[list[nx]]);
+}
+
+/* Win+D: minimise every open window; press again to restore the ones we hid. */
+static void gui_show_desktop(void) {
+    static uint8_t hidden[MAX_WIN];
+    int any_visible = 0;
+    for (int i = 0; i < nwin; i++) if (wins[i].open && !wins[i].minimized) { any_visible = 1; break; }
+    if (any_visible) {
+        for (int i = 0; i < nwin; i++) {
+            hidden[i] = (wins[i].open && !wins[i].minimized) ? 1 : 0;
+            if (hidden[i]) wins[i].minimized = 1;
+        }
+    } else {                                   /* restore what we hid */
+        for (int i = 0; i < nwin; i++) if (hidden[i] && wins[i].open) { wins[i].minimized = 0; hidden[i] = 0; }
+    }
+    dirty = 1;
+}
+
+/* Open (and focus) the first window whose title matches, if any. */
+static void gui_open_by_title(const char *title) {
+    for (int i = 0; i < nwin; i++)
+        if (!strcmp(wins[i].title, title)) { gui_open(&wins[i]); return; }
 }
 
 /* topmost open, non-minimised window index, or -1 */
@@ -606,6 +708,35 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         g_fill(x + 14 * s, y + 8 * s, 2 * s, 2 * s, 0xF3C766); /* pencil tip  */
         break;
     }
+    case ICON_MUSIC: {                          /* eighth note */
+        uint32_t note = 0xE85AB0;
+        g_fill(x + 5 * s, y + 2 * s, 2 * s, 9 * s, note);            /* stem      */
+        g_fill(x + 5 * s, y + 2 * s, 7 * s, 2 * s, note);            /* flag      */
+        g_fill(x + 11 * s, y + 2 * s, 2 * s, 4 * s, note);
+        g_round(x + s, y + 9 * s, 6 * s, 5 * s, 2 * s, note, 255);   /* note head */
+        break;
+    }
+    case ICON_IMAGE: {                          /* photo: sky, sun, mountain    */
+        uint32_t frame = 0xF5F7FC, sky = 0x5AB0FF, hill = 0x33C481, sun = 0xFFD54A;
+        g_round(x, y + s, 16 * s, 13 * s, 2 * s, frame, 255);
+        g_fill(x + 2 * s, y + 3 * s, 12 * s, 9 * s, sky);
+        g_round(x + 9 * s, y + 4 * s, 3 * s, 3 * s, s, sun, 255);          /* sun  */
+        for (int i = 0; i < 6; i++)                                        /* hill */
+            g_fill(x + (2 + i) * s, y + (9 - (i < 3 ? i : 5 - i)) * s, s, (4 + (i < 3 ? i : 5 - i)) * s, hill);
+        for (int i = 0; i < 6; i++)
+            g_fill(x + (8 + i) * s, y + (8 - (i < 3 ? i : 5 - i)) * s, s, (5 + (i < 3 ? i : 5 - i)) * s, hill);
+        break;
+    }
+    case ICON_SHEETS: {                         /* spreadsheet: green grid page */
+        uint32_t pg = 0xF5F7FC, grid = 0x33C481;
+        g_round(x + s, y, 14 * s, 16 * s, 2 * s, pg, 255);
+        g_fill(x + s, y, 14 * s, 4 * s, grid);                /* header band   */
+        for (int gx2 = 1; gx2 < 4; gx2++)
+            g_fill(x + (s) + gx2 * 4 * s, y + 4 * s, s, 12 * s, grid);   /* cols */
+        for (int gy2 = 1; gy2 < 4; gy2++)
+            g_fill(x + s, y + 4 * s + gy2 * 3 * s, 14 * s, s, grid);     /* rows */
+        break;
+    }
     case ICON_CLOCK: {                          /* analog clock */
         int cxx = x + 8 * s, cyy = y + 7 * s, rr = 6 * s;
         g_round(cxx - rr, cyy - rr, 2 * rr, 2 * rr, rr, c, 255);
@@ -613,6 +744,22 @@ static void draw_icon(int id, int x, int y, int s, uint32_t c) {
         g_round(cxx - rr + s, cyy - rr + s, 2 * (rr - s), 2 * (rr - s), rr - s, in, 255);
         g_fill(cxx - s / 2, cyy - 4 * s, s, 4 * s, c);          /* hour hand  */
         g_fill(cxx, cyy - s / 2, 4 * s, s, c);                  /* minute hand*/
+        break;
+    }
+    case ICON_CONTACTS: {                       /* person: head + shoulders */
+        uint32_t pc = 0xF5F7FC;
+        g_round(x + 5 * s, y + s, 6 * s, 6 * s, 3 * s, pc, 255);          /* head */
+        g_round(x + 2 * s, y + 8 * s, 12 * s, 7 * s, 3 * s, c, 255);      /* body */
+        break;
+    }
+    case ICON_TASKS: {                          /* checklist: page with ticks */
+        uint32_t pg = 0xF5F7FC, bx2 = 0x33C481;
+        g_round(x + s, y, 14 * s, 16 * s, 2 * s, pg, 255);
+        for (int i = 0; i < 3; i++) {
+            int ry = y + (3 + i * 4) * s;
+            g_round(x + 3 * s, ry, 3 * s, 3 * s, s, bx2, 255);   /* check box */
+            g_fill(x + 7 * s, ry + s, 6 * s, s, 0x9AA7C2);       /* task line */
+        }
         break;
     }
     default:
@@ -711,6 +858,167 @@ static void draw_clock(void) {
     g_text(W - g_text_width(md, 1) - 18, H - TASKBAR_H + 27, md, COL_TEXT_DIM, 1);
 }
 
+/* ---- tray volume control ------------------------------------------------ */
+static void tray_vol_rect(int *bx, int *by) {
+    *bx = W - 96;                                /* just left of the clock */
+    *by = H - TASKBAR_H + (TASKBAR_H - 28) / 2;
+}
+static void vol_popup_rect(int *x, int *y, int *w, int *h) {
+    *w = 188; *h = 56;
+    int bx, by; tray_vol_rect(&bx, &by);
+    *x = bx + 14 - *w / 2;
+    if (*x + *w > W - 6) *x = W - 6 - *w;
+    if (*x < 6) *x = 6;
+    *y = H - TASKBAR_H - *h - 8;
+}
+/* speaker glyph + sound waves scaled by the current volume */
+static void draw_speaker(int x, int y, int vol, uint32_t col) {
+    g_fill(x, y + 5, 4, 6, col);                 /* speaker box */
+    for (int i = 0; i < 5; i++)                  /* cone */
+        g_fill(x + 4 + i, y + 5 - i, 1, 6 + 2 * i, col);
+    if (vol > 0)  g_fill(x + 11, y + 6, 2, 4, col);          /* wave 1 */
+    if (vol > 40) g_fill(x + 14, y + 4, 2, 8, col);          /* wave 2 */
+    if (vol > 75) g_fill(x + 17, y + 2, 2, 12, col);         /* wave 3 */
+    if (vol == 0) { g_fill(x + 12, y + 4, 8, 2, 0xFF6B6B); } /* mute slash hint */
+}
+static void draw_volume_tray(void) {
+    int bx, by; tray_vol_rect(&bx, &by);
+    int mxp = mlx(), myp = mly();
+    int hot = mxp >= bx && mxp < bx + 28 && myp >= by && myp < by + 28;
+    if (vol_open || hot) g_round(bx, by, 28, 28, 7, 0x2A2A38, 255);
+    draw_speaker(bx + 5, by + 7, audio_volume(), COL_TEXT);
+
+    if (!vol_open) return;
+    int px, py, pw, ph; vol_popup_rect(&px, &py, &pw, &ph);
+    g_round(px - 2, py - 2, pw + 4, ph + 4, 12, 0x000000, 70);
+    g_round(px, py, pw, ph, 10, 0x16161E, 250);
+    int vol = audio_volume();
+    draw_speaker(px + 12, py + ph / 2 - 8, vol, COL_TEXT);
+    /* slider track */
+    int tx = px + 38, tw = pw - 38 - 44, ty = py + ph / 2 - 3;
+    g_round(tx, ty, tw, 6, 3, 0x33333F, 255);
+    g_round(tx, ty, tw * vol / 100, 6, 3, COL_ACCENT, 255);
+    g_round(tx + tw * vol / 100 - 4, ty - 4, 9, 14, 4, COL_TEXT, 255);  /* knob */
+    char pct[5]; int n = 0;                       /* "NN%" */
+    if (vol >= 100) { pct[n++]='1'; pct[n++]='0'; pct[n++]='0'; }
+    else { if (vol >= 10) pct[n++] = '0' + vol / 10; pct[n++] = '0' + vol % 10; }
+    pct[n++] = '%'; pct[n] = 0;
+    g_text(px + pw - 38, py + ph / 2 - 4, pct, COL_TEXT, 1);
+}
+/* click inside the volume popup -> set level from the slider, or toggle mute on
+ * the speaker. Returns 1 if the click was consumed by the popup. */
+static int volume_popup_click(int x, int y) {
+    int px, py, pw, ph; vol_popup_rect(&px, &py, &pw, &ph);
+    if (x < px || x >= px + pw || y < py || y >= py + ph) return 0;
+    if (x < px + 32) { audio_set_volume(audio_volume() > 0 ? 0 : 80); return 1; }  /* mute toggle */
+    int tx = px + 38, tw = pw - 38 - 44;
+    int v = (x - tx) * 100 / (tw > 0 ? tw : 1);
+    if (v < 0) v = 0; if (v > 100) v = 100;
+    audio_set_volume(v);
+    return 1;
+}
+
+/* ---- tray network indicator --------------------------------------------- */
+static int net_is_up(void) {
+    struct netif *n = netif_default();
+    return (n && n->link_up && net_ip != 0);
+}
+static void tray_net_rect(int *bx, int *by) {
+    *bx = W - 132;                               /* left of the volume button */
+    *by = H - TASKBAR_H + (TASKBAR_H - 28) / 2;
+}
+/* wifi-style arcs; bright when connected, dim+slash when not */
+static void draw_net_glyph(int x, int y, int up, uint32_t col) {
+    uint32_t c = up ? col : COL_TEXT_DIM;
+    g_fill(x + 8, y + 13, 3, 3, c);                          /* base dot */
+    g_fill(x + 4, y + 9, 11, 2, c);                          /* arc 1 */
+    g_fill(x + 2, y + 5, 15, 2, c);                          /* arc 2 */
+    if (!up) { g_fill(x + 3, y + 3, 13, 2, 0xFF6B6B); }      /* offline slash */
+}
+static void ipv4_str(uint32_t ip, char *out) {               /* host order -> "a.b.c.d" */
+    int n = 0;
+    for (int s = 24; s >= 0; s -= 8) {
+        int v = (ip >> s) & 0xFF, d = 0; char t[4];
+        if (v == 0) t[d++] = '0'; else { int x = v; char r[4]; int ri = 0; while (x) { r[ri++] = '0' + x % 10; x /= 10; } while (ri) t[d++] = r[--ri]; }
+        for (int i = 0; i < d; i++) out[n++] = t[i];
+        if (s) out[n++] = '.';
+    }
+    out[n] = 0;
+}
+static void draw_net_tray(void) {
+    int bx, by; tray_net_rect(&bx, &by);
+    int mxp = mlx(), myp = mly();
+    int hot = mxp >= bx && mxp < bx + 28 && myp >= by && myp < by + 28;
+    int up = net_is_up();
+    if (net_open || hot) g_round(bx, by, 28, 28, 7, 0x2A2A38, 255);
+    draw_net_glyph(bx + 4, by + 5, up, COL_ACCENT);
+
+    if (!net_open) return;
+    int pw = 200, ph = 56, px = bx + 14 - pw / 2, py = H - TASKBAR_H - ph - 8;
+    if (px + pw > W - 6) px = W - 6 - pw;
+    if (px < 6) px = 6;
+    g_round(px - 2, py - 2, pw + 4, ph + 4, 12, 0x000000, 70);
+    g_round(px, py, pw, ph, 10, 0x16161E, 250);
+    draw_net_glyph(px + 10, py + ph / 2 - 9, up, COL_ACCENT);
+    if (up) {
+        char ip[16]; ipv4_str(net_ip, ip);
+        g_text(px + 40, py + 12, "Connected", COL_GOOD, 1);
+        g_text(px + 40, py + 30, ip, COL_TEXT_DIM, 1);
+    } else {
+        g_text(px + 40, py + ph / 2 - 4, "No network", COL_TEXT_DIM, 1);
+    }
+}
+
+/* ---- clock calendar flyout ---------------------------------------------- */
+static int cal_is_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0); }
+static int cal_days_in(int y, int m) {
+    static const int d[13] = { 0,31,28,31,30,31,30,31,31,30,31,30,31 };
+    return (m == 2 && cal_is_leap(y)) ? 29 : d[m];
+}
+static int cal_weekday(int y, int m, int d) {       /* 0=Sun..6=Sat */
+    if (m < 3) { m += 12; y--; }
+    int K = y % 100, J = y / 100;
+    int h = (d + (13 * (m + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+    return (h + 6) % 7;
+}
+static void clock_rect(int *bx, int *by, int *bw, int *bh) {
+    *bw = 72; *bx = W - *bw; *by = H - TASKBAR_H; *bh = TASKBAR_H;
+}
+static void draw_clock_flyout(void) {
+    if (!clock_open) return;
+    static const char *MON[13] = { "", "January","February","March","April","May","June",
+        "July","August","September","October","November","December" };
+    struct rtc_time t; rtc_now(&t);
+    int yr = t.year ? t.year : 2026, mo = (t.mon >= 1 && t.mon <= 12) ? t.mon : 1, today = t.day;
+    int pw = 210, ph = 196, px = W - pw - 6, py = H - TASKBAR_H - ph - 8;
+    g_round(px - 2, py - 2, pw + 4, ph + 4, 12, 0x000000, 70);
+    g_round(px, py, pw, ph, 10, 0x16161E, 250);
+    /* header: Month Year */
+    char hdr[24]; int n = 0;
+    for (const char *p = MON[mo]; *p; p++) hdr[n++] = *p;
+    hdr[n++] = ' ';
+    int y4 = yr; char yb[6]; int yi = 0; while (y4) { yb[yi++] = '0' + y4 % 10; y4 /= 10; }
+    while (yi) hdr[n++] = yb[--yi];
+    hdr[n] = 0;
+    g_text(px + 14, py + 12, hdr, COL_TEXT, 1);
+    /* weekday header */
+    static const char *WD[7] = { "S","M","T","W","T","F","S" };
+    int cw = (pw - 20) / 7, gx = px + 12, gy = py + 36;
+    for (int i = 0; i < 7; i++)
+        g_text(gx + i * cw + cw / 2 - 3, gy, WD[i], (i == 0 || i == 6) ? COL_ACCENT : COL_TEXT_DIM, 1);
+    /* day grid */
+    int first = cal_weekday(yr, mo, 1), dim = cal_days_in(yr, mo);
+    int row = 0;
+    for (int d = 1; d <= dim; d++) {
+        int slot = first + d - 1; row = slot / 7; int col = slot % 7;
+        int cxp = gx + col * cw, cyp = gy + 16 + row * 22;
+        if (d == today) g_round(cxp + cw / 2 - 11, cyp - 3, 22, 20, 5, COL_ACCENT, 255);
+        char db[3]; int dn = 0; if (d >= 10) db[dn++] = '0' + d / 10; db[dn++] = '0' + d % 10; db[dn] = 0;
+        int dw = g_text_width(db, 1);
+        g_text(cxp + cw / 2 - dw / 2, cyp, db, d == today ? 0xFFFFFF : COL_TEXT, 1);
+    }
+}
+
 static void draw_taskbar(void) {
     g_blend(0, H - TASKBAR_H, W, TASKBAR_H, 0x0E0E16, 224);
     g_hline(0, H - TASKBAR_H, W, 0x33333F);
@@ -741,20 +1049,33 @@ static void draw_taskbar(void) {
             g_round(bx + TB_BTN / 2 - 1, by + TB_BTN - 3, 3, 3, 1, COL_TEXT_DIM, 200);
         }
     }
+    draw_net_tray();
+    draw_volume_tray();
     draw_clock();
+    draw_clock_flyout();
 }
 
-/* ---- taskbar right-click context menu ----------------------------------- */
+/* ---- right-click context menu (window or desktop) ----------------------- */
+static int ctx_count(void) { return ctx_mode == 1 ? CTX_DESK_N : CTX_N; }
 static const char *ctx_label(int item) {
+    if (ctx_mode == 1) {                        /* desktop shortcuts */
+        switch (item) {
+            case 0:  return "Display Settings";
+            case 1:  return "File Explorer";
+            default: return "Open Terminal";
+        }
+    }
     if (item == 0) return "Close window";
     return (ctx_win >= 0 && wins[ctx_win].pinned) ? "Unpin from taskbar"
                                                    : "Pin to taskbar";
 }
 static void ctx_menu_rect(int *x, int *y, int *w, int *h) {
-    *w = CTX_W; *h = CTX_ITEM * CTX_N + 8;
-    int mx = ctx_x, my = ctx_y - *h;            /* pop upward from the taskbar */
+    *w = CTX_W; *h = CTX_ITEM * ctx_count() + 8;
+    int mx = ctx_x;
+    int my = ctx_mode == 1 ? ctx_y : ctx_y - *h;  /* desktop: down; taskbar: up */
     if (mx + *w > W - 6) mx = W - 6 - *w;
     if (mx < 6) mx = 6;
+    if (my + *h > H - 6) my = H - 6 - *h;
     if (my < 6) my = 6;
     *x = mx; *y = my;
 }
@@ -764,19 +1085,19 @@ static void draw_context_menu(void) {
     g_round(x - 2, y - 2, w + 4, h + 4, 12, 0x000000, 70);
     g_round(x, y, w, h, 10, 0x16161E, 250);
     int mxp = mlx(), myp = mly();
-    for (int it = 0; it < CTX_N; it++) {
+    for (int it = 0; it < ctx_count(); it++) {
         int iy = y + 4 + it * CTX_ITEM;
         int hot = mxp >= x && mxp < x + w && myp >= iy && myp < iy + CTX_ITEM;
         if (hot) g_round(x + 4, iy, w - 8, CTX_ITEM, 7, 0x2A2A3A, 255);
-        uint32_t col = (it == 0) ? COL_BAD : COL_TEXT;
+        uint32_t col = (ctx_mode == 0 && it == 0) ? COL_BAD : COL_TEXT;  /* "Close" in red */
         g_text(x + 14, iy + 9, ctx_label(it), hot ? 0xFFFFFF : col, 1);
     }
 }
-/* returns clicked item (0/1) or -1 */
+/* returns clicked item index, -1 (between items), or -2 (outside) */
 static int ctx_menu_hit(int x, int y) {
     int mx, my, w, h; ctx_menu_rect(&mx, &my, &w, &h);
     if (x < mx || x >= mx + w || y < my || y >= my + h) return -2;   /* outside */
-    for (int it = 0; it < CTX_N; it++) {
+    for (int it = 0; it < ctx_count(); it++) {
         int iy = my + 4 + it * CTX_ITEM;
         if (y >= iy && y < iy + CTX_ITEM) return it;
     }
@@ -788,11 +1109,42 @@ static int ctx_menu_hit(int x, int y) {
 #define SM_TW   86
 #define SM_TH   80
 #define SM_PAD  16
-#define SM_HEAD 56
+#define SM_HEAD 86      /* title + subtitle + search box */
 #define SM_FOOT 40
 
+/* Type-to-search: the Start menu filters its app grid by a query the user types
+ * while it's open. The filtered window indices are rebuilt on demand. */
+static char sm_query[32];
+static int  sm_qlen;
+static int  sm_filt[MAX_WIN];
+static int  sm_nfilt;
+
+/* case-insensitive substring test */
+static int sm_ci_contains(const char *hay, const char *needle) {
+    if (!needle[0]) return 1;
+    for (int i = 0; hay[i]; i++) {
+        int j = 0;
+        while (needle[j] && hay[i + j]) {
+            char a = hay[i + j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            j++;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+static void sm_build_filter(void) {
+    sm_nfilt = 0;
+    for (int i = 0; i < nwin; i++)
+        if (sm_ci_contains(wins[i].title, sm_query)) sm_filt[sm_nfilt++] = i;
+}
+
 static void start_menu_rect(int *ox, int *oy, int *mw, int *mh) {
-    int rows = (nwin + SM_COLS - 1) / SM_COLS; if (rows < 1) rows = 1;
+    sm_build_filter();
+    int n = sm_nfilt > 0 ? sm_nfilt : 1;
+    int rows = (n + SM_COLS - 1) / SM_COLS; if (rows < 1) rows = 1;
     *mw = SM_PAD * 2 + SM_COLS * SM_TW;
     *mh = SM_HEAD + rows * SM_TH + SM_PAD - 8 + SM_FOOT;
     int sx, sy; taskbar_layout(&sx, &sy);
@@ -800,9 +1152,10 @@ static void start_menu_rect(int *ox, int *oy, int *mw, int *mh) {
     int y = H - TASKBAR_H - *mh - 10; if (y < 8) y = 8;
     *ox = x; *oy = y;
 }
-static void start_menu_tile(int idx, int ox, int oy, int *tx, int *ty) {
-    *tx = ox + SM_PAD + (idx % SM_COLS) * SM_TW;
-    *ty = oy + SM_HEAD + (idx / SM_COLS) * SM_TH;
+/* slot = grid position (0-based) of a tile within the filtered list */
+static void start_menu_tile(int slot, int ox, int oy, int *tx, int *ty) {
+    *tx = ox + SM_PAD + (slot % SM_COLS) * SM_TW;
+    *ty = oy + SM_HEAD + (slot / SM_COLS) * SM_TH;
 }
 
 /* sign-out button rect inside the start menu footer */
@@ -817,12 +1170,28 @@ static void draw_start_menu(void) {
     int x, y, mw, mh; start_menu_rect(&x, &y, &mw, &mh);
     g_round(x, y, mw, mh, 14, 0x16161E, 248);
     g_fill(x, y, mw, 3, COL_ACCENT);
-    g_text(x + 18, y + 16, "BoltOS", COL_TEXT, 2);
-    g_text(x + 18, y + 38, "All apps", COL_TEXT_DIM, 1);
+    g_text(x + 18, y + 12, "BoltOS", COL_TEXT, 2);
+
+    /* search box */
+    int qbx = x + 16, qby = y + 40, qbw = mw - 32, qbh = 26;
+    g_round(qbx, qby, qbw, qbh, 6, 0x0C0C12, 255);
+    if (sm_qlen) {
+        g_text(qbx + 10, qby + 6, sm_query, COL_TEXT, 1);
+        if ((pit_ticks() / 500) % 2 == 0) {
+            int cxp = qbx + 10 + g_text_width(sm_query, 1);
+            if (cxp < qbx + qbw - 4) g_fill(cxp, qby + 5, 2, qbh - 10, COL_ACCENT);
+        }
+    } else {
+        g_text(qbx + 10, qby + 6, "Search apps...", COL_TEXT_DIM, 1);
+    }
 
     int mxp = mlx(), myp = mly();
-    for (int i = 0; i < nwin; i++) {
-        int tx, ty; start_menu_tile(i, x, y, &tx, &ty);
+    sm_build_filter();
+    if (sm_nfilt == 0)
+        g_text(x + 18, y + SM_HEAD + 10, "No matching apps", COL_TEXT_DIM, 1);
+    for (int k = 0; k < sm_nfilt; k++) {
+        int i = sm_filt[k];
+        int tx, ty; start_menu_tile(k, x, y, &tx, &ty);
         int hot = mxp >= tx && mxp < tx + SM_TW && myp >= ty && myp < ty + SM_TH;
         if (hot) g_round(tx + 3, ty + 2, SM_TW - 6, SM_TH - 6, 10, 0x2A2A3A, 255);
         draw_icon(wins[i].icon, tx + SM_TW / 2 - 16, ty + 12, 2, wins[i].accent);
@@ -1102,6 +1471,76 @@ static void dnd_drop(int x, int y) {
 /* ===========================================================================
  *  Compositor
  * ===========================================================================*/
+/* A transient notification toast, bottom-right above the taskbar. */
+static void draw_toast(void) {
+    if (!toast_msg[0] || pit_ticks() >= toast_until) return;
+    int tw = g_text_width(toast_msg, 1);
+    int bw = tw + 28, bh = 30;
+    int bx = W - bw - 18, by = H - TASKBAR_H - bh - 14;
+    g_round(bx, by, bw, bh, 8, COL_PANEL_2, 245);
+    g_round(bx, by, 4, bh, 8, COL_ACCENT, 255);          /* accent edge */
+    g_text(bx + 16, by + 11, toast_msg, COL_TEXT, 1);
+}
+
+/* Show `msg` as a ~2.5 s toast (called by apps + the GUI for user feedback). */
+void gui_toast(const char *msg) {
+    if (!msg) return;
+    int i = 0; for (; msg[i] && i < (int)sizeof(toast_msg) - 1; i++) toast_msg[i] = msg[i];
+    toast_msg[i] = 0;
+    toast_until = pit_ticks() + 2500;
+    dirty = 1;
+}
+
+/* prompt button rects (screen coords), rebuilt each draw */
+static int pr_ok_x, pr_ok_y, pr_ok_w, pr_ok_h, pr_ca_x, pr_ca_w;
+static void draw_prompt(void) {
+    if (!prompt_active) return;
+    int pw = 360, ph = 150, px = (W - pw) / 2, py = (H - ph) / 2;
+    g_blend(0, 0, W, H, 0x000000, 120);                  /* dim the desktop */
+    g_round(px - 2, py - 2, pw + 4, ph + 4, 14, 0x000000, 80);
+    g_round(px, py, pw, ph, 12, 0x16161E, 255);
+    g_fill(px, py, pw, 3, COL_ACCENT);
+    g_text(px + 20, py + 16, prompt_title, COL_TEXT, 2);
+    /* text field */
+    int fx = px + 20, fy = py + 52, fw = pw - 40, fh = 30;
+    g_round(fx, fy, fw, fh, 6, 0x0C0C12, 255);
+    g_rect(fx, fy, fw, fh, COL_ACCENT);
+    g_text(fx + 10, fy + 8, prompt_buf, COL_TEXT, 1);
+    if ((pit_ticks() / 500) % 2 == 0) {
+        int cxp = fx + 10 + g_text_width(prompt_buf, 1);
+        if (cxp < fx + fw - 4) g_fill(cxp, fy + 6, 2, fh - 12, COL_ACCENT);
+    }
+    /* OK / Cancel buttons */
+    pr_ok_w = 80; pr_ok_h = 28; pr_ok_y = py + ph - pr_ok_h - 16;
+    pr_ok_x = px + pw - pr_ok_w - 20;
+    pr_ca_w = 80; pr_ca_x = pr_ok_x - pr_ca_w - 10;
+    g_round(pr_ca_x, pr_ok_y, pr_ca_w, pr_ok_h, 6, COL_PANEL_3, 255);
+    g_text(pr_ca_x + 22, pr_ok_y + 7, "Cancel", COL_TEXT, 1);
+    g_round(pr_ok_x, pr_ok_y, pr_ok_w, pr_ok_h, 6, COL_ACCENT, 255);
+    g_text(pr_ok_x + 30, pr_ok_y + 7, "OK", 0xFFFFFF, 1);
+}
+
+/* Open a modal text prompt. `cb` is called with the entered string on OK/Enter
+ * (not called on Cancel/Esc). Only one prompt is shown at a time. */
+void gui_prompt(const char *title, const char *initial, void (*cb)(const char *)) {
+    prompt_active = 1;
+    prompt_cb = cb;
+    int i = 0; for (; title && title[i] && i < (int)sizeof(prompt_title) - 1; i++) prompt_title[i] = title[i];
+    prompt_title[i] = 0;
+    prompt_len = 0;
+    if (initial) for (; initial[prompt_len] && prompt_len < (int)sizeof(prompt_buf) - 1; prompt_len++)
+        prompt_buf[prompt_len] = initial[prompt_len];
+    prompt_buf[prompt_len] = 0;
+    dirty = 1;
+}
+static void prompt_confirm(void) {
+    prompt_active = 0;
+    void (*cb)(const char *) = prompt_cb;
+    prompt_cb = 0; dirty = 1;
+    if (cb && prompt_len > 0) cb(prompt_buf);
+}
+static void prompt_cancel(void) { prompt_active = 0; prompt_cb = 0; dirty = 1; }
+
 static void composite(void) {
     g_clear_clip();
     if (BG) { for (int i = 0; i < W * H; i++) BB[i] = BG[i]; }
@@ -1119,6 +1558,8 @@ static void composite(void) {
     draw_taskbar();
     draw_context_menu();
     if (dnd_active) draw_drag_ghost();
+    draw_toast();
+    draw_prompt();
     draw_cursor();
 }
 
@@ -1152,6 +1593,24 @@ static void do_maximize(window_t *w) {
     }
 }
 
+/* Win+arrow window management: left/right half, maximise, restore-or-minimise. */
+static void gui_keysnap(window_t *w, char c) {
+    int avail = H - TASKBAR_H;
+    if (!w->maximized && !w->snapped) { w->rx = w->x; w->ry = w->y; w->rw = w->w; w->rh = w->h; }
+    switch ((unsigned char)c) {
+    case KEY_LEFT:  w->x = 0; w->y = 0; w->w = W / 2; w->h = avail; w->maximized = 0; w->snapped = 1; break;
+    case KEY_RIGHT: w->x = W / 2; w->y = 0; w->w = W - W / 2; w->h = avail; w->maximized = 0; w->snapped = 1; break;
+    case KEY_UP:    w->x = 0; w->y = 0; w->w = W; w->h = avail; w->maximized = 1; w->snapped = 0; break;
+    case KEY_DOWN:
+        if (w->maximized || w->snapped) {              /* restore */
+            w->x = w->rx; w->y = w->ry; w->w = w->rw; w->h = w->rh;
+            w->maximized = 0; w->snapped = 0;
+        } else w->minimized = 1;                        /* else minimise */
+        break;
+    }
+    dirty = 1;
+}
+
 /* Aero-snap on drag release: pointer at the top edge maximises; at the left or
  * right edge fills that half of the screen. The pre-snap rect is saved so the
  * next drag (or the maximise button) restores it. */
@@ -1171,19 +1630,47 @@ static void snap_window(window_t *w, int mx, int my) {
 }
 
 static void on_left_down(int x, int y) {
+    /* a modal prompt swallows all clicks; only OK/Cancel act */
+    if (prompt_active) {
+        if (x >= pr_ok_x && x < pr_ok_x + pr_ok_w && y >= pr_ok_y && y < pr_ok_y + pr_ok_h) prompt_confirm();
+        else if (x >= pr_ca_x && x < pr_ca_x + pr_ca_w && y >= pr_ok_y && y < pr_ok_y + pr_ok_h) prompt_cancel();
+        return;
+    }
     /* an open context menu eats the next click */
     if (ctx_open) {
         int it = ctx_menu_hit(x, y);
-        if (it == 0)      { if (ctx_win >= 0) wins[ctx_win].open = 0; }      /* close   */
-        else if (it == 1) { if (ctx_win >= 0) wins[ctx_win].pinned = !wins[ctx_win].pinned; }
+        if (ctx_mode == 1) {                                       /* desktop shortcuts */
+            if (it == 0)      gui_open_by_title("Settings");
+            else if (it == 1) gui_open_by_title("File Explorer");
+            else if (it == 2) gui_open_by_title("Terminal");
+        } else {
+            if (it == 0)      { if (ctx_win >= 0) wins[ctx_win].open = 0; }      /* close   */
+            else if (it == 1) { if (ctx_win >= 0) wins[ctx_win].pinned = !wins[ctx_win].pinned; }
+        }
         ctx_open = 0; dirty = 1;
         if (it >= 0) return;                  /* clicked an item -> done       */
         /* it == -2 (outside) falls through so the click also lands normally   */
     }
 
+    /* tray volume: popup slider, then the speaker button toggles it */
+    if (vol_open && volume_popup_click(x, y)) { dirty = 1; return; }
+    { int vbx, vby; tray_vol_rect(&vbx, &vby);
+      if (x >= vbx && x < vbx + 28 && y >= vby && y < vby + 28) { vol_open = !vol_open; net_open = clock_open = 0; dirty = 1; return; } }
+    if (vol_open) { vol_open = 0; dirty = 1; }   /* click elsewhere dismisses it */
+
+    /* tray network: button toggles an info popup */
+    { int nbx, nby; tray_net_rect(&nbx, &nby);
+      if (x >= nbx && x < nbx + 28 && y >= nby && y < nby + 28) { net_open = !net_open; vol_open = 0; clock_open = 0; dirty = 1; return; } }
+    if (net_open) { net_open = 0; dirty = 1; }    /* click elsewhere dismisses it */
+
+    /* tray clock: toggles a calendar flyout */
+    { int qbx, qby, qbw, qbh; clock_rect(&qbx, &qby, &qbw, &qbh);
+      if (x >= qbx && x < qbx + qbw && y >= qby && y < qby + qbh) { clock_open = !clock_open; vol_open = net_open = 0; dirty = 1; return; } }
+    if (clock_open) { clock_open = 0; dirty = 1; } /* click elsewhere dismisses it */
+
     /* start button */
     int bx, by; taskbar_btn_rect(-1, &bx, &by);
-    if (x >= bx && x < bx + TB_BTN && y >= by && y < by + TB_BTN) { menu_open = !menu_open; dirty = 1; return; }
+    if (x >= bx && x < bx + TB_BTN && y >= by && y < by + TB_BTN) { menu_open = !menu_open; sm_query[0] = 0; sm_qlen = 0; dirty = 1; return; }
 
     /* taskbar app buttons (open-or-pinned list) */
     if (y >= H - TASKBAR_H) {
@@ -1201,9 +1688,10 @@ static void on_left_down(int x, int y) {
         if (x >= mxx && x < mxx + mw && y >= myy && y < myy + mh) {
             int sx, sy, sw, sh; signout_rect(mxx, myy, mw, mh, &sx, &sy, &sw, &sh);
             if (x >= sx && x < sx + sw && y >= sy && y < sy + sh) { menu_open = 0; gui_logout(); return; }
-            for (int i = 0; i < nwin; i++) {
-                int tx, ty; start_menu_tile(i, mxx, myy, &tx, &ty);
-                if (x >= tx && x < tx + SM_TW && y >= ty && y < ty + SM_TH) { gui_open(&wins[i]); menu_open = 0; return; }
+            sm_build_filter();
+            for (int k = 0; k < sm_nfilt; k++) {
+                int tx, ty; start_menu_tile(k, mxx, myy, &tx, &ty);
+                if (x >= tx && x < tx + SM_TW && y >= ty && y < ty + SM_TH) { gui_open(&wins[sm_filt[k]]); menu_open = 0; return; }
             }
             return;
         }
@@ -1290,7 +1778,7 @@ static void on_right_down(int x, int y) {
         for (int s = 0; s < vis; s++) {
             int bx, by; taskbar_btn_rect(s, &bx, &by);
             if (x >= bx && x < bx + TB_BTN && y >= by && y < by + TB_BTN) {
-                ctx_open = 1; ctx_win = idx[s];
+                ctx_open = 1; ctx_mode = 0; ctx_win = idx[s];
                 ctx_x = bx; ctx_y = by; dirty = 1;
                 return;
             }
@@ -1308,11 +1796,26 @@ static void on_right_down(int x, int y) {
             if (y >= w->y + TITLE_H && w->rclick) { gui_focus(w); w->rclick(w, x - w->x, y - (w->y + TITLE_H)); }
             return;
         }
+
+    /* empty desktop -> shortcut context menu at the cursor */
+    if (!menu_open) { ctx_open = 1; ctx_mode = 1; ctx_x = x; ctx_y = y; dirty = 1; }
 }
 
 /* scroll-wheel over a window's client area -> its scroll handler */
 static void handle_wheel(int dz) {
     int x = mlx(), y = mly();
+    /* wheel over the tray speaker (or its open popup) nudges the volume */
+    int vbx, vby; tray_vol_rect(&vbx, &vby);
+    int over_tray = (x >= vbx && x < vbx + 28 && y >= vby && y < vby + 28);
+    if (!over_tray && vol_open) {
+        int px, py, pw, ph; vol_popup_rect(&px, &py, &pw, &ph);
+        over_tray = (x >= px && x < px + pw && y >= py && y < py + ph);
+    }
+    if (over_tray) {
+        int v = audio_volume() + dz * 5;
+        if (v < 0) v = 0; if (v > 100) v = 100;
+        audio_set_volume(v); dirty = 1; return;
+    }
     for (int z = ztop; z >= 0; z--)
         for (int i = 0; i < nwin; i++) {
             window_t *w = &wins[i];
@@ -1375,8 +1878,90 @@ static void handle_mouse(void) {
     dirty = 1;                                      /* cursor moved -> repaint */
 }
 
+/* Capture the composited desktop (the BB backbuffer) to a 24-bit BMP under
+ * /home/Pictures and open it in Photos. Triggered globally by F12. */
+static void gui_screenshot(void) {
+    int w = W, h = H;
+    if (w <= 0 || h <= 0) return;
+    uint32_t row = (uint32_t)w * 3, pad = (4 - (row & 3)) & 3, stride = row + pad;
+    uint32_t sz = 54 + stride * (uint32_t)h;
+    uint8_t *bmp = (uint8_t *)kmalloc(sz);
+    if (!bmp) return;
+    memset(bmp, 0, 54);
+    bmp[0] = 'B'; bmp[1] = 'M';
+    bmp[2] = (uint8_t)sz; bmp[3] = (uint8_t)(sz >> 8); bmp[4] = (uint8_t)(sz >> 16); bmp[5] = (uint8_t)(sz >> 24);
+    bmp[10] = 54; bmp[14] = 40;
+    bmp[18] = (uint8_t)w; bmp[19] = (uint8_t)(w >> 8); bmp[20] = (uint8_t)(w >> 16); bmp[21] = (uint8_t)(w >> 24);
+    bmp[22] = (uint8_t)h; bmp[23] = (uint8_t)(h >> 8); bmp[24] = (uint8_t)(h >> 16); bmp[25] = (uint8_t)(h >> 24);
+    bmp[26] = 1; bmp[28] = 24;
+    for (int y = 0; y < h; y++) {
+        uint8_t  *dst = bmp + 54 + (uint32_t)(h - 1 - y) * stride;   /* bottom-up */
+        uint32_t *src = &BB[(uint32_t)y * w];
+        for (int x = 0; x < w; x++) {
+            uint32_t p = src[x];
+            dst[x * 3 + 0] = (uint8_t)(p);          /* B */
+            dst[x * 3 + 1] = (uint8_t)(p >> 8);     /* G */
+            dst[x * 3 + 2] = (uint8_t)(p >> 16);    /* R */
+        }
+    }
+    /* pick the first free /home/Pictures/screenshot-N.bmp */
+    if (!fs_lookup("/home/Pictures")) fs_create("/home/Pictures", 1);
+    char path[FS_PATH_MAX];
+    for (int n = 1; n <= 999; n++) {
+        const char *pre = "/home/Pictures/screenshot-";
+        int i = 0; for (; pre[i]; i++) path[i] = pre[i];
+        char num[8]; int t = 0, v = n; while (v) { num[t++] = (char)('0' + v % 10); v /= 10; }
+        while (t) path[i++] = num[--t];
+        const char *suf = ".bmp"; for (int j = 0; suf[j]; j++) path[i++] = suf[j];
+        path[i] = 0;
+        if (!fs_lookup(path)) break;
+    }
+    fs_node *f = fs_create(path, 0);
+    if (f) fs_write(f, bmp, sz);
+    kfree(bmp);
+    gui_toast("Screenshot saved to Pictures");
+    imgview_open_path(path);
+}
+
 static void handle_key(char c) {
+    /* a modal prompt grabs all keys until confirmed/cancelled */
+    if (prompt_active) {
+        unsigned char u = (unsigned char)c;
+        if (u == 27)      prompt_cancel();
+        else if (u == '\n' || u == '\r') prompt_confirm();
+        else if (u == '\b') { if (prompt_len > 0) prompt_buf[--prompt_len] = 0; dirty = 1; }
+        else if (u >= 32 && u < 127 && prompt_len < (int)sizeof(prompt_buf) - 1) {
+            prompt_buf[prompt_len++] = c; prompt_buf[prompt_len] = 0; dirty = 1;
+        }
+        return;
+    }
     if (c == 27) { menu_open = 0; ctx_open = 0; dirty = 1; return; }   /* Esc closes menus */
+    if ((unsigned char)c == KEY_SHOT) { gui_screenshot(); dirty = 1; return; }
+    if ((unsigned char)c == KEY_ALTTAB)  { gui_cycle_window(+1); menu_open = 0; return; }
+    if ((unsigned char)c == KEY_ALTTABR) { gui_cycle_window(-1); menu_open = 0; return; }
+    if ((unsigned char)c == KEY_ALTF4)   { int t = topmost(); if (t >= 0) wins[t].open = 0; menu_open = 0; dirty = 1; return; }
+    if ((unsigned char)c == KEY_WINTAP)  { menu_open = !menu_open; sm_query[0] = 0; sm_qlen = 0; dirty = 1; return; }
+    /* Win+arrow snaps the focused window; Win+D shows/restores the desktop. */
+    if (kbd_win_down()) {
+        unsigned char u = (unsigned char)c;
+        if (u == KEY_LEFT || u == KEY_RIGHT || u == KEY_UP || u == KEY_DOWN) {
+            int t = topmost(); if (t >= 0) gui_keysnap(&wins[t], c);
+            return;
+        }
+        if (u == 'd' || u == 'D') { gui_show_desktop(); return; }
+    }
+    /* While the Start menu is open, keystrokes drive its search box. */
+    if (menu_open) {
+        unsigned char u = (unsigned char)c;
+        if (u == '\b') { if (sm_qlen) sm_query[--sm_qlen] = 0; }
+        else if (u == '\n') {                       /* Enter opens the first match */
+            sm_build_filter();
+            if (sm_nfilt > 0) { gui_open(&wins[sm_filt[0]]); menu_open = 0; }
+        } else if (u >= 32 && u < 127 && sm_qlen < (int)sizeof(sm_query) - 1) {
+            sm_query[sm_qlen++] = c; sm_query[sm_qlen] = 0;
+        }
+        dirty = 1; return;
+    }
     int f = topmost();
     if (f >= 0 && wins[f].key) wins[f].key(&wins[f], c);
     dirty = 1;
@@ -1548,6 +2133,11 @@ void gui_run(void) {
     calc_app_init();
     clock_app_init();
     notes_app_init();
+    tasks_app_init();
+    contacts_app_init();
+    sheets_app_init();
+    imgview_app_init();
+    music_app_init();
     calendar_app_init();
     piano_app_init();
     paint_app_init();
@@ -1574,10 +2164,18 @@ void gui_run(void) {
     uint64_t busy = 0, total = 0;
     prev_btns = 0; drag_id = -1; dirty = 1;
 
+    wallpaper_restore();       /* restore a saved image wallpaper, if any */
+
     login_begin();             /* gate the desktop behind a sign-in */
 
     for (;;) {
         uint64_t t0 = rdtsc();
+
+        /* A ring-3 program (the userland browser) has grabbed the panel: don't
+         * touch VRAM or drain the keyboard -- it reads input via SYS_GETKEY and
+         * paints the screen itself. Park until the timer tick reschedules; the
+         * scheduler runs that ring-3 thread. Repaint the desktop once it lets go. */
+        if (g_fb_exclusive) { __asm__ volatile("hlt"); dirty = 1; continue; }
 
         if (login_active) {                          /* sign-in: keyboard only */
             xhci_poll();
@@ -1609,10 +2207,15 @@ void gui_run(void) {
 
         if (dirty) {
             composite();
-            if (output_is_native()) fb_blit(BB);
-            else fb_blit_scaled(BB, (uint32_t)W, (uint32_t)H,
-                                 (uint32_t)out_x, (uint32_t)out_y,
-                                 (uint32_t)out_w, (uint32_t)out_h);
+            /* Re-check after the (non-atomic) composite: a ring-3 renderer may
+             * have grabbed the panel mid-frame. Don't blit over it -- that was
+             * the stale-frame race that left the desktop on screen. */
+            if (!g_fb_exclusive) {
+                if (output_is_native()) fb_blit(BB);
+                else fb_blit_scaled(BB, (uint32_t)W, (uint32_t)H,
+                                     (uint32_t)out_x, (uint32_t)out_y,
+                                     (uint32_t)out_w, (uint32_t)out_h);
+            }
             dirty = 0;
         }
 

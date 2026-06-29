@@ -63,8 +63,12 @@ Bundled apps (24):
 - Games: **DOOM** (real doomgeneric port, playable E1M1), **Minesweeper**,
   **Snake**, **2048**, **Tic-Tac-Toe**, **Memory match**, **Conway's Game of Life**
 
-> No hardware floating point in the kernel — everything is fixed-point / integer
-> math (FPU/SSE state isn't saved across the scheduler).
+> The kernel logic is fixed-point / integer math, but **SSE is enabled and the
+> FPU/SSE register file is saved and restored across context switches**: the
+> scheduler gives every thread its own 512-byte `FXSAVE` area and the ISR common
+> path (`kernel/isr.asm`) `fxsave`s the outgoing thread and `fxrstor`s the
+> incoming one around every interrupt, so XMM/x87 state never leaks between
+> threads. Ring-3 programs (e.g. the libc `libm`) can use floating point freely.
 
 ## Userland (ring 3, ELF64)
 
@@ -77,6 +81,32 @@ A preemptive **round-robin scheduler** (`kernel/sched.c`) with per-process
 state (`kernel/proc.c`) time-slices processes off the PIT. Userland benefits
 from **ASLR** (randomised load base), **SMAP/SMEP** (kernel/user page isolation),
 and per-process address spaces.
+
+### Ring-3 browser & JS
+
+The **web browser, DOM/layout engine and JavaScript interpreter run in ring 3**,
+not in the kernel. `kernel/{dom,layout,js}.c` — the HTML tokeniser + DOM tree
+builder, the CSS cascade + box/flex/grid layout engine, and the BoltJS
+interpreter — are the *same sources* the kernel uses, but they are also compiled
+into two userland ELF programs and executed in ring 3:
+
+- **`/bin/js`** (`user/js_main.c`) — the JavaScript interpreter as a ring-3
+  program. `js FILE.js` execs it; the language runtime never touches kernel mode.
+- **`/bin/browser`** (`user/browser_main.c`) — the web browser as a ring-3
+  program. It loads a page (local file, or a URL through the kernel network
+  stack), builds the **DOM**, runs the **CSS cascade + layout**, executes the
+  page's **JavaScript** (with a real DOM-bound `js_host`, including `fetch()`),
+  and **paints the box tree to the framebuffer** — all in ring 3. Launch it with
+  the `webx [url]` shell command; keys scroll / follow links (Tab+Enter) / edit
+  the address bar (`g`) / quit (`q`).
+
+The kernel exposes only the privileged primitives behind four syscalls
+(`include/syscall.h`): `SYS_FBINFO` maps the framebuffer into the process and
+pauses the compositor (a `g_fb_exclusive` flag the GUI loop checks), `SYS_GETKEY`
+reads the keyboard, `SYS_HTTPGET` fetches a URL over the in-kernel TCP/TLS stack,
+and `SYS_FBEND` hands the screen back. No HTML parsing, layout, or script
+execution happens in ring 0. (The in-window desktop **Browser** app still uses
+the in-kernel copy of the engine for its embedded window.)
 
 ## ACPI / APIC / SMP
 
@@ -116,8 +146,12 @@ detected and skipped.
 
 An **NVMe driver** (`drivers/nvme.c`) brings up a controller over PCI/MMIO: it
 sets up the admin queue pair, runs `IDENTIFY`, creates one I/O queue pair, and
-registers namespace 1 with the block layer. It is polled — completions are read
-off the CQ phase bit — which fits BoltOS's synchronous, one-command-at-a-time I/O.
+registers namespace 1 with the block layer. Completions arrive on a **hardware
+MSI/MSI-X interrupt** (`pci_msi_enable` routes a vector to the local APIC, the
+I/O completion queue is created with IEN=1): the issuing thread `hlt`s until the
+interrupt wakes it instead of busy-polling the CQ phase bit. If the controller
+exposes no MSI capability the driver falls back to polling so it still works
+everywhere.
 
 An **AHCI (SATA) driver** (`drivers/ahci.c`) drives Serial ATA host bus adapters
 over DMA. Each port gets a command list, received FIS area, and command table;
@@ -182,8 +216,9 @@ lives for the page's lifetime, so it also has an **event loop**:
 `requestAnimationFrame` (driven off the PIT tick), and **`fetch()` returning real
 Promises** (`.then` / `.catch` / `.finally`, `Promise.resolve` / `reject` / `all`,
 `new Promise`) drained through a microtask queue, plus `JSON.parse` / `stringify`.
-The `js` shell command runs code inline (`js -c "…"`) or a script from the
-filesystem (`js FILE.js`).
+The `js` shell command runs code inline (`js -c "…"`, in-kernel for quick eval)
+or a script file (`js FILE.js`), which **executes in ring 3** via the userland
+interpreter `/bin/js` (see *Ring-3 browser & JS* below).
 
 Pages load over the kernel's own stack (DNS → TCP → TLS → HTTP/1.1):
 
@@ -339,7 +374,11 @@ An **xHCI USB host-controller driver** (`drivers/xhci.c`) brings up the controll
 connected root-hub port, resets it, issues **Enable Slot** / **Address Device**,
 and walks EP0 control transfers to read the device and configuration descriptors.
 Enumerated devices (including **HID** keyboards and mice) are reported at boot.
-The driver is polled, matching the rest of the kernel's synchronous I/O model.
+Enumeration runs polled (a bounded one-time sequence), then HID input switches to
+**hardware interrupts**: interrupter 0 + `USBCMD.INTE` are enabled and an
+MSI/MSI-X vector is routed to the IDT, so keyboard/mouse boot reports arrive as
+IRQs (the handler drains the event ring) instead of being polled from the idle
+loop. Controllers without MSI stay on the polled path.
 
 ## Freestanding libc
 
@@ -408,9 +447,15 @@ UEFI firmware ── loads ──▶ boot/uefi_boot.c (BOOTX64.EFI)
                           kmain(bootinfo)   ← kernel/main.c
 ```
 
-The kernel is linked to a **flat binary** (`ld.lld --oformat binary`) loaded at
-physical `0x100000`. `bootinfo` (framebuffer + E820 map) is handed to the kernel
-in `RDI` and lives at physical `0x0500`.
+The kernel is a **higher-half** kernel: it is linked at virtual
+`0xFFFFFFFF80100000` (`linker.ld`, `KERNEL_VBASE = 0xFFFFFFFF80000000`) but its
+load address (LMA) is physical `0x100000`, so `ld.lld --oformat binary` still
+emits a flat image that loads at phys 1 MiB. The bootloader (stage2 / UEFI loader)
+maps the top 2 GiB of the address space to physical 0 before entering the kernel;
+`boot.asm` then `jmp`s from the identity-mapped entry to its linked higher-half
+address and runs from the higher half thereafter, with a direct physical map at
+`PHYS_BASE`. `bootinfo` (framebuffer + E820 map) is handed to the kernel in `RDI`
+and lives at physical `0x0500`.
 
 ## Toolchain (Windows / msys2)
 
@@ -493,7 +538,7 @@ The interactive OS shell supports a wide range of commands:
 - **System Information:** `sysinfo`, `cpuinfo`, `meminfo`, `diskinfo`, `sync`, `uptime`, `battery`, `sensors`, `devices`, `version`, `health`
 - **Process Management:** `ps`, `kill`, `top`, `freeze`, `resume`, `services`, `service`, `jobs`, `priority`, `monitor`
 - **System (cont.):** `winrun` (Windows PE32+ loader), `compile` (BoltRT: compile a source file into a real PE32+ `.exe`), `pkg` (package manager), `users` / `useradd` / `userdel` (multi-user), `libctest` (libc validation)
-- **Networking:** `netinfo`, `ping`, `trace`, `ports`, `download`, `browse`, `upload`, `wifi`, `firewall`, `share`, `scan`, `nstest` (NetSurf library test)
+- **Networking:** `netinfo`, `ping`, `trace`, `ports`, `download`, `browse`, `webx` (ring-3 web browser), `upload`, `wifi`, `firewall`, `share`, `scan`, `nstest` (NetSurf library test)
 - **Language:** `python` (BoltPy interpreter / REPL), `js` (BoltJS interpreter, `js -c "…"` or `js FILE.js`); the **Code** app compiles C / C++ / C#
 - **Bonus / Unique:** `focus`, `snapshot`, `timeline`, `vault`, `doctor`, `assistant`, `sandbox`, `workspace`, `panic`, `story`
 - **Core:** `help`, `echo`, `clear`, `mem`
@@ -546,6 +591,7 @@ The interactive OS shell supports a wide range of commands:
 +-- vendor/               Vendored libcss-0.9.2 (CSS parsing/selection)
 \-- user/
     +-- crt0.asm  hello.c  winhello.c  boltrt.c    Ring-3 ELF64 + PE32+ demos
+    +-- js_main.c  browser_main.c  kheap.h         Ring-3 JS interpreter + web browser (DOM+layout+JS)
     +-- ulibc.c/.h  stdlib_ext.c  libm.c
     +-- stdio.h  stdlib.h  math.h  ctype.h
     \-- user.ld

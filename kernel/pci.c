@@ -2,6 +2,8 @@
 #include "hw.h"
 #include "io.h"
 #include "mm.h"
+#include "apic.h"
+#include "kprintf.h"
 
 /* ===========================================================================
  *  PCI configuration space (mechanism #1) + BAR decode / MMIO mapping.
@@ -217,4 +219,81 @@ void pci_enable_bus_master(const struct pci_dev *d) {
 
 uint8_t pci_interrupt_line(const struct pci_dev *d) {
     return pci_cfg_read8(d->bus, d->slot, d->func, PCI_INTLINE);
+}
+
+/* ===========================================================================
+ *  Message-Signalled Interrupts (MSI / MSI-X)
+ *
+ *  Lets a PCI device deliver an interrupt by *writing* a memory message to the
+ *  local APIC, instead of asserting a shared INTx pin (which would need ACPI
+ *  _PRT routing BoltOS doesn't parse). The composed (address,data) targets the
+ *  boot CPU + the given IDT vector, edge/fixed (apic_msi_compose).
+ *
+ *  MSI-X is preferred (QEMU's nvme + qemu-xhci expose it): its vector table
+ *  lives in an MMIO BAR; we program table entry 0 and unmask it. MSI is the
+ *  fallback: the address/data go straight into config space. One vector only,
+ *  which matches BoltOS's single-interrupter-per-controller use.
+ *
+ *  Returns 0 on success, -1 if the device has neither capability.
+ * ===========================================================================*/
+#define PCI_STATUS    0x06
+#define PCI_CAP_PTR   0x34
+#define CAP_ID_MSI    0x05
+#define CAP_ID_MSIX   0x11
+
+int pci_msi_enable(const struct pci_dev *d, uint8_t vector) {
+    uint16_t status = pci_read16(d, PCI_STATUS);
+    if (!(status & (1u << 4))) return -1;          /* no capability list */
+
+    uint32_t addr = 0, data = 0;
+    apic_msi_compose(vector, &addr, &data);
+
+    /* walk the capability list, remembering MSI + MSI-X offsets */
+    uint8_t cap = pci_cfg_read8(d->bus, d->slot, d->func, PCI_CAP_PTR) & 0xFC;
+    uint8_t msi_cap = 0, msix_cap = 0;
+    for (int guard = 0; cap && guard < 48; guard++) {
+        uint8_t id = pci_cfg_read8(d->bus, d->slot, d->func, cap);
+        if      (id == CAP_ID_MSIX) msix_cap = cap;
+        else if (id == CAP_ID_MSI)  msi_cap  = cap;
+        cap = pci_cfg_read8(d->bus, d->slot, d->func, (uint8_t)(cap + 1)) & 0xFC;
+    }
+
+    if (msix_cap) {
+        uint32_t tbl = pci_read32(d, (uint8_t)(msix_cap + 4));   /* table offset|BIR */
+        int      bir = (int)(tbl & 0x7);
+        uint32_t toff = tbl & ~0x7u;
+        struct pci_bar bar;
+        if (pci_bar(d, bir, &bar) == 0 && bar.is_mmio && pci_map_bar(&bar)) {
+            volatile uint32_t *e = (volatile uint32_t *)((volatile uint8_t *)bar.virt + toff);
+            e[0] = addr;        /* message address low  */
+            e[1] = 0;           /* message address high */
+            e[2] = data;        /* message data         */
+            e[3] = 0;           /* vector control: unmask (bit0 = 0) */
+            __asm__ volatile("" ::: "memory");
+            uint16_t mc = pci_read16(d, (uint8_t)(msix_cap + 2));
+            mc |=  (1u << 15);  /* MSI-X Enable      */
+            mc &= ~(1u << 14);  /* Function Mask off */
+            pci_write16(d, (uint8_t)(msix_cap + 2), mc);
+            return 0;
+        }
+        kprintf("[pci] MSI-X table BAR%d unmappable; trying MSI\n", bir);
+    }
+
+    if (msi_cap) {
+        uint16_t mc = pci_read16(d, (uint8_t)(msi_cap + 2));
+        int is64 = (mc >> 7) & 1;
+        pci_write32(d, (uint8_t)(msi_cap + 4), addr);              /* msg addr lo */
+        if (is64) {
+            pci_write32(d, (uint8_t)(msi_cap + 8), 0);            /* msg addr hi */
+            pci_write16(d, (uint8_t)(msi_cap + 0xC), (uint16_t)data);
+        } else {
+            pci_write16(d, (uint8_t)(msi_cap + 8), (uint16_t)data);
+        }
+        mc &= ~(0x7u << 4);   /* MME = 0 -> a single message  */
+        mc |=  1u;            /* MSI Enable                   */
+        pci_write16(d, (uint8_t)(msi_cap + 2), mc);
+        return 0;
+    }
+
+    return -1;
 }

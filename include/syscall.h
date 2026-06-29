@@ -24,6 +24,22 @@
 #define SYS_GETPID  39  /* ()                        -> pid                  */
 #define SYS_EXIT    60  /* (code)                    -> (no return)          */
 
+/* ---- BoltOS device syscalls (private; let a ring-3 program own the screen,
+ *      read the keyboard, and fetch over the network -- the substrate the
+ *      ring-3 web browser /bin/browser runs on). The drivers stay in ring 0;
+ *      ring 3 reaches them only through these calls. -------------------------*/
+#define SYS_FBINFO  100 /* (struct user_fbinfo*)     -> 0/-1; claim panel+dims */
+#define SYS_GETKEY  101 /* ()                        -> key, or -1 if none    */
+#define SYS_HTTPGET 102 /* (url, buf, cap, status*)  -> body len / -1         */
+#define SYS_FBEND   103 /* ()                        -> 0; release the screen  */
+#define SYS_FBPRESENT 104 /* (xrgb w*h buffer)       -> 0/-1; blit to panel    */
+
+/* Filled by SYS_FBINFO: the panel geometry. The renderer draws a packed w*h
+ * xRGB image into its own buffer and hands it to SYS_FBPRESENT each frame; the
+ * compositor is paused until SYS_FBEND / process exit. `ptr` is reserved (0).
+ * Layout shared verbatim with user/ulibc.h. */
+struct user_fbinfo { uint64_t ptr; uint32_t w, h, pitch_px; };
+
 /* mmap prot bits */
 #define PROT_READ   1
 #define PROT_WRITE  2

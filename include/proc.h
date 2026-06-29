@@ -21,11 +21,13 @@ typedef struct proc {
 
 /* User-space virtual layout (low half, ring 3) */
 #define USER_STACK_TOP  0x0000700000000000ull
-#define USER_STACK_PGS  4
+#define USER_STACK_PGS  64        /* 256 KiB: the ring-3 browser recurses through
+                                   * DOM parse + layout + JS eval + paint */
 #define USER_MMAP_BASE  0x0000400000000000ull
 
 void    proc_init(void);
 int     proc_exec(const char *path);       /* load ELF + run; pid or -1 */
+int     proc_exec_argv(const char *path, const char *arg1); /* with argv[1] */
 proc_t *proc_current(void);                /* running process, or 0     */
 
 int     proc_fd_alloc(proc_t *p, file *f); /* lowest free fd, or -1     */

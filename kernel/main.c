@@ -93,18 +93,35 @@ static void demo_thread_b(void) {
  * the program is scheduled as a ring-3 thread with its own fd table + heap. */
 extern const uint8_t _binary_hello_elf_start[];
 extern const uint8_t _binary_hello_elf_end[];
+extern const uint8_t _binary_js_elf_start[];
+extern const uint8_t _binary_js_elf_end[];
+extern const uint8_t _binary_browser_elf_start[];
+extern const uint8_t _binary_browser_elf_end[];
+
+/* Write an embedded ELF blob into the filesystem at `path` so proc_exec can load
+ * it. /bin is created on first use. Returns 0 on success. */
+static int seed_blob(const char *path, const uint8_t *start, const uint8_t *end) {
+    uint64_t len = (uint64_t)(end - start);
+    fs_node *n = fs_lookup(path);
+    if (!n) { fs_create("/bin", 1); n = fs_create(path, 0); }
+    if (!n || fs_write(n, start, (uint32_t)len) != 0) {
+        kprintf("[--] could not seed %s\n", path);
+        return -1;
+    }
+    kprintf("[ok] seeded %s (%lu bytes)\n", path, len);
+    return 0;
+}
 
 static void launch_user_demo(void) {
     syscall_init();   kprintf("[ok] SYSCALL/SYSRET armed (LSTAR + EFER.SCE)\n");
 
-    uint64_t len = (uint64_t)(_binary_hello_elf_end - _binary_hello_elf_start);
-    fs_node *n = fs_lookup("/bin/hello");
-    if (!n) { fs_create("/bin", 1); n = fs_create("/bin/hello", 0); }
-    if (!n || fs_write(n, _binary_hello_elf_start, (uint32_t)len) != 0) {
-        kprintf("[--] could not seed /bin/hello\n");
+    /* Ring-3 programs: the demo, the JavaScript interpreter, and the web browser
+     * (DOM + layout + JS). The latter two are seeded for `js`/`webx` to exec on
+     * demand -- all three run in ring 3 through the ELF loader + syscalls. */
+    seed_blob("/bin/js",      _binary_js_elf_start,      _binary_js_elf_end);
+    seed_blob("/bin/browser", _binary_browser_elf_start, _binary_browser_elf_end);
+    if (seed_blob("/bin/hello", _binary_hello_elf_start, _binary_hello_elf_end) != 0)
         return;
-    }
-    kprintf("[ok] seeded /bin/hello (%lu bytes)\n", len);
 
     if (proc_exec("/bin/hello") < 0)
         kprintf("[--] proc_exec(/bin/hello) failed\n");

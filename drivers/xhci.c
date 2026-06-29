@@ -8,22 +8,26 @@
 #include "xhci.h"
 #include "keyboard.h"
 #include "mouse.h"
+#include "interrupts.h"
 
 /* ===========================================================================
- *  xHCI USB host controller driver (polled).
+ *  xHCI USB host controller driver.
  *
  *  Brings up the controller (DCBAA, command ring, single-segment event ring,
  *  scratchpad buffers), then for every connected root-hub port: reset it,
  *  Enable Slot, Address Device (BSR=0), and walk EP0 control transfers to read
  *  the device + configuration descriptors. Devices are reported and remembered.
  *
- *  No interrupts: completions are found by polling the event-ring cycle bit.
- *  The controller's interrupts are masked (IMAN, PCI Interrupt-Disable) so an
- *  unhandled completion can't storm the IDT -- same lesson as the NVMe driver.
+ *  Bring-up (enumeration) runs with interrupts off and finds completions by
+ *  polling the event-ring cycle bit -- a bounded, one-time setup sequence. Once
+ *  enumeration is done the driver switches HID input to hardware interrupts:
+ *  interrupter 0 + USBCMD.INTE are enabled and an MSI/MSI-X vector is routed to
+ *  the IDT, so boot keyboard/mouse reports arrive as IRQs (xhci_irq drains the
+ *  event ring) instead of being polled from the GUI/shell idle loop. If the
+ *  controller has no MSI capability it stays on the polled xhci_poll() path.
  *
  *  This is a faithful subset of the spec: enough to enumerate and classify
- *  HID/mass-storage/hub devices over EP0. Interrupt-IN endpoint polling for
- *  HID boot input is layered on top via xhci_get_devices().
+ *  HID/mass-storage/hub devices over EP0.
  * ===========================================================================*/
 
 /* --- capability registers (BAR0 + 0) -------------------------------------- */
@@ -48,7 +52,10 @@
 #define USBCMD_HCRST    (1u << 1)
 #define USBCMD_INTE     (1u << 2)
 #define USBSTS_HCH      (1u << 0)
+#define USBSTS_EINT     (1u << 3)    /* event interrupt (write 1 to clear) */
 #define USBSTS_CNR      (1u << 11)
+
+#define XHCI_MSI_VECTOR (MSI_VECTOR_BASE + 2)   /* 0x72 */
 
 #define PORTSC_CCS      (1u << 0)
 #define PORTSC_PED      (1u << 1)
@@ -105,6 +112,7 @@ struct usbdev {
 
 static struct {
     int present;
+    int irq_ok;                /* 1 once MSI + interrupter 0 drive HID input */
     volatile void *cap;        /* BAR0 base (capability regs)   */
     volatile void *op;         /* operational regs              */
     volatile void *rt;         /* runtime regs                  */
@@ -490,7 +498,7 @@ static void hid_setup(struct usbdev *d, struct ring *ep0, const uint8_t *cfg, ui
             d->if_proto == 2 ? "mouse" : "keyboard", d->slot, dci);
 }
 
-/* Non-blocking peek of the event ring; returns 1 and fills *type/*ptr if an
+/* Non-blocking peek of the event ring; returns 1 and fills *type / *ptr if an
  * event is pending, else 0. Used by the HID poll so it never spins. */
 static int evt_try(uint32_t *type, uint64_t *ptr) {
     volatile uint32_t *e = xh.evt.trb + xh.evt_deq * 4;
@@ -504,10 +512,10 @@ static int evt_try(uint32_t *type, uint64_t *ptr) {
     return 1;
 }
 
-/* Poll all HID keyboards for new boot reports and inject decoded keys. Called
- * from the GUI/shell idle loops (polled controller, no IRQs). */
-void xhci_poll(void) {
-    if (!xh.present || nhid == 0) return;
+/* Drain every pending event-ring entry: decode HID boot reports, inject keys /
+ * mouse deltas, and re-arm each interrupt transfer. Shared by the IRQ handler
+ * (xhci_irq) and the polled fallback (xhci_poll). */
+static void xhci_drain(void) {
     uint32_t type; uint64_t ptr;
     while (evt_try(&type, &ptr)) {
         if (type != TRB_TR_EVENT) continue;
@@ -540,6 +548,24 @@ void xhci_poll(void) {
             xh.db[h->slot] = h->dci;
         }
     }
+}
+
+/* MSI/MSI-X interrupt handler: a boot keyboard/mouse report (or any other event)
+ * arrived. Acknowledge the interrupt (USBSTS.EINT + IMAN.IP are write-1-clear),
+ * keeping IE set, then drain the event ring. Acking before draining means an
+ * event that lands mid-drain simply re-asserts the MSI -- nothing is lost. */
+static void xhci_irq(struct registers *r) {
+    (void)r;
+    op_wr(OP_USBSTS, USBSTS_EINT);
+    rt_wr(IR0_IMAN, 0x3);            /* bit0 IP (W1C) + bit1 IE (kept set) */
+    if (xh.present) xhci_drain();
+}
+
+/* Polled fallback for the idle loop. A no-op once hardware interrupts drive the
+ * controller (xh.irq_ok), so the IRQ handler is the sole event-ring consumer. */
+void xhci_poll(void) {
+    if (!xh.present || nhid == 0 || xh.irq_ok) return;
+    xhci_drain();
 }
 
 void xhci_init(void) {
@@ -625,4 +651,20 @@ void xhci_init(void) {
     for (uint32_t p = 0; p < xh.maxports; p++) enumerate_port(p);
 
     if (xh.ndev == 0) kprintf("[xhci] no devices attached\n");
+
+    /* Enumeration done -- switch HID input from idle-loop polling to hardware
+     * interrupts. Route an MSI/MSI-X vector to the IDT, enable interrupter 0
+     * (IMAN.IE) and the controller's master interrupt (USBCMD.INTE). From here
+     * key/mouse reports raise IRQs that xhci_irq services. */
+    if (pci_msi_enable(&pd, XHCI_MSI_VECTOR) == 0) {
+        msi_install(XHCI_MSI_VECTOR, xhci_irq);
+        op_wr(OP_USBSTS, USBSTS_EINT);                       /* clear stale EINT */
+        rt_wr(IR0_IMAN, 0x2);                                /* IE = 1           */
+        op_wr(OP_USBCMD, op_rd(OP_USBCMD) | USBCMD_INTE);    /* master INT enable */
+        xh.irq_ok = 1;
+        kprintf("[xhci] HID input on MSI vector 0x%x (interrupt-driven)\n",
+                XHCI_MSI_VECTOR);
+    } else {
+        kprintf("[xhci] no MSI capability; HID input stays polled\n");
+    }
 }

@@ -151,8 +151,8 @@ static void apply_hot(int kind, int val) {
     case K_THEME:     g_settings.theme = val;
                       g_settings.accent = settings_theme_accent(val); break;
     case K_ACCENT:    g_settings.accent = settings_accent_color(val); break;
-    case K_WALLSTYLE: g_settings.wall_style = val; break;
-    case K_WALLCOLOR: g_settings.wall_color = settings_wallcolor(val); break;
+    case K_WALLSTYLE: g_settings.wall_style = val; gui_clear_wallpaper_image(); break;
+    case K_WALLCOLOR: g_settings.wall_color = settings_wallcolor(val); gui_clear_wallpaper_image(); break;
     case K_RES:       g_settings.res_index = val; break;
     case K_AUDIO:     g_settings.audio_device = val; break;
     case K_FONT:      g_settings.font = val; break;

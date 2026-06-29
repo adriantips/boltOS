@@ -20,6 +20,7 @@ args = [QEMU,
   "-device","nvme,drive=nvm,serial=BOLTNVME01",
   "-m","2G","-rtc","base=utc","-vga","std","-global","VGA.vgamem_mb=64",
   "-netdev","user,id=net0","-device","e1000,netdev=net0",
+  "-audiodev","none,id=snd0","-device","AC97,audiodev=snd0",
   "-display","none",
   "-qmp", f"tcp:127.0.0.1:{PORT},server,nowait",
   "-no-reboot","-no-shutdown"]
@@ -59,7 +60,13 @@ def tap():
 def click(x,y):
     move(x,y); tap(); time.sleep(0.3)
 def dblclick(x,y):
-    move(x,y); tap(); time.sleep(0.2); tap(); time.sleep(0.5)
+    move(x,y)
+    for _ in range(2):
+        cmd({"execute":"input-send-event","arguments":{"events":[
+          {"type":"btn","data":{"button":"left","down":True}}]}}); rd(); time.sleep(0.12)
+        cmd({"execute":"input-send-event","arguments":{"events":[
+          {"type":"btn","data":{"button":"left","down":False}}]}}); rd(); time.sleep(0.12)
+    time.sleep(0.5)
 
 # argv items: "x,y" single click, "d:x,y" double click, "k:text" type, "s:secs" sleep
 for a in sys.argv[3:]:
@@ -67,6 +74,13 @@ for a in sys.argv[3:]:
         x,y = a[2:].split(","); dblclick(int(x),int(y))
     elif a.startswith("s:"):
         time.sleep(float(a[2:]))
+    elif a.startswith("q:"):                       # raw qcode key tap, e.g. q:f12
+        qc = a[2:]
+        cmd({"execute":"input-send-event","arguments":{"events":[
+          {"type":"key","data":{"down":True,"key":{"type":"qcode","data":qc}}}]}}); rd()
+        cmd({"execute":"input-send-event","arguments":{"events":[
+          {"type":"key","data":{"down":False,"key":{"type":"qcode","data":qc}}}]}}); rd()
+        time.sleep(0.3)
     elif a.startswith("bs:"):
         for _ in range(int(a[3:])):
             cmd({"execute":"input-send-event","arguments":{"events":[
@@ -75,8 +89,8 @@ for a in sys.argv[3:]:
               {"type":"key","data":{"down":False,"key":{"type":"qcode","data":"backspace"}}}]}}); rd()
             time.sleep(0.04)
     elif a.startswith("k:"):
-        QC = {".":"dot","/":"slash","-":"minus"," ":"spc","_":"minus"}
-        SH = {":":"semicolon","?":"slash"}
+        QC = {".":"dot","/":"slash","-":"minus"," ":"spc","_":"minus","\t":"tab","=":"equal"}
+        SH = {":":"semicolon","?":"slash","+":"equal","*":"8","(":"9",")":"0"}
         def key(qc, shift=False):
             ev=[]
             if shift: ev.append({"type":"key","data":{"down":True,"key":{"type":"qcode","data":"shift"}}})

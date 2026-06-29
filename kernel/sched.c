@@ -6,7 +6,8 @@
 #include "gdt.h"
 
 #define MAXT    16
-#define KSTACK  16384          /* per-thread kernel stack */
+#define KSTACK  65536          /* per-thread kernel stack: deep enough for the
+                                * TLS/X.509/RSA chain a SYS_HTTPGET runs in ring 0 */
 
 typedef struct {
     uint64_t     rsp;          /* saved register-frame pointer when not running */

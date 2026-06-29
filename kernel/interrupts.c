@@ -6,10 +6,16 @@
 #include "io.h"
 
 static irq_handler_t handlers[16];
+static irq_handler_t msi_handlers[16];      /* vectors 0x70..0x7F */
 static tick_hook_t   tick_hook;
 
 void irq_install(int irq, irq_handler_t h) {
     if (irq >= 0 && irq < 16) handlers[irq] = h;
+}
+
+void msi_install(uint8_t vector, irq_handler_t h) {
+    if (vector >= MSI_VECTOR_BASE && vector < MSI_VECTOR_BASE + 16)
+        msi_handlers[vector - MSI_VECTOR_BASE] = h;
 }
 
 void irq_set_tick_hook(tick_hook_t h) { tick_hook = h; }
@@ -96,6 +102,14 @@ struct registers *isr_handler(struct registers *r) {
         if (apic_active()) lapic_eoi(); else pic_eoi(irq);
         /* preemptive reschedule on the timer tick; may return a new frame */
         if (irq == 0 && tick_hook) r = tick_hook(r);
+    }
+
+    /* Message-signalled interrupts (NVMe completions, xHCI events). Delivered
+     * straight to the local APIC, so only it needs the EOI. */
+    if (r->int_no >= MSI_VECTOR_BASE && r->int_no < MSI_VECTOR_BASE + 16) {
+        irq_handler_t h = msi_handlers[r->int_no - MSI_VECTOR_BASE];
+        if (h) h(r);
+        if (apic_active()) lapic_eoi();
     }
     return r;
 }

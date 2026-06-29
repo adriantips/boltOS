@@ -15,7 +15,6 @@
 #include "string.h"
 
 #define BUFCAP 16384
-#define NPATH  "/notes.txt"
 #define CELLW  8
 #define CELLH  16
 #define PAD    10
@@ -32,11 +31,13 @@ typedef struct {
 } notes_t;
 
 static notes_t nt;
+static char        nt_path[FS_PATH_MAX] = "/notes.txt";  /* current document    */
+static window_t   *nt_win;                                /* our window, for open */
 
 /* toolbar button hot rects (client-local), rebuilt each draw */
-enum { B_SAVE = 1, B_NEW };
+enum { B_SAVE = 1, B_NEW, B_SAVEAS };
 typedef struct { int x, y, w, h, id; } nhot_t;
-static nhot_t nhots[4];
+static nhot_t nhots[6];
 static int    nnhot;
 
 /* ---- buffer editing ----------------------------------------------------- */
@@ -122,21 +123,23 @@ static void nt_down(void) {
 
 /* ---- file I/O ----------------------------------------------------------- */
 static void nt_load(void) {
-    fs_node *n = fs_lookup(NPATH);
+    fs_node *n = fs_lookup(nt_path);
     if (n && !n->is_dir && n->data) {
         int len = (int)n->size; if (len > BUFCAP - 1) len = BUFCAP - 1;
         memcpy(nt.buf, n->data, len);
         nt.len = len; nt.buf[len] = 0;
-    } else {
+    } else if (strcmp(nt_path, "/notes.txt") == 0) {
         const char *seed = "Welcome to BoltOS Notepad.\n\nType freely; use the arrow keys to move the\ncaret, and press Save to write to /notes.txt.\n";
         int len = (int)strlen(seed);
         memcpy(nt.buf, seed, len); nt.len = len; nt.buf[len] = 0;
+    } else {
+        nt.len = 0; nt.buf[0] = 0;               /* a freshly-opened empty file */
     }
     nt.cur = 0; nt.top = 0; nt.dirty = 0;
 }
 static void nt_save(void) {
-    fs_node *n = fs_lookup(NPATH);
-    if (!n) n = fs_create(NPATH, 0);
+    fs_node *n = fs_lookup(nt_path);
+    if (!n) n = fs_create(nt_path, 0);
     if (n && fs_write(n, nt.buf, (uint32_t)nt.len) == 0) {
         nt.dirty = 0;
         nt.saved_flash = (int)pit_ticks() + 1500;
@@ -144,6 +147,21 @@ static void nt_save(void) {
 }
 static void nt_new(void) {
     nt.len = 0; nt.cur = 0; nt.sel = -1; nt.top = 0; nt.buf[0] = 0; nt.dirty = 1;
+}
+
+/* Save As: the GUI prompt hands us a filename. Bare names land in
+ * /home/Documents; an absolute path (leading '/') is used verbatim. */
+static void nt_saveas_cb(const char *name) {
+    if (!name || !name[0]) return;
+    if (name[0] == '/') {
+        strncpy(nt_path, name, sizeof(nt_path) - 1);
+    } else {
+        nt_path[0] = 0;
+        kstrlcat(nt_path, "/home/Documents/", sizeof(nt_path));
+        kstrlcat(nt_path, name, sizeof(nt_path));
+    }
+    nt_path[sizeof(nt_path) - 1] = 0;
+    nt_save();
 }
 
 /* ---- input -------------------------------------------------------------- */
@@ -189,6 +207,7 @@ static void notes_click(window_t *w, int lx, int ly) {
         if (lx < h->x || lx >= h->x + h->w || ly < h->y || ly >= h->y + h->h) continue;
         if (h->id == B_SAVE) nt_save();
         else if (h->id == B_NEW) nt_new();
+        else if (h->id == B_SAVEAS) gui_prompt("Save As (filename)", "", nt_saveas_cb);
         return;
     }
 }
@@ -202,7 +221,7 @@ static int tool_btn(int x, int y, const char *label, int id, uint32_t bg) {
     int w = g_text_width(label, 1) + 24, h = 24;
     g_round(x, y, w, h, 6, bg, 255);
     g_text(x + 12, y + 5, label, 0xFFFFFF, 1);
-    if (nnhot < 4) { nhots[nnhot].x = x - note_ox; nhots[nnhot].y = y - note_oy;
+    if (nnhot < 6) { nhots[nnhot].x = x - note_ox; nhots[nnhot].y = y - note_oy;
                      nhots[nnhot].w = w; nhots[nnhot].h = h; nhots[nnhot].id = id; nnhot++; }
     return w;
 }
@@ -217,11 +236,11 @@ static void notes_draw(window_t *w, int cx, int cy, int cw, int ch) {
     g_hline(cx, cy + TOOLH, cw, COL_PANEL_3);
     int bx = cx + 10, by = cy + 6;
     bx += tool_btn(bx, by, "Save", B_SAVE, COL_ACCENT) + 8;
+    bx += tool_btn(bx, by, "Save As", B_SAVEAS, COL_PANEL_3) + 8;
     bx += tool_btn(bx, by, "New",  B_NEW,  COL_PANEL_3) + 8;
 
     /* status: filename + dirty/saved indicator */
-    const char *status = NPATH;
-    g_text(bx + 6, cy + 11, status, COL_TEXT_DIM, 1);
+    g_text(bx + 6, cy + 11, nt_path, COL_TEXT_DIM, 1);
     int sx = cx + cw - 80;
     if (nt.saved_flash && (int)pit_ticks() < nt.saved_flash)
         g_text(sx, cy + 11, "Saved", COL_GOOD, 1);
@@ -299,4 +318,16 @@ void notes_app_init(void) {
     win->click = notes_click;
     win->min_w = 320; win->min_h = 240;
     win->x = 240; win->y = 90;
+    nt_win = win;
+}
+
+/* Open an arbitrary text file in Notepad (called by the file manager). */
+void notes_open_path(const char *path) {
+    if (!path || !path[0]) return;
+    strncpy(nt_path, path, sizeof(nt_path) - 1);
+    nt_path[sizeof(nt_path) - 1] = 0;
+    nt.sel = -1;
+    nt_load();
+    nt.cur = 0; nt.top = 0; nt.dirty = 0;
+    if (nt_win) gui_open(nt_win);
 }

@@ -71,8 +71,9 @@ void audio_set_volume(int percent) {
     nam_w(NAM_PCM_VOL, v);
 }
 
-/* Stream the first `frames` stereo frames already sitting in a.pcm. Blocking. */
-static void ac97_play_buffer(uint32_t frames) {
+/* Program the BDL for the first `frames` stereo frames in a.pcm and start the
+ * DMA engine. Returns without waiting (the buffer plays in the background). */
+static void ac97_start_buffer(uint32_t frames) {
     struct bdl_entry *bdl = (struct bdl_entry *)a.bdl.virt;
     uint32_t per = 0xFFFE / 2;                 /* max stereo frames per descriptor */
     uint32_t off = 0, n = 0;
@@ -93,13 +94,42 @@ static void ac97_play_buffer(uint32_t frames) {
     outb((uint16_t)(a.nabm + PO_LVI), (uint8_t)(n - 1));
     outw((uint16_t)(a.nabm + PO_SR), 0x1C);    /* clear status bits */
     outb((uint16_t)(a.nabm + PO_CR), CR_RPBM); /* run */
+}
 
+/* Stream the first `frames` stereo frames already sitting in a.pcm. Blocking. */
+static void ac97_play_buffer(uint32_t frames) {
+    ac97_start_buffer(frames);
     /* wait until the DMA engine halts (buffer drained) */
     for (uint64_t t = 0; t < 200000000ull; t++) {
         if (inw((uint16_t)(a.nabm + PO_SR)) & SR_DCH) break;
     }
     outb((uint16_t)(a.nabm + PO_CR), 0);
 }
+
+/* Non-blocking playback: copy PCM into the device buffer, start DMA, return.
+ * Poll audio_busy() to know when it has drained, then push the next chunk. */
+void audio_play_async(const int16_t *interleaved, uint32_t frames) {
+    if (!a.present || a.is_hda || !interleaved || !frames) return;
+    uint32_t cap = (uint32_t)(a.pcm.size / 4);
+    if (frames > cap) frames = cap;
+    memcpy(a.pcm.virt, interleaved, frames * 4);
+    ac97_start_buffer(frames);
+}
+
+/* 1 while the PCM-out DMA engine is still playing a buffer. */
+int audio_busy(void) {
+    if (!a.present || a.is_hda) return 0;
+    return (inw((uint16_t)(a.nabm + PO_SR)) & SR_DCH) ? 0 : 1;
+}
+
+/* Stop any in-progress playback immediately. */
+void audio_stop(void) {
+    if (!a.present || a.is_hda) return;
+    outb((uint16_t)(a.nabm + PO_CR), 0);
+}
+
+/* Is real PCM streaming available (AC97 claimed, not the HDA/speaker fallback)? */
+int audio_pcm_ok(void) { return a.present && !a.is_hda; }
 
 void audio_play_pcm(const int16_t *interleaved, uint32_t frames) {
     if (!a.present || a.is_hda) return;

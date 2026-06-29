@@ -46,6 +46,7 @@ REM Use SDL display if available, otherwise fall back to GTK
     -display sdl ^
     -netdev user,id=net0 ^
     -device e1000,netdev=net0 ^
+    -audiodev none,id=snd0 -device AC97,audiodev=snd0 ^
     -serial stdio ^
     -no-reboot -no-shutdown
 
@@ -64,6 +65,8 @@ if errorlevel 1 (
         -display gtk ^
         -netdev user,id=net0 ^
         -device e1000,netdev=net0 ^
+        -audiodev none,id=snd0 -device AC97,audiodev=snd0 ^
+    -audiodev none,id=snd0 -device AC97,audiodev=snd0 ^
         -serial stdio ^
         -no-reboot -no-shutdown
 )

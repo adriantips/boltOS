@@ -7,6 +7,9 @@
 #include "vfs.h"
 #include "proc.h"
 #include "kprintf.h"
+#include "framebuffer.h"
+#include "keyboard.h"
+#include "http.h"
 
 #define IA32_EFER  0xC0000080
 #define IA32_STAR  0xC0000081
@@ -88,9 +91,34 @@ static uint64_t do_mmap(proc_t *p, uint64_t len, uint64_t prot) {
     return base;
 }
 
+/* Claim the panel for a ring-3 renderer and report its geometry. No framebuffer
+ * is mapped into the process: the renderer draws into its own RAM backbuffer and
+ * hands it to SYS_FBPRESENT, so the kernel performs every VRAM write (the proven
+ * fb_blit path) and is the sole arbiter of the panel -- there is no shared-VRAM
+ * race with the compositor, which the g_fb_exclusive flag parks. */
+static uint64_t do_fbinfo(proc_t *p, uint64_t uptr) {
+    (void)p;
+    if (!uok(uptr)) return (uint64_t)-1;
+    if (!fb_present()) return (uint64_t)-1;             /* no panel */
+    struct { uint64_t ptr; uint32_t w, h, pitch_px; } *u = (void *)uptr;
+    u->ptr = 0; u->w = fb_width(); u->h = fb_height(); u->pitch_px = fb_width();
+    g_fb_exclusive = 1;                                  /* compositor steps back */
+    return 0;
+}
+
+/* Copy a ring-3 renderer's packed w*h xRGB backbuffer onto the panel via the
+ * kernel's framebuffer path. The buffer must be fully inside the user half. */
+static uint64_t do_fbpresent(uint64_t ubuf) {
+    if (!g_fb_exclusive || !fb_present()) return (uint64_t)-1;
+    uint64_t bytes = (uint64_t)fb_width() * fb_height() * 4;
+    if (!uok(ubuf) || !uok(ubuf + bytes - 1)) return (uint64_t)-1;
+    fb_blit((const uint32_t *)ubuf);
+    return 0;
+}
+
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5) {
-    (void)a4; (void)a5;
+    (void)a5;
     proc_t *p = proc_current();
 
     switch (num) {
@@ -142,6 +170,25 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_YIELD:  return 0;
     case SYS_GETPID: return p ? (uint64_t)p->pid : 0;
     case SYS_EXIT:   proc_exit((int)a1);   /* no return */
+
+    /* ---- device syscalls for the ring-3 browser -------------------------- */
+    case SYS_FBINFO:
+        if (!p) return (uint64_t)-1;
+        return do_fbinfo(p, a1);
+    case SYS_GETKEY:                          /* non-blocking; -1 if ring empty */
+        return (uint64_t)(int64_t)kbd_trygetc();
+    case SYS_HTTPGET: {                        /* (url, buf, cap, status*)      */
+        if (!p || !uok(a1) || !uok(a2) || a3 == 0) return (uint64_t)-1;
+        int status = 0;
+        int n = http_get((const char *)a1, (char *)a2, (uint32_t)a3, &status, 0, 0);
+        if (a4 && uok(a4)) *(int *)a4 = status;
+        return (uint64_t)(int64_t)n;
+    }
+    case SYS_FBPRESENT:                        /* blit a ring-3 backbuffer       */
+        return do_fbpresent(a1);
+    case SYS_FBEND:                            /* hand the panel back to the GUI */
+        g_fb_exclusive = 0;
+        return 0;
     default:         return (uint64_t)-1;
     }
 }

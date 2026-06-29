@@ -9,6 +9,7 @@
 #include "kheap.h"
 #include "string.h"
 #include "kprintf.h"
+#include "framebuffer.h"
 
 static int next_pid = 1;
 
@@ -39,8 +40,10 @@ static inline void poke64(uint8_t *page_kv, uint64_t frame_off, uint64_t v) {
 }
 
 /* Map the user stack and lay out a minimal SysV entry stack (argc/argv/auxv).
- * Returns the initial user RSP, or 0 on failure. */
-static uint64_t setup_user_stack(uint64_t cr3, const char *arg0) {
+ * arg0 is argv[0]; arg1 (if non-null) becomes argv[1], so a ring-3 tool can be
+ * handed an operand (e.g. the script path for /bin/js). Returns the initial
+ * user RSP, or 0 on failure. */
+static uint64_t setup_user_stack(uint64_t cr3, const char *arg0, const char *arg1) {
     uint64_t base = USER_STACK_TOP - (uint64_t)USER_STACK_PGS * PAGE_SIZE;
     uint64_t top_frame = 0;
     for (int i = 0; i < USER_STACK_PGS; i++) {
@@ -57,26 +60,41 @@ static uint64_t setup_user_stack(uint64_t cr3, const char *arg0) {
     uint64_t page_va = USER_STACK_TOP - PAGE_SIZE;     /* user VA of top page base */
     #define OFF(uva) ((uva) - page_va)
 
-    /* copy arg0 string near the top */
-    uint64_t slen = strlen(arg0) + 1;
-    uint64_t str_uva = (USER_STACK_TOP - slen) & ~0xFull;
-    for (uint64_t i = 0; i < slen; i++) tk[OFF(str_uva) + i] = (uint8_t)arg0[i];
+    int argc = arg1 ? 2 : 1;
 
-    /* vector: argc, argv0, NULL, envp NULL, AT_NULL(key,val) = 6 qwords */
-    uint64_t sp = (str_uva - 6 * 8) & ~0xFull;          /* 16-aligned argc slot */
-    uint64_t o = OFF(sp);
-    poke64(tk, o + 0,  1);                               /* argc            */
-    poke64(tk, o + 8,  str_uva);                         /* argv[0]         */
-    poke64(tk, o + 16, 0);                               /* argv terminator */
-    poke64(tk, o + 24, 0);                               /* envp terminator */
-    poke64(tk, o + 32, 0);                               /* auxv AT_NULL k  */
-    poke64(tk, o + 40, 0);                               /* auxv AT_NULL v  */
+    /* copy the argv strings down from the very top of the stack */
+    uint64_t slen0 = strlen(arg0) + 1;
+    uint64_t arg0_uva = (USER_STACK_TOP - slen0) & ~0xFull;
+    for (uint64_t i = 0; i < slen0; i++) tk[OFF(arg0_uva) + i] = (uint8_t)arg0[i];
+
+    uint64_t arg1_uva = 0, lowstr = arg0_uva;
+    if (arg1) {
+        uint64_t slen1 = strlen(arg1) + 1;
+        arg1_uva = (arg0_uva - slen1) & ~0xFull;
+        for (uint64_t i = 0; i < slen1; i++) tk[OFF(arg1_uva) + i] = (uint8_t)arg1[i];
+        lowstr = arg1_uva;
+    }
+
+    /* vector: argc, argv[0..argc-1], NULL, envp NULL, AT_NULL(key,val) */
+    uint64_t nq = (uint64_t)argc + 5;
+    uint64_t sp = (lowstr - nq * 8) & ~0xFull;          /* 16-aligned argc slot */
+    uint64_t o  = OFF(sp);
+    poke64(tk, o, (uint64_t)argc);                       /* argc            */
+    poke64(tk, o + 8,  arg0_uva);                        /* argv[0]         */
+    uint64_t k = o + 16;
+    if (arg1) { poke64(tk, k, arg1_uva); k += 8; }       /* argv[1]         */
+    poke64(tk, k,      0); k += 8;                        /* argv terminator */
+    poke64(tk, k,      0); k += 8;                        /* envp terminator */
+    poke64(tk, k,      0); k += 8;                        /* auxv AT_NULL k  */
+    poke64(tk, k,      0);                                /* auxv AT_NULL v  */
     #undef OFF
     return sp;
 }
 
 /* --------------------------------------------------------------- exec ------*/
-int proc_exec(const char *path) {
+int proc_exec(const char *path) { return proc_exec_argv(path, 0); }
+
+int proc_exec_argv(const char *path, const char *arg1) {
     file *f = vfs_open(path, O_RDONLY);
     if (!f) { kprintf("[exec] %s: not found\n", path); return -1; }
 
@@ -99,7 +117,7 @@ int proc_exec(const char *path) {
     }
     kfree(image);
 
-    uint64_t ustack = setup_user_stack(cr3, path);
+    uint64_t ustack = setup_user_stack(cr3, path, arg1);
     if (!ustack) return -1;
 
     proc_t *p = (proc_t *)kmalloc(sizeof(proc_t));
@@ -124,6 +142,7 @@ int proc_exec(const char *path) {
 
 /* --------------------------------------------------------------- exit ------*/
 void proc_exit(int code) {
+    g_fb_exclusive = 0;          /* if a fb-grabbing program died, free the panel */
     proc_t *p = proc_current();
     if (p) {
         p->exit_code = code;

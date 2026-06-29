@@ -14,6 +14,7 @@
 #include "kheap.h"
 #include "fs.h"
 #include "http.h"
+#include "proc.h"
 
 static void cli_log(void *ud, const char *m) { (void)ud; kprintf("%s\n", m); }
 static js_dom_node cli_byid(void *ud, const char *id) { (void)ud; (void)id; return 0; }
@@ -61,14 +62,31 @@ int cmd_js(int argc, char **argv) {
         code[n] = 0;
         return run_src(code, (uint32_t)n);
     }
+    /* A script file runs in RING 3: exec /bin/js (the same BoltJS engine built
+     * as a userland ELF) with the path as argv[1]. The interpreter executes in
+     * ring 3, reading the file and printing output through syscalls -- no part
+     * of the language runtime touches kernel mode. Output goes to the console. */
     fs_node *f = fs_lookup(argv[1]);
     if (!f)        { kprintf("js: can't open '%s'\n", argv[1]); return 1; }
     if (f->is_dir) { kprintf("js: '%s' is a directory\n", argv[1]); return 1; }
-    char *src = (char *)kmalloc(f->size + 1);
-    if (!src) { kprintf("js: out of memory\n"); return 1; }
-    for (uint32_t i = 0; i < f->size; i++) src[i] = (char)f->data[i];
-    src[f->size] = 0;
-    int rc = run_src(src, f->size);
-    kfree(src);
-    return rc;
+    if (proc_exec_argv("/bin/js", argv[1]) < 0) {
+        kprintf("js: could not start ring-3 interpreter\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* `webx [url-or-path]` -- launch the RING-3 web browser (/bin/browser). The
+ * whole rendering pipeline (HTML->DOM, CSS cascade + box/flex/grid layout, and
+ * JavaScript) executes in ring 3; it grabs the framebuffer via SYS_FBINFO,
+ * reads keys via SYS_GETKEY and fetches over the net via SYS_HTTPGET. Press q
+ * inside the browser to return to the desktop. */
+int cmd_webx(int argc, char **argv) {
+    const char *url = (argc > 1) ? argv[1] : "/web/index.html";
+    if (proc_exec_argv("/bin/browser", url) < 0) {
+        kprintf("webx: could not start ring-3 browser\n");
+        return 1;
+    }
+    kprintf("webx: ring-3 browser launched (%s); press q to quit\n", url);
+    return 0;
 }

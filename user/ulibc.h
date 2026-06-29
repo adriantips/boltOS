@@ -36,6 +36,14 @@ int   getpid(void);
 void  yield(void);
 void  exit(int code) __attribute__((noreturn));
 
+/* ---- device access for the ring-3 browser (see include/syscall.h) -------- */
+struct user_fbinfo { uint64_t ptr; uint32_t w, h, pitch_px; };
+int   fb_map(struct user_fbinfo *fi);   /* claim the panel + pause compositor; 0/-1 */
+void  fb_release(void);                  /* hand the panel back to the desktop    */
+void  fb_present(const void *buf);       /* blit a packed w*h xRGB backbuffer     */
+int   getkey(void);                      /* next key, or -1 if none (non-blocking) */
+long  http_get_u(const char *url, char *buf, unsigned long cap, int *status);
+
 /* heap */
 void *malloc(unsigned long n);
 void *calloc(unsigned long nm, unsigned long sz);

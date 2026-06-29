@@ -9,6 +9,12 @@ int      fb_present(void);
 int      fb_set_mode(uint32_t w, uint32_t h);
 uint32_t fb_width(void);
 uint32_t fb_height(void);
+uint64_t fb_phys(void);      /* physical base of the linear framebuffer */
+uint32_t fb_pitch_px(void);  /* scanline stride in pixels (>= width) */
+
+/* Set while a ring-3 program owns the panel (maps the fb via SYS_FBINFO); the
+ * GUI compositor skips its flip so it doesn't fight the userland renderer. */
+extern volatile int g_fb_exclusive;
 void     fb_pixel(uint32_t x, uint32_t y, uint32_t color);  /* color = 0x00RRGGBB */
 void     fb_fill(uint32_t color);
 void     fb_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);

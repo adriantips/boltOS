@@ -203,7 +203,8 @@ const command_t commands[] = {
     { "echo",     "Core",             "print text back",                    cmd_echo },
     { "clear",    "Core",             "clear the screen",                   cmd_clear },
     { "python",   "Core",             "BoltPython REPL / run a .py file",    cmd_python },
-    { "js",       "Core",             "run JavaScript (BoltJS engine)",     cmd_js },
+    { "js",       "Core",             "run JavaScript in ring 3 (BoltJS)",  cmd_js },
+    { "webx",     "Networking",       "ring-3 web browser (DOM+layout+JS)", cmd_webx },
     { "libctest", "Core",             "self-test the freestanding C library", cmd_libctest },
     { "nstest",   "Core",             "self-test the ported NetSurf libraries", cmd_nstest },
 };

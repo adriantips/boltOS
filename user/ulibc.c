@@ -16,6 +16,11 @@
 #define SYS_YIELD 24
 #define SYS_GETPID 39
 #define SYS_EXIT 60
+#define SYS_FBINFO 100
+#define SYS_GETKEY 101
+#define SYS_HTTPGET 102
+#define SYS_FBEND 103
+#define SYS_FBPRESENT 104
 
 static long __syscall(long n, long a, long b, long c, long d, long e) {
     long ret;
@@ -42,6 +47,13 @@ void *sbrk_brk(void *addr)                                 { return (void *)__sy
 int  getpid(void)                                          { return (int)__syscall(SYS_GETPID, 0, 0, 0, 0, 0); }
 void yield(void)                                           { __syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
 void exit(int code) { __syscall(SYS_EXIT, code, 0, 0, 0, 0); for (;;) {} }
+
+int  fb_map(struct user_fbinfo *fi) { return (int)__syscall(SYS_FBINFO, (long)fi, 0, 0, 0, 0); }
+void fb_release(void)               { __syscall(SYS_FBEND, 0, 0, 0, 0, 0); }
+void fb_present(const void *buf)    { __syscall(SYS_FBPRESENT, (long)buf, 0, 0, 0, 0); }
+int  getkey(void)                   { return (int)__syscall(SYS_GETKEY, 0, 0, 0, 0, 0); }
+long http_get_u(const char *url, char *buf, unsigned long cap, int *status)
+                                    { return __syscall(SYS_HTTPGET, (long)url, (long)buf, (long)cap, (long)status, 0); }
 
 /* --------------------------------------------------------------- heap ------
  * First-fit free list backed by SYS_BRK. Each block carries a header with its

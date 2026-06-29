@@ -77,4 +77,5 @@ int cmd_story(int, char **);
 int cmd_help(int, char **);   int cmd_echo(int, char **);   int cmd_clear(int, char **);
 int cmd_mem(int, char **);    int cmd_python(int, char **);
 int cmd_js(int, char **);     int cmd_libctest(int, char **);
+int cmd_webx(int, char **);
 int cmd_nstest(int, char **);

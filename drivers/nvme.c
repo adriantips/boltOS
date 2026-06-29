@@ -6,14 +6,20 @@
 #include "mmio.h"
 #include "string.h"
 #include "kprintf.h"
+#include "interrupts.h"
 
 /* ===========================================================================
- *  NVMe controller driver (polled).
+ *  NVMe controller driver (interrupt-driven).
  *
  *  Brings up the admin queue pair, identifies namespace 1, creates one I/O
- *  queue pair, and registers the namespace with the generic block layer. No
- *  interrupts: completions are detected by polling the CQ phase bit, which is
- *  simple and correct for BoltOS's synchronous, one-command-at-a-time I/O.
+ *  queue pair, and registers the namespace with the generic block layer.
+ *
+ *  Completions are delivered by a hardware MSI/MSI-X interrupt: the I/O CQ is
+ *  created with IEN=1 (interrupt enable, vector 0) and the controller's MSI-X
+ *  vector 0 is routed to an IDT vector (msi_install). The issuing thread halts
+ *  (hlt) until the interrupt wakes it, then reads the single outstanding CQE --
+ *  it no longer busy-polls the phase bit. If the controller exposes no MSI
+ *  capability the driver falls back to polling so it still works everywhere.
  *
  *  Data transfers use a single page-aligned bounce buffer and are chunked to
  *  <= 4 KiB per command, so PRP1 alone describes the transfer (PRP2 unused)
@@ -55,6 +61,7 @@ struct nvme_queue {
 
 static struct {
     int present;
+    int irq_ok;                /* 1 once MSI/MSI-X delivers completions */
     volatile void *regs;
     uint32_t dstrd;
     struct nvme_queue admin, io;
@@ -63,6 +70,21 @@ static struct {
     uint32_t lbads;            /* logical block size in bytes         */
     uint16_t cid;
 } nv;
+
+#define NVME_MSI_VECTOR  (MSI_VECTOR_BASE + 1)   /* 0x71 */
+
+/* The completion interrupt fires here. With one command outstanding at a time
+ * the only job is to wake the halted submit() loop, which then reads the CQE;
+ * a tiny counter aids diagnostics. isr_handler issues the local-APIC EOI. */
+static volatile uint64_t nvme_irq_count;
+static void nvme_irq(struct registers *r) { (void)r; nvme_irq_count++; }
+
+/* Only park on hlt when interrupts are actually unmasked, so a caller that
+ * happens to hold IF=0 can never wedge the machine waiting for a wakeup. */
+static inline int ints_on(void) {
+    uint64_t f; __asm__ volatile("pushfq; pop %0" : "=r"(f));
+    return (int)((f >> 9) & 1u);
+}
 
 static inline uint32_t rd32(uint32_t off)            { return mmio_read32(nv.regs, off); }
 static inline void     wr32(uint32_t off, uint32_t v){ mmio_write32(nv.regs, off, v); }
@@ -86,8 +108,12 @@ static int alloc_queue(struct nvme_queue *q, uint32_t qid) {
     return 0;
 }
 
-/* Submit a 16-dword command and poll its completion. Returns the NVMe status
- * field (0 == success), or -1 on timeout. */
+/* Submit a 16-dword command and wait for its completion. In interrupt mode the
+ * CPU halts between checks and the MSI wakes it; the timer tick is a backstop so
+ * a missed interrupt can never hang forever. In polled mode (no MSI capability)
+ * it spins on the phase bit as before. Returns the NVMe status (0 == success),
+ * or -1 on timeout. Only this function advances cq_head/phase, so the lone
+ * outstanding completion is consumed exactly once with no IRQ-side race. */
 static int submit(struct nvme_queue *q, const uint32_t cmd[16]) {
     uint16_t cid = nv.cid++;
     volatile uint32_t *e = q->sqes + q->sq_tail * 16;
@@ -109,6 +135,10 @@ static int submit(struct nvme_queue *q, const uint32_t cmd[16]) {
             wr32(q->cq_db, q->cq_head);
             return (int)status;
         }
+        /* Interrupt-driven: sleep until the completion MSI (or the periodic
+         * timer) wakes us, instead of burning the core on the phase bit. */
+        if (nv.irq_ok && ints_on()) __asm__ volatile("hlt");
+        else                        __asm__ volatile("pause");
     }
     kprintf("[nvme] submit timeout: sq_tail=%u cq_head=%u phase=%u dw3=%x\n",
             q->sq_tail, q->cq_head, q->phase, c[3]);
@@ -181,7 +211,7 @@ static int create_io_queues(void) {
     cmd[6]  = (uint32_t)nv.io.cq_phys;
     cmd[7]  = (uint32_t)(nv.io.cq_phys >> 32);
     cmd[10] = ((QDEPTH - 1) << 16) | 1;         /* QSIZE-1, QID=1      */
-    cmd[11] = 1;                                /* PC=1, IEN=0         */
+    cmd[11] = 1u | (nv.irq_ok ? 2u : 0u);       /* PC=1, IEN=irq, IV=0 */
     if (submit(&nv.admin, cmd) != 0) return -1;
 
     /* Create I/O Submission Queue (qid 1, bound to CQ 1) */
@@ -206,10 +236,17 @@ void nvme_init(void) {
     }
     nv.regs = bar.virt;
     pci_enable_bus_master(&pd);
-    /* We poll completions, so silence the controller's interrupts entirely:
-     * mask every vector (INTMS) and set PCI command Interrupt-Disable. Without
-     * this a completion asserts an IRQ with no handler -> interrupt storm. */
-    pci_write16(&pd, 0x04, pci_read16(&pd, 0x04) | (1u << 10));
+
+    /* Route completions through a hardware MSI/MSI-X interrupt (the preferred
+     * path). If the controller exposes no MSI capability, fall back to polling
+     * and silence INTx (PCI command bit 10) so an unhandled pin assertion can't
+     * storm the IDT -- the same defence the old polled driver relied on. */
+    if (pci_msi_enable(&pd, NVME_MSI_VECTOR) == 0) {
+        msi_install(NVME_MSI_VECTOR, nvme_irq);
+        nv.irq_ok = 1;
+    } else {
+        pci_write16(&pd, 0x04, pci_read16(&pd, 0x04) | (1u << 10));
+    }
 
     uint64_t cap = (uint64_t)rd32(REG_CAP) | ((uint64_t)rd32(REG_CAP + 4) << 32);
     nv.dstrd = (cap >> 32) & 0xF;
@@ -217,7 +254,7 @@ void nvme_init(void) {
     /* reset: clear CC.EN, wait until not ready */
     wr32(REG_CC, 0);
     for (uint64_t t = 0; t < 5000000ull; t++) { if (!(rd32(REG_CSTS) & CSTS_RDY)) break; }
-    wr32(REG_INTMS, 0xFFFFFFFFu);          /* mask all completion interrupts */
+    if (!nv.irq_ok) wr32(REG_INTMS, 0xFFFFFFFFu);   /* polled: mask completions */
 
     if (alloc_queue(&nv.admin, 0) != 0) { kprintf("[nvme] admin queue OOM\n"); return; }
     wr32(REG_AQA, ((QDEPTH - 1) << 16) | (QDEPTH - 1));
@@ -243,8 +280,9 @@ void nvme_init(void) {
 
     nv.present = 1;
     uint64_t mb = (nv.nsze * nv.lbads) / (1024 * 1024);
-    kprintf("[nvme] %x:%x ns1 %luMiB %u-byte blocks\n",
-            pd.vendor, pd.device, (unsigned long)mb, nv.lbads);
+    kprintf("[nvme] %x:%x ns1 %luMiB %u-byte blocks (%s)\n",
+            pd.vendor, pd.device, (unsigned long)mb, nv.lbads,
+            nv.irq_ok ? "MSI irq" : "polled");
 
     blkdev_t b; memset(&b, 0, sizeof b);
     b.sectors     = nv.nsze;

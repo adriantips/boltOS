@@ -41,6 +41,9 @@ static volatile char    rb[RBSZ];
 static volatile uint8_t rhead, rtail;
 static volatile int     shift;
 static volatile int     ctrl;            /* either Ctrl key held */
+static volatile int     alt;             /* either Alt key held  */
+static volatile int     win;             /* either Super/Win key held */
+static volatile int     win_used;         /* a key was pressed while Win held -> not a tap */
 static volatile int     extended;        /* last byte was the 0xE0 prefix */
 
 /* Map a navigation key to its selection-extending (Shift+nav) variant. */
@@ -69,6 +72,7 @@ static char ctrl_shortcut(char c) {
 }
 
 static void push(char c) {
+    if (win) win_used = 1;                          /* a key fired during Win -> combo, not a tap */
     uint8_t n = (uint8_t)(rtail + 1);
     if (n != rhead) { rb[rtail] = c; rtail = n; }   /* drop on overflow */
 }
@@ -103,6 +107,11 @@ static void on_key(struct registers *r) {
         extended = 0;
         if (sc == 0x1D) { ctrl = 1; return; }       /* right Ctrl pressed  */
         if (sc == 0x9D) { ctrl = 0; return; }       /* right Ctrl released */
+        if (sc == 0x38) { alt = 1; return; }        /* right Alt pressed   */
+        if (sc == 0xB8) { alt = 0; return; }        /* right Alt released  */
+        if (sc == 0x5B || sc == 0x5C) { win = 1; win_used = 0; return; }  /* L/R Super pressed  */
+        if (sc == 0xDB || sc == 0xDC) { int wu = win_used; win = 0;       /* L/R Super released */
+            if (!wu) push(KEY_WINTAP); return; }                         /* tapped alone -> Start */
         if (!(sc & 0x80)) {
             char e = ext_map(sc);
             if (e) push(shift ? shift_nav(e) : e);
@@ -114,7 +123,15 @@ static void on_key(struct registers *r) {
         case 0xAA: case 0xB6: shift = 0; return;    /* L/R shift released */
         case 0x1D: ctrl = 1; return;                /* left Ctrl pressed  */
         case 0x9D: ctrl = 0; return;                /* left Ctrl released */
+        case 0x38: alt  = 1; return;                /* left Alt pressed   */
+        case 0xB8: alt  = 0; return;                /* left Alt released  */
+        case 0x58: push(KEY_SHOT); return;          /* F12 -> screenshot  */
     }
+    if (sc == 0x0F && alt) {                         /* Alt+Tab -> cycle windows */
+        push(shift ? KEY_ALTTABR : KEY_ALTTAB);
+        return;
+    }
+    if (sc == 0x3E && alt) { push(KEY_ALTF4); return; }  /* Alt+F4 -> close window */
     if (sc & 0x80) return;                          /* any other key release */
     char c = shift ? shiftmap[sc] : map[sc];
     if (!c) return;
@@ -128,6 +145,7 @@ static void on_key(struct registers *r) {
 
 int kbd_ctrl_down(void)  { return ctrl;  }
 int kbd_shift_down(void) { return shift; }
+int kbd_win_down(void)   { return win;   }
 
 /* Inject an already-decoded character into the input ring. Used by the USB HID
  * keyboard driver, which decodes boot-protocol reports itself and feeds the
@@ -151,6 +169,9 @@ void keyboard_init(void) {
     rhead = rtail = 0;
     shift = 0;
     ctrl = 0;
+    alt = 0;
+    win = 0;
+    win_used = 0;
     extended = 0;
     irq_install(1, on_key);
     inb(0x60);                                      /* drain any pending byte */
